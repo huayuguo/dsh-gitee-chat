@@ -1,0 +1,11 @@
+# 依赖与构建产物（跟随兄弟仓库 dsh-gitee-pj 的约定：lib 不入库，由 prepare 构建）
+node_modules/
+lib/
+*.tsbuildinfo
+
+# 生成物
+preview/
+*.log
+
+# 编辑器/系统
+.DS_Store

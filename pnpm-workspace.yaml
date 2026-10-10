@@ -1,0 +1,24 @@
+# pnpm 设置（不是 workspace 成员声明 —— 本包不自组 workspace）。
+#
+# 1. autoInstallPeers: false
+#    @deepseek-ai/dsh-* 这些 peer 由 **DSH 的依赖闭包**在运行时提供。
+#    为了让 smoke / types:check 在没有 DSH 的机器（含 CI）上也能跑，dev 树所需的
+#    peer 闭包已按精确版本钉进 package.json 的 devDependencies；这里关掉自动装 peer，
+#    避免 pnpm 去解析镜像上滞后 / 不完整的版本。npm 侧的等价物是 `--legacy-peer-deps`。
+#
+# 2. allowBuilds.esbuild: true
+#    pnpm 10 起默认**不跑**依赖的构建脚本，install 会以
+#    `[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: esbuild@0.28.2` 退出 1。
+#    这里必须是真的布尔值：本文件原本留着 pnpm 自动生成的占位串
+#    `set this to true or false`，那等于没放行 —— 照着 README 走就会卡在第一步。
+#    实测：`onlyBuiltDependencies`（写在这里或 package.json 里）在 pnpm 11.5.1 上
+#    无效，`allowBuilds: { esbuild: true }` 才是它认的那个键。
+#
+# 3. minimumReleaseAgeExclude
+#    pnpm 11 对「发布不满 minimumReleaseAge 的版本」会拒装；DSH 的 rc/预发布版本
+#    常在发布当天就要用于适配，所以对 @deepseek-ai/* 整体豁免。
+autoInstallPeers: false
+allowBuilds:
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@deepseek-ai/*'

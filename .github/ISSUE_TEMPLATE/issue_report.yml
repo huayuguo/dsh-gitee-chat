@@ -1,0 +1,67 @@
+name: 问题报告
+description: 报告 Bug、功能请求或建议
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请尽量填全，能显著加快定位。
+        安全漏洞**不要**开公开 issue，请走 [SECURITY.md](../../SECURITY.md)。
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索现有 issue，确认没有完全相同的条目
+          required: true
+        - label: 我已确认使用最新版本 dsh-gitee-chat（add @latest 装到的版本）
+          required: false
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: 类型
+      options:
+        - 🐛 Bug（功能异常）
+        - ✨ 功能请求
+        - 💡 建议（体验改进）
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      placeholder: "如 0.5.1"
+    validations:
+      required: false
+
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DSH 版本 + 运行方式
+      placeholder: "如 DSH 0.2.0-rc.2；桌面版 / dsh web"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 描述
+      description: 现象、期望行为、（Bug 必填）复现步骤、截图或日志。
+      placeholder: |
+        现象：
+        期望行为：
+        复现步骤（Bug）：
+        截图或日志：
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: 补充信息
+      placeholder: "操作系统、profile、相关配置等（不要贴 token）"
+    validations:
+      required: false

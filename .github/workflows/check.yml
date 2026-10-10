@@ -1,0 +1,55 @@
+name: check
+
+# 全量回归：与本地 `pnpm run check` 同一条链（smoke / render-check / 能力矩阵 /
+# preset / 类型声明 / 随包 MCP）。@deepseek-ai/* 的 dev 树 peer 闭包已按精确版本
+# 钉进 package.json 的 devDependencies，所以 CI 无需安装 DSH 即可跑通 smoke 与 types:check。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 取消被覆盖的 PR 运行；push 运行本身是合并后信号，不取消。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: 全量检查（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows 必须进矩阵：本插件大量分支是给 win32 写的
+        # （路径、`.exe`、`.cmd` 安装脚本、PATHEXT、junction），只在 Linux 跑等于没测。
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 版本由 package.json 的 packageManager 提供；不要再写 version，
+      # 否则 pnpm/action-setup 会因「同时指定两处版本」报错。
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # pnpm-workspace.yaml 里的键（autoInstallPeers: false / allowBuilds.esbuild: true）
+      # 是 `pnpm install` 能跑通的前提，缺一个就失败 —— 见该文件的注释。
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # lib/ 不入库，由 build.mjs 生成（prepare 也会跑一次，这里显式再跑确保最新）。
+      - name: 构建产物
+        run: node build.mjs
+
+      # smoke 会真实 import lib/*.js；types:check 会 tsc 重新生成后比对。
+      - name: 全量回归（pnpm run check）
+        run: pnpm run check

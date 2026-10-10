@@ -1,0 +1,17 @@
+# 随包的 MCP 二进制（vendor/mcp-gitee-ent/）是**可执行文件**，不是文本。
+#
+# `-text` 关掉换行转换：Windows 同事若开了 core.autocrlf，转一次就把 `.exe`
+# 改成 CRLF，PE 头跟着坏掉 —— 而 sha256 校验会报「与清单不一致」，
+# 人却看不出哪里错了。`-diff` 让 git 不去算文本差异（二进制差异又大又没意义）。
+#
+# manifest.json 刻意不匹配这条：它是文本，要能正常 diff、按 LF 存。
+vendor/mcp-gitee-ent/mcp-gitee-ent-* -text -diff
+# 换行符规范：文本统一 LF 入库，跨系统不再因 CRLF/LF 产生幽灵变更
+* text=auto
+
+# Windows 批处理必须 CRLF（否则 cmd 解析可能出错），检出也保持 CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Shell 脚本强制 LF
+*.sh text eol=lf

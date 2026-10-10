@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" width="36" height="36" role="img" aria-label="dsh-gitee-chat">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#C71D23"/>
+      <stop offset="1" stop-color="#F04A52"/>
+    </linearGradient>
+  </defs>
+  <rect width="36" height="36" rx="8" fill="url(#g)"/>
+  <g fill="#fff">
+    <rect x="8" y="9" width="8" height="18" rx="2"/>
+    <rect x="20" y="9" width="8" height="11" rx="2"/>
+    <rect x="20" y="23" width="8" height="4" rx="2" opacity=".65"/>
+  </g>
+</svg>

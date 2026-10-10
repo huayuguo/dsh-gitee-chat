@@ -1,0 +1,66 @@
+# dsh-gitee-chat 挂载补丁 —— **只挂 host 半**，而且**必须是纯 insert**。
+#
+# ⚠️ 平面纪律（本插件最容易搞错的地方）：
+#   本文件挂在 profile 里，注册的东西对**所有 preset 生效**。
+#   因此这里**只允许**放 host 半（执行器 + 路由 + giteeChat 服务），
+#   绝不放工具、人格注入或门禁——那些属于 agent 平面，走 `dsh-gitee-chat/agent`，
+#   只在 Gitee 模式（preset）里挂。
+#
+#   曾经把工具与人格注入写在这里，结果 PTC 等无关 preset 的新会话
+#   也被注入了 Gitee 人格、也能看到 Gitee 工具。
+#
+# ⚠️ 为什么这里**只有 id + name**（纯 insert，一行 config 都不许有）：
+#   插件市场（dshmarket）的「热挂载」只认纯 insert 形状，而它读的正是本文件
+#   （`hot.js` 的 `parseSimplePatch`：市场目前只认字符串形式的 dsh.bundle.patch，
+#   本包的数组形式会被它忽略 → 回落到读本文件）。
+#   一旦这里出现 `config:` 行，市场「关闭后再打开」就会失败并留下**半状态**：
+#   包仍在 `dsh.profile.bundles` 里、而 profile 补丁被写上
+#   `- id: gitee-chat` + `disabled: true`，于是 Gitee preset 还在列表里、
+#   但 `giteeChat` 服务不存在 → `dsh-gitee-chat/agent` 永远 pending →
+#   预设红标「加载失败」。拆成【本文件纯 insert + 配置走 profile 补丁】
+#   之后，市场的热挂载能成功，这条路就断了。
+#   同理：skill 行因为**必须带 config** 而单独放在 `cordis.skills.patch.yml`。
+#
+# 配置从哪来（不写在这里，是因为它与默认值逐项相同，写在这里会破坏纯 insert）：
+#   1. 默认值 = `src/index.ts` 的 `resolveConfig()`：apiBase、cacheTtlSeconds 0、
+#      scriptTimeoutMs 60000、allowFixtureFallback false、enterpriseId 0、
+#      roleTtlSeconds 600、mode auto、userAgent ''、allowWrites true、presetIds []、
+#      agentRowName 'dsh-gitee-chat/agent'、docs.mcpToolPrefix 'mcp__gitee_ent__'、
+#      docs.autoCheckOnRead true、docs.maxPageBytes 200000、thresholds {}。
+#   2. `node scripts/setup.mjs apply` 会把**完整配置**写进 profile 的
+#      `cordis.patch.yml`（哨兵段，带行内注释、且不含 token）。
+#      补丁在所有 bundle 之后应用，同一 id 的 config 是**整体替换**而不是深合并。
+#   3. 环境变量（GITEE_ENT_ID、GITEE_CHAT_* 等）与
+#      `$DSH_HOME/.gitee-chat/config.json` 仍按次覆盖。
+#
+# 用法：
+#   1. 作为 bundle 安装：dsh plugin --profile <profile> add "file:<本目录>"
+#      （桌面版用应用自带的 dsh 命令，profile 固定 desktop；dsh web 默认 web）。
+#      必须是 `file:` 而不是裸路径：裸路径会被记成 `link:`，模块 realpath 落在
+#      profiles/** 之外，agent 半的裸导入解析不到。
+#   2. 手工挂载：把下面 insert 段合并进 profile 的 cordis.patch.yml
+#
+# agent 半（在 preset 的组合里）：
+#   - id: gitee-chat-agent
+#     name: 'dsh-gitee-chat/agent'
+#     config:
+#       injectPersona: true
+#       enforceTier: true
+#
+# 数据口径：
+#   - 不做本地数据库；数据以会话拉取为准。
+#   - 模型只拿到 gq 脚本产出的 `summary` 摘要（几十~一千 token）；
+#     看板卡片经 /api/gitee-chat/payload 直接取全量结构化数据，不经过模型。
+#
+# token：按次解析（环境变量 GITEE_ENT_MCP_ACCESS_TOKEN →
+#        $DSH_HOME/.gitee-chat/token → ~/.gitee-token）。**不回落到 preset 行**：
+#        MCP server 行的 token 是另一处 !!js 表达式，见 presets/*.patch.yml。
+#
+# ⚠️ 这里面**没有**任何"本机 / 本公司"的东西：企业 id、API base、UA、阈值、
+#    token 位置全部可从配置或环境变量覆盖。换同事 / 换机器请看 README 的
+#    「换一台机器 / 换一个同事」一节，并先跑
+#    `node scripts/check-presets.mjs --doctor`。
+
+- insert:
+    - id: gitee-chat
+      name: 'dsh-gitee-chat'

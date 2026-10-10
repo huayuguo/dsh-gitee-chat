@@ -1,0 +1,40 @@
+# dsh-gitee-chat 的 skill 挂载补丁 —— 单独一个文件，而且**必须是纯 insert**。
+#
+# 为什么这一行不放在 `cordis.patch.yml`（两个原因，缺一不可）：
+#   1. 这一行**必须带 config**（`providerName` 不能省，见下），
+#      而 `cordis.patch.yml` 必须保持纯 insert —— 市场未识别
+#      `dsh.bundle.patch` 数组时只读那个文件，`parseSimplePatch` 见到
+#      `config:` 就返回 null，于是「关闭后再打开」永久失败并留下半状态
+#      （详见 `cordis.patch.yml` 头部与）。
+#   2. 拆开后，两个文件各自只有一个顶层 `- insert:`，谁也不覆盖谁的行；
+#      市场识别数组之后（它按文件逐个判归属），本包任何一行都不算
+#      "外来行"，于是关闭插件时整包从 `dsh.profile.bundles` 干净移出。
+#
+# skill 真源就在本包里：`<包>/skills/dsh-gitee-chat/SKILL.md`。
+# 它教 AI 怎么**问使用者、写配置、自检** —— 也就是让安装与调参
+# 完全不需要使用者打开任何文件。
+#
+# 四个实测出来的要点（改动前先读）：
+#
+#  1. `!!js` 里的 `baseUrl` 是 **profile 目录**（不是本包目录）。
+#     所以这里按**包名** `dsh-gitee-chat` 解析 —— bundle 就装在 profile 里，
+#     换机器/换 profile 都不用改这行。
+#  2. **必须换 `providerName`**：dsh-base 已经挂了一个名为 `filesystem` 的
+#     provider，同名会以 "a skill provider named ... is already registered"
+#     让整棵插件树启动失败。⇒ 这一行**不能**简化成 id + name 两行。
+#  3. **解析失败必须 fail-soft**：手工拷 lib/ 而没注册 bundle 时 resolve() 会抛，
+#     那会让整个 DSH 起不来。所以包一层 try/catch，回落到一个不可能存在的路径。
+#  4. 表达式必须返回**单个字符串**。`customSkillDirs` 本身已是数组，元素再返回
+#     数组就会变成 `[[path]]`，报 "expected string but got [path]"。
+#
+# `includeDefaultRoots: false`：project / user 根已由宿主的 filesystem provider
+# 覆盖，这里只贡献本包自己的 skills/，不去重复扫一遍。
+
+- insert:
+    - id: gitee-chat-skills
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: 'gitee-chat-skills'
+        includeDefaultRoots: false
+        customSkillDirs:
+          - !!js "(() => { const P = process.getBuiltinModule('node:path'); const U = process.getBuiltinModule('node:url'); try { const M = process.getBuiltinModule('node:module'); const anchor = U.fileURLToPath(new URL('package.json', baseUrl)); return P.join(P.dirname(M.createRequire(anchor).resolve('dsh-gitee-chat/package.json')), 'skills') } catch { return P.join(U.fileURLToPath(baseUrl), '.dsh-gitee-chat-no-skills') } })()"

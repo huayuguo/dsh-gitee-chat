@@ -1,0 +1,93 @@
+name: release
+
+# 打 `v*` tag → 发 npm 官方源 + 建 GitHub Release（挂 npm pack 的 tgz 供国内直连下载）。
+#
+# 前置（仓库 Settings → Secrets and variables → Actions）：
+#   NPM_TOKEN —— npmjs 的 Automation token（官方源；本包 publishConfig.registry 已钉死官方源）
+#   想免掉这个长期 secret，可迁到 npm Trusted Publishing（OIDC）：见文末注记。
+#
+# 发布前应当已有一次全绿的 check.yml；本工作流会重跑同一条 `pnpm run check` 全量链。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 建 Release
+  id-token: write   # npm provenance（公开仓库才有意义）
+
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 版本由 package.json 的 packageManager 提供；不要再写 version。
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org/
+
+      - name: 校验 tag 与 package.json 版本一致
+        shell: bash
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have="$(node -p "require('./package.json').version")"
+          if [ "$want" != "$have" ]; then
+            echo "::error title=版本不一致::tag $GITHUB_REF_NAME 与 package.json $have 不一致"
+            exit 1
+          fi
+          echo "版本一致：v$have"
+
+      - name: 校验 CHANGELOG 里有这一版
+        shell: bash
+        run: |
+          have="$(node -p "require('./package.json').version")"
+          grep -q "## \[$have\]" CHANGELOG.md || {
+            echo "::error title=CHANGELOG 缺条目::CHANGELOG.md 里没有 ## [$have] 小节"
+            exit 1
+          }
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建
+        run: node build.mjs
+
+      - name: 全量回归（pnpm run check）
+        run: pnpm run check
+
+      - name: 发布到 npm 官方源（带 provenance）
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: 打出 Release 附件
+        run: |
+          mkdir -p dist
+          npm pack --pack-destination dist
+          cd dist && sha256sum *.tgz > SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tgz
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+
+      - name: 提示后续的手动步骤
+        shell: bash
+        run: |
+          echo "::notice title=发布后::1) Gitee 侧手动建同名 Release 并上传同一份 tgz（国内直连）"
+          echo "2) 国内镜像（npmmirror 等）会自动从官方源同步，无需操作"
+          echo "3) 需要催同步时可 PUT https://registry.npmmirror.com/-/package/dsh-gitee-chat/syncs"
+          echo "4) 免 NPM_TOKEN 方案（一次性，需在 npmjs.com 操作）：package Settings -> Publishing access -> Trusted Publishers 添加 GitHub Actions / huayuguo / dsh-gitee-chat / release.yml，之后删掉 NPM_TOKEN secret 即可。"

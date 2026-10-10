@@ -1,0 +1,149 @@
+{
+  "name": "dsh-gitee-chat",
+  "version": "0.5.1",
+  "description": "会话内 Gitee 企业项目管理：模型用触发型工具取数，脚本负责拉取，看板与图表由客户端插件在对话流里渲染并可直接操作。不做侧边栏、不维护本地数据库。",
+  "license": "MIT",
+  "author": "jackxiao <xd20260413@outlook.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huayuguo/dsh-gitee-chat.git"
+  },
+  "homepage": "https://github.com/huayuguo/dsh-gitee-chat",
+  "bugs": {
+    "url": "https://github.com/huayuguo/dsh-gitee-chat/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "gitee",
+    "project-management",
+    "kanban",
+    "mcp",
+    "enterprise"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./agent": {
+      "types": "./types/agent.d.ts",
+      "default": "./lib/agent.js"
+    },
+    "./client": {
+      "types": "./types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "types",
+    "vendor",
+    "src",
+    "scripts",
+    "skills",
+    "presets",
+    "cordis.patch.yml",
+    "cordis.skills.patch.yml",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "USAGE.md",
+    "icon.svg"
+  ],
+  "packageManager": "pnpm@11.5.1",
+  "icon": "./icon.svg",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "dsh": "^0.2.0-rc.2",
+    "node": "^22.19 || >=24"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml",
+        "./cordis.skills.patch.yml",
+        "./presets/gitee-exec.patch.yml",
+        "./presets/gitee-manager.patch.yml"
+      ]
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ]
+    },
+    "manifestVersion": 1
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepare": "node build.mjs",
+    "prepublishOnly": "node scripts/gen-capabilities.mjs --check && node scripts/check-presets.mjs --check && node scripts/check-types.mjs --check",
+    "gq": "node scripts/gitee/gq.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "render-check": "node scripts/render-check.mjs",
+    "capabilities": "node scripts/gen-capabilities.mjs",
+    "capabilities:check": "node scripts/gen-capabilities.mjs --check",
+    "presets:check": "node scripts/check-presets.mjs --check",
+    "types:gen": "node scripts/check-types.mjs",
+    "types:check": "node scripts/check-types.mjs --check",
+    "doctor": "node scripts/check-presets.mjs --doctor",
+    "setup": "node scripts/setup.mjs",
+    "setup:verify": "node scripts/setup.mjs verify",
+    "check": "node scripts/smoke.mjs && node scripts/render-check.mjs && node scripts/gen-capabilities.mjs --check && node scripts/check-presets.mjs --check && node scripts/check-types.mjs --check && node scripts/build-mcp.mjs --check",
+    "mcp:build": "node scripts/build-mcp.mjs",
+    "mcp:check": "node scripts/build-mcp.mjs --check"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-host-webserver": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "react": "^18 || ^19",
+    "react-dom": "^18 || ^19"
+  },
+  "dependencies": {
+    "schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.4",
+    "@deepseek-ai/cordis-plugin-include": "1.0.9",
+    "@deepseek-ai/cordis-plugin-loader": "1.0.5",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-brand": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-invariants": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-ptc-runtime": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox-policy": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-scope": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-persistence": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-projection": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-timeout": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-user-approval": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-util-values": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-workspace": "0.2.0-rc.2",
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "esbuild": "^0.28.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "typescript": "^5.9.3"
+  }
+}
