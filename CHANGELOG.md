@@ -3,6 +3,33 @@
 本文件记录 dsh-gitee-chat 的版本变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)；日期为本地（Asia/Shanghai）日期。
 
+## [0.5.3] - 2026-10-12
+
+**仓库面板与知识库面板整体 401 的修复版**。0.5.2 及更早：插件配置 `enterpriseId: 0`（自动档，
+默认值）时，这两个面板会整体报 `[api_error] 401 企业未授权此应用进行访问`，而看板/人格/工作项
+一切正常 —— 后者走 gq 脚本，脚本遇到 0 会自己回落读 `~/.dsh/.gitee-chat/config.json`，
+**MCP 通道没有这层回落**，把字面量 `0` 当成企业 id 发了出去。
+
+### 修复
+
+- **`enterpriseId: 0` 被当成企业 id 发给 MCP ⇒ 仓库/知识库面板 401**（新增 `src/host/enterpriseId.ts`）：
+  生效企业改为**每次现取**（插件配置钉住值 → 环境变量 → 本地配置文件 → token 唯一企业自动），
+  不缓存（企业可在设置里随时切换）；**多家企业绝不自动挑一个**（与 gq 同一条纪律，静默取第一家
+  会拿错公司的数据，宁可报可行动错误）。
+- **那句 401 本身会把人带偏**（`src/host/mcpDocs.ts`）：实测 token 有效、企业 id 换成别家的
+  也逐字报「企业未授权此应用进行访问」—— 所以它只表示"这个企业 id 不在当前 token 名下"。
+  现在这句话会被翻译成"企业 id 不对、不用重配 token"，并写出本次用的是哪个 id、来源是什么；
+  解析不出企业时改报 `no-enterprise`（含去哪儿选，而不是甩一句 MCP 原始报错）。
+- **模型侧工具目录抬头写出生效企业 id 与来源**（`src/host/gateway.ts`、`src/index.ts`）：
+  现取而非注册快照，且企业 id 为 0 时不写（避免模型照着 `enterprise_id: 0` 去调，重演同一个 401）。
+- `src/host/routes.ts` 给 `no-enterprise` 映射 409、`src/host/docService.ts` 与
+  `src/host/repoService.ts` 的缓存分层与返回值改用现取的生效企业。
+
+### 测试
+
+- `scripts/smoke.mjs`：新增「永不发 0」（钉住不探测 / 唯一企业自动用 / 多家报可行动错误 /
+  顺序 flag>env>file）与「401 被翻译成可行动的话」两组用例，以及工具目录抬头的正反两例。
+
 ## [0.5.2] - 2026-10-12
 
 **0.5.1 的修正版**。0.5.1 是从打 tag 的那个提交（f3cf5e2）构建的，里面缺了下面这批 Windows

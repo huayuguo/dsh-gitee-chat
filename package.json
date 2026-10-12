@@ -1,6 +1,6 @@
 {
   "name": "dsh-gitee-chat",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "会话内 Gitee 企业项目管理：模型用触发型工具取数，脚本负责拉取，看板与图表由客户端插件在对话流里渲染并可直接操作。不做侧边栏、不维护本地数据库。",
   "license": "MIT",
   "author": "jackxiao <xd20260413@outlook.com>",
