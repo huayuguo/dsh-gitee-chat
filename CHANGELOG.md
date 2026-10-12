@@ -3,6 +3,29 @@
 本文件记录 dsh-gitee-chat 的版本变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)；日期为本地（Asia/Shanghai）日期。
 
+## [0.5.2] - 2026-10-12
+
+**0.5.1 的修正版**。0.5.1 是从打 tag 的那个提交（f3cf5e2）构建的，里面缺了下面这批 Windows
+修复 —— **Windows 上请用 0.5.2 取代 0.5.1**。
+
+### 修复
+
+- **Windows 上知识库文档的 workspace 链接恒失效**（`src/host/wikiCache.ts`）：判据写成了
+  `cwd.startsWith('/')`，Windows 盘符路径永远不成立，`workspaceLink()` 直接返回 `null`，
+  「把知识库文档挂进当前工作区」这条路径在 Windows 上等于没有；改判 `path.isAbsolute(cwd)`，
+  建链接时按平台选 `junction`（普通用户即可创建；`symlink` 要开发者模式或管理员）。
+
+### 构建与发布链
+
+- `scripts/smoke.mjs`：Windows 上按平台造路径、PATH 分隔符、目录链接与可执行位断言，
+  `pnpm run check` 在 Windows 开发机上不再假红。
+- `scripts/gen-capabilities.mjs`：派生物比对忽略 CRLF（Windows 结账默认 `core.autocrlf=true`，
+  否则能力矩阵会误报漂移）。
+- `.github/workflows/release.yml`：缺 `NPM_TOKEN` 时给出可行动的报错（0.5.1 首次发布就是
+  这么挂的，日志只有一句 `ENEEDAUTH`）；手动触发不再被 tag 门槛拦死，且无 tag 时不跑
+  Release 附件步骤。
+- 自此 CI 的 `windows-latest` 矩阵在 `check` 与 `release` 两个工作流上都全绿。
+
 ## [0.5.1] - 2026-10-10
 
 **首个公开发布版本**，当前版本包含：
