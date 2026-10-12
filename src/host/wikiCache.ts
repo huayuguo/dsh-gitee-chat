@@ -36,7 +36,7 @@
 
 import { execFile } from 'node:child_process'
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 
 const run = promisify(execFile)
@@ -331,7 +331,9 @@ export function createWikiCache(deps: WikiCacheDeps) {
    * @returns 软链接绝对路径；无法安全创建时返回 null。
    */
   async function workspaceLink(cwd: string): Promise<string | null> {
-    if (cwd === '' || !cwd.startsWith('/')) return null
+    // 「必须是绝对路径」要用 isAbsolute 表达：Windows 的 `C:\…` 也是绝对路径，
+    // 早先只认 `/` 开头，于是这个功能在 Windows 上**永远**静默返回 null（矩阵上抓到）。
+    if (cwd === '' || !isAbsolute(cwd)) return null
     const dir = join(cwd, WORKSPACE_LINK_DIR)
     const link = join(dir, WORKSPACE_LINK_NAME)
     try {
@@ -343,7 +345,11 @@ export function createWikiCache(deps: WikiCacheDeps) {
         exists = false
       }
       if (!exists) {
-        symlinkSync(cacheRoot, link, 'dir')
+        // Windows 上普通用户（没开开发者模式、也不是管理员）建 `dir` 软链接会 EPERM，
+        // 于是这里整段被 catch 吞掉、功能静默失效 —— 用 junction：不需要任何特权，
+        // 与 `scripts/setup.mjs` 补那一跳同一个理由。Node 里 junction 依旧算 symlink，
+        // 下面的 isSymbolicLink / readlinkSync 判定不用改。
+        symlinkSync(cacheRoot, link, process.platform === 'win32' ? 'junction' : 'dir')
       } else {
         // 已存在：必须是"指向缓存根的软链接"，否则**绝不覆盖**（可能是用户自己的东西）。
         const st = lstatSync(link)
