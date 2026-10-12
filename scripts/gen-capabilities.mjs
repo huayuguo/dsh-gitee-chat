@@ -90,7 +90,10 @@ const drifted = presets.filter((p) => p.text !== p.next)
 if (process.argv.includes('--check')) {
   let bad = false
   const currentGenerated = await readFile(generatedTarget, 'utf8').catch(() => '')
-  if (currentGenerated !== generatedContent) {
+  // 比的是内容，不是字节：Windows 检出（core.autocrlf=true）会把工作区文件写成 CRLF，
+  // 而这里是按 '\n' 生成的 —— 原样比较会在 Windows 开发机/CI 上恒红：
+  // 「src/generated/tierWrites.ts 与 TIERS 不一致」，可 TIERS 一字没动（ubuntu 上反而全绿）。
+  if (currentGenerated.replace(/\r\n/g, '\n') !== generatedContent) {
     console.error('src/generated/tierWrites.ts 与 TIERS 不一致（只读闸门会拦错工具）。请运行：node scripts/gen-capabilities.mjs')
     bad = true
   }
