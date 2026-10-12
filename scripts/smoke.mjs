@@ -20,7 +20,7 @@ import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
+import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { execFile } from 'node:child_process'
@@ -54,6 +54,25 @@ function presetToolsetsFromFile(path) {
   const rest = text.slice(text.indexOf('\n', at) + 1)
   const line = rest.slice(0, rest.indexOf('\n')).trim()
   return line.replace(/^-\s*/, '').replace(/^['"]|['"]$/g, '').split(',').map((s) => s.trim()).filter(Boolean)
+}
+
+/**
+ * 建一个指向 `target` 的**目录链接**（fixture 里模拟装的插件）。
+ *
+ * Windows 上普通用户（没开开发者模式、也不是管理员）用 `fs.symlink(…, 'dir')`
+ * 会拿到 `EPERM: operation not permitted, symlink` —— 那是**本机权限**问题，
+ * 不是夹具或插件的错，却会让 `pnpm run check` 在 Windows 开发机上必然红
+ * （CI 的 runner 是管理员，反而看不出来）。退到 junction：不需要任何特权，
+ * 而且这正是产品在 Windows 上补那一跳的形状
+ * （见 `scripts/setup.mjs`：`symlinkSync(source, dest, process.platform === 'win32' ? 'junction' : 'dir')`）。
+ */
+async function linkDir(target, linkPath) {
+  try {
+    await symlink(target, linkPath, 'dir')
+  } catch (err) {
+    if (process.platform !== 'win32' || (err.code !== 'EPERM' && err.code !== 'EACCES')) throw err
+    await symlink(resolve(target), linkPath, 'junction')
+  }
 }
 
 /** 取出 preset 里 `command: !!js "…"` 的那个表达式；不是这个形状返回 null。 */
@@ -1701,7 +1720,10 @@ process.stdin.on('data', (chunk) => {
 
   // SKILL.md 的 frontmatter 必须合法（name + description，且 name 与目录名一致）
   const skillPath = join(root, 'skills', 'dsh-gitee-chat', 'SKILL.md')
-  const skillText = await readFile(skillPath, 'utf8')
+  // 换行先归一成 LF：Windows 结账（core.autocrlf=true，Git for Windows 的默认值）
+  // 会把工作区文本变成 CRLF，而下面几条断言是逐行锚定的（`^---$` / `^name:`）。
+  // 守卫不该依赖结账时的行尾 —— 否则 windows 矩阵在 CI 上必红，而 Linux 本地全绿。
+  const skillText = (await readFile(skillPath, 'utf8')).replace(/\r\n/g, '\n')
   const fm = /^---\n([\s\S]*?)\n---\n/.exec(skillText)
   assert.ok(fm !== null, 'SKILL.md 必须有 YAML frontmatter')
   assert.match(fm[1], /^name: dsh-gitee-chat$/m, 'SKILL.md 的 name 必须与目录名一致')
@@ -1718,8 +1740,13 @@ process.stdin.on('data', (chunk) => {
   const evaluate = (baseUrl) => new Function('baseUrl',
     `with ({ baseUrl }) { return eval(${JSON.stringify(exprMatch[1])}) }`)(baseUrl)
 
-  // 失败分支：baseUrl 指向一个解析不到本包的目录 → 必须返回字符串、不许抛
-  const fallback = evaluate('file:///tmp/definitely-not-a-profile/')
+  // 失败分支：baseUrl 指向一个解析不到本包的目录 → 必须返回字符串、不许抛。
+  // 🔴 这里必须用**本平台合法**的 file URL：win32 下 `fileURLToPath('file:///tmp/…')`
+  // 会抛 ERR_INVALID_FILE_URL_PATH（`file:///tmp/x` 不是合法的 win32 文件 URL），
+  // 而表达式的 catch 分支里还要再 fileURLToPath 一次 —— 异常直接从 catch 里冒出来。
+  // 那是这个夹具的错，不是表达式的错：真实的 baseUrl 永远是 DSH 给的 profile 目录 URL。
+  const noSuchProfile = join(tmpdir(), 'gq-no-such-profile')
+  const fallback = evaluate(`${pathToFileURL(noSuchProfile).href}/`)
   assert.equal(typeof fallback, 'string', '解析失败时必须 fail-soft 返回字符串（抛错会让整个 DSH 起不来）')
   assert.ok(fallback.includes('no-skills'), `失败分支应回落到哨兵路径，实际 ${fallback}`)
   assert.equal(pathExists(fallback), false, '失败分支回落的路径不应存在')
@@ -1727,7 +1754,7 @@ process.stdin.on('data', (chunk) => {
   // 成功分支：造一个"profile 里有本包"的目录 → 必须解析到 <包>/skills
   const fakeBase = await mkdtemp(join(tmpdir(), 'gq-skill-anchor-'))
   await mkdir(join(fakeBase, 'node_modules'), { recursive: true })
-  await symlink(root, join(fakeBase, 'node_modules', 'dsh-gitee-chat'), 'dir')
+  await linkDir(root, join(fakeBase, 'node_modules', 'dsh-gitee-chat'))
   const resolved = evaluate(`${pathToFileURL(fakeBase).href}/`)
   assert.equal(resolved, join(root, 'skills'),
     '成功分支必须解析到 <包>/skills（customSkillDirs 的元素是**根目录**，不是 skill 自身目录）')
@@ -1916,7 +1943,7 @@ process.stdin.on('data', (chunk) => {
   await writeFile(join(webA, 'package.json'), JSON.stringify({
     name: 'web', private: true, dependencies: { 'dsh-gitee-chat': 'link:../../pkgs/fake' },
   }))
-  await symlink(pluginA, join(webA, 'node_modules', 'dsh-gitee-chat'), 'dir')
+  await linkDir(pluginA, join(webA, 'node_modules', 'dsh-gitee-chat'))
 
   const probeBefore = await probeAgentImport(webA)
   assert.equal(probeBefore.ok, false, 'link: 装法下 agent 半应当解析失败（探针没探到就是白装）')
@@ -1963,7 +1990,7 @@ process.stdin.on('data', (chunk) => {
     dependencies: { 'dsh-gitee-chat': `link:${agentHealPlugin}` },
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-gitee-chat'] } },
   }, null, 2) + '\n')
-  await symlink(agentHealPlugin, join(agentHealProfile, 'node_modules', 'dsh-gitee-chat'), 'dir')
+  await linkDir(agentHealPlugin, join(agentHealProfile, 'node_modules', 'dsh-gitee-chat'))
 
   const { stdout: agentHealOut } = await run(process.execPath, [
     join(root, 'scripts/setup.mjs'), 'apply', '--json',
@@ -2008,9 +2035,14 @@ process.stdin.on('data', (chunk) => {
   // Linux 的 fixture 必须按 PATHEXT 的大小写写，才能模拟这个行为。
   await writeFile(join(winBin, 'runner.COM'), '')
   await writeFile(join(winBin, 'notes.txt'), '')
-  const winEnv = { PATH: `C:\\Windows\\System32;C:\\Program Files\\Git\\cmd;${winBin}`, PATHEXT: '.COM;.EXE;.BAT;.CMD' }
-  assert.equal(which('git', winEnv, 'win32'), join(winBin, 'git.EXE'),
-    'Windows PATH 是 ";" 分隔、可执行文件带 PATHEXT 后缀（git.exe），两件都要处理')
+  // 靠前的条目里也真放一个 git.EXE：这才既验了「按 ';' 切 + 按顺序找」，又不会像早先
+  // 写死 `C:\Program Files\Git\cmd` 那样，在**真的装了 Git 的机器**上被那个目录抢先命中
+  // ——Windows runner 与 Windows 开发机都装了 Git，写死就必红（which() 返回真 git 是对的）。
+  const winBinFirst = await mkdtemp(join(tmpdir(), 'gitee-which-first-'))
+  await writeFile(join(winBinFirst, 'git.EXE'), '')
+  const winEnv = { PATH: `C:\\Windows\\System32;${winBinFirst};${winBin}`, PATHEXT: '.COM;.EXE;.BAT;.CMD' }
+  assert.equal(which('git', winEnv, 'win32'), join(winBinFirst, 'git.EXE'),
+    'Windows PATH 是 ";" 分隔、按顺序找，可执行文件带 PATHEXT 后缀（git.exe），都要处理')
   assert.equal(which('runner', winEnv, 'win32'), join(winBin, 'runner.COM'),
     '带 .COM 后缀的程序也要认得 —— 只试 .exe 就不够了')
   assert.equal(which('notes', winEnv, 'win32'), null,
@@ -2022,6 +2054,7 @@ process.stdin.on('data', (chunk) => {
   assert.equal(which('git', { PATH: `"${winBin}";C:\\x`, PATHEXT: '.EXE' }, 'win32'), join(winBin, 'git.EXE'),
     'PATH 里带引号的条目（"C:\\Program Files\\..."）要先去掉引号')
   await rm(winBin, { recursive: true, force: true })
+  await rm(winBinFirst, { recursive: true, force: true })
 
   // ② inspectSkill()：判据必须是"解析出来的目录里有没有 SKILL.md"，
   //    而不是"解析结果 == 源码目录"（后者只对 link: 成立）。
@@ -2040,7 +2073,7 @@ process.stdin.on('data', (chunk) => {
     await writeFile(join(profile, 'package.json'), JSON.stringify({ name: 'web', private: true }))
     const installed = join(profile, 'node_modules', 'dsh-gitee-chat')
     if (mode === 'link') {
-      await symlink(skillSrc, installed, 'dir')
+      await linkDir(skillSrc, installed)
     } else {
       // file: / 正常 pnpm 装 —— 包被**复制**进来，不是软链
       await mkdir(join(installed, 'skills', 'dsh-gitee-chat'), { recursive: true })
@@ -2207,10 +2240,21 @@ process.stdin.on('data', (chunk) => {
   }
   console.log('  ✓ 随包 MCP 二进制与 manifest 逐字节一致（sha256 全部命中）')
 
-  // 隔离 DSH_HOME + 用户 bin 里真的落地一次：apply 之后 preset 表达式必须能取到那个文件。
+  // 隔离 DSH_HOME + 用户级 bin 里真的落地一次：apply 之后 preset 表达式必须能取到那个文件。
+  //
+  // ⚠️ 落点由**平台**决定，不能只按 POSIX 那份写：Windows 是 `%USERPROFILE%\.local\bin`
+  // 且二进制带 `.exe`（见 src/host/mcpBinary.ts 的 userBinDir / binaryName），而 Node 的
+  // `homedir()` 在 Windows 上读 `USERPROFILE`、**不认 `HOME`** —— 两个都得塞进 env，
+  // 否则子进程拿的是真机主目录：既把 16 MiB 二进制拷进用户真实的 `~/.local/bin`，
+  // 又去临时目录里找一个永远不会出现的文件（Windows 上稳定红）。
   const mcpHome = await mkdtemp(join(tmpdir(), 'gq-mcp-home-'))
   const mcpUserBin = join(mcpHome, 'userbin')
-  const mcpApplyEnv = { ...process.env, DSH_HOME: mcpHome, HOME: mcpHome, XDG_BIN_HOME: mcpUserBin }
+  const mcpApplyEnv = {
+    ...process.env, DSH_HOME: mcpHome, HOME: mcpHome, USERPROFILE: mcpHome, XDG_BIN_HOME: mcpUserBin,
+  }
+  const mcpWin = process.platform === 'win32'
+  const mcpLandingDir = mcpWin ? join(mcpHome, '.local', 'bin') : mcpUserBin
+  const mcpBinName = mcpWin ? 'mcp-gitee-ent.exe' : 'mcp-gitee-ent'
   try {
     const mcpProfile = join(mcpHome, 'profiles', 'mcp')
     await mkdir(mcpProfile, { recursive: true })
@@ -2219,9 +2263,9 @@ process.stdin.on('data', (chunk) => {
       name: 'mcp-profile', private: true,
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-gitee-chat'] } },
     }, null, 2) + '\n')
-    // 先造一个垃圾 .tmp-*，验证落地会顺手清掉它
-    await mkdir(mcpUserBin, { recursive: true })
-    await writeFile(join(mcpUserBin, 'mcp-gitee-ent.tmp-99999'), 'stale tmp')
+    // 先造一个垃圾 .tmp-*（与产品清理用的 `<target>.tmp-<pid>` 同形），验证落地会顺手清掉它
+    await mkdir(mcpLandingDir, { recursive: true })
+    await writeFile(join(mcpLandingDir, `${mcpBinName}.tmp-99999`), 'stale tmp')
 
     const applied = JSON.parse(await run(process.execPath, [join(root, 'scripts/setup.mjs'), 'apply', '--json',
       '--answers', JSON.stringify({ profile: 'mcp', enterpriseId: 1 })], {
@@ -2229,12 +2273,16 @@ process.stdin.on('data', (chunk) => {
       env: mcpApplyEnv,
     }).then((r) => r.stdout))
     assert.equal(applied.mcp.ok, true, `apply 应落地随包 MCP 二进制：${JSON.stringify(applied.mcp)}`)
-    const landed = join(mcpUserBin, 'mcp-gitee-ent')
+    const landed = join(mcpLandingDir, mcpBinName)
     assert.ok(pathExists(landed), `apply 后 ${landed} 应存在（落在用户级 bin）`)
-    assert.equal(statSync(landed).mode & 0o111, 0o111, '落地的二进制必须可执行（少了 +x 会 spawn EACCES）')
+    // Windows 的文件系统没有可执行位（statSync 恒 0o666），"能不能执行"由 `.exe` 后缀决定；
+    // 产品那边也是按平台取名字的，不能拿 POSIX 的位去卡 Windows。
+    if (!mcpWin) {
+      assert.equal(statSync(landed).mode & 0o111, 0o111, '落地的二进制必须可执行（少了 +x 会 spawn EACCES）')
+    }
     assert.equal(createHash('sha256').update(readFileSync(landed)).digest('hex'),
       mcpManifest.platforms[platformKey()].sha256, '落地的必须就是随包那份')
-    assert.equal(pathExists(join(mcpUserBin, 'mcp-gitee-ent.tmp-99999')), false,
+    assert.equal(pathExists(join(mcpLandingDir, `${mcpBinName}.tmp-99999`)), false,
       '落地前应顺手清掉上一轮留下的 .tmp-* 垃圾')
     // 幂等：再跑一次不应重拷（copied=false）
     const again = JSON.parse(await run(process.execPath, [join(root, 'scripts/setup.mjs'), 'apply', '--json',
@@ -2277,7 +2325,11 @@ process.stdin.on('data', (chunk) => {
     assert.equal(healed.copied, true, '内容不一致时应重新落地（这就是"被换成上游版"的自愈）')
     assert.equal(createHash('sha256').update(readFileSync(healed.command)).digest('hex'),
       mcpManifest.platforms['linux-x64'].sha256, '自愈后的内容必须等于随包那份')
-    assert.equal(statSync(healed.command).mode & 0o111, 0o111, '自愈后仍须可执行')
+    // 这段模拟的是 linux 分支，但文件确实落在**本机**文件系统上：Windows 没有可执行位
+    // （chmod 只动只读位，statSync 恒 0o666），所以这一条只能在 POSIX 宿主上验。
+    if (process.platform !== 'win32') {
+      assert.equal(statSync(healed.command).mode & 0o111, 0o111, '自愈后仍须可执行')
+    }
     assert.equal(readFileSync(`${healed.command}.bak`, 'utf8'), 'not a real binary',
       '被替换掉的那份必须备份成 .bak，不能静默丢掉别人的二进制')
 
@@ -2290,7 +2342,18 @@ process.stdin.on('data', (chunk) => {
     assert.equal(unsupported.bundledForPlatform, false)
 
     // onPath：落点目录进了 PATH 就必须认出来（Windows 的加 PATH 提示靠这个判断）
-    const onPathHit = ensureMaterialized({ ...healOpts, env: { PATH: `/usr/bin:${healBin}` } })
+    //
+    // ⚠️ 这一段必须按**本机平台**模拟：onPath 是纯字符串比较，PATH 分隔符随模拟平台取
+    // （linux 是 ':'），而 home 是真实临时目录 —— 在 Windows 上把 `C:\…` 拼进 ':' 分隔的
+    // PATH，盘符自带的那一个冒号会把它切成两段，于是"落点就在 PATH 上"永远认不出来
+    // （Linux 上碰巧对得上，所以这个夹具只在 Windows 上红）。
+    const hostPlatform = process.platform
+    const hostSep = hostPlatform === 'win32' ? ';' : ':'
+    const onPathHit = ensureMaterialized({
+      platform: hostPlatform,
+      env: { HOME: healHome, USERPROFILE: healHome, PATH: `${join(healHome, 'other')}${hostSep}${healBin}` },
+      home: healHome,
+    })
     assert.equal(onPathHit.onPath, true, 'PATH 里有落点目录时必须认出来')
 
     // MCP_GITEE_ENT_BIN 优先级最高，且**不该**往任何地方写东西
@@ -2362,10 +2425,15 @@ process.stdin.on('data', (chunk) => {
     console.log('  ✓ 按需拉取计划：本地已改与冲突的页**永不自动拉取**')
 
     // ── 缓存布局：单企业扁平、多企业嵌套 ────────────────────────────────
-    const flat = enterpriseLayer('/root/docs', 100, { schema: 1, enterprises: [100], documents: { '1': { enterpriseId: 100, programId: 1, name: 'a' } } })
-    assert.equal(flat, '/root/docs', '只有一家企业时不额外嵌套（保持直觉路径）')
-    const nested = enterpriseLayer('/root/docs', 200, { schema: 1, enterprises: [100, 200], documents: { '1': { enterpriseId: 100, programId: 1, name: 'a' } } })
-    assert.equal(nested, '/root/docs/e200', '缓存里已有别家文档时必须嵌套，避免同名撞车')
+    //
+    // 缓存根用 join() 造（不写死 '/root/docs'）：enterpriseLayer 内部按平台拼路径，
+    // Windows 上 join('/root/docs','e200') 是 `\root\docs\e200`，拿 POSIX 字面量断言
+    // 会在 Windows 开发机上恒红（Linux 上碰巧一致）。
+    const docsRoot = join(tmpdir(), 'gq-docs-fixture')
+    const flat = enterpriseLayer(docsRoot, 100, { schema: 1, enterprises: [100], documents: { '1': { enterpriseId: 100, programId: 1, name: 'a' } } })
+    assert.equal(flat, docsRoot, '只有一家企业时不额外嵌套（保持直觉路径）')
+    const nested = enterpriseLayer(docsRoot, 200, { schema: 1, enterprises: [100, 200], documents: { '1': { enterpriseId: 100, programId: 1, name: 'a' } } })
+    assert.equal(nested, join(docsRoot, 'e200'), '缓存里已有别家文档时必须嵌套，避免同名撞车')
     assert.equal(safeSlug('示例产品 设计文档/v2'), '示例产品-设计文档-v2')
     assert.equal(pageRelPath({ name: '01-总体设计', type: 'page' }), '01-总体设计.md')
     assert.equal(pageRelPath({ name: '01-接口', type: 'folder' }), '01-接口')
@@ -2665,7 +2733,8 @@ process.stdin.on('data', (chunk) => {
     // 3) 路径换算与防穿越（纯函数 + 文件系统，不需要 git、不需要网络）
     {
       assert.equal(safeRepoSegment('example-org/docs'), 'example-org__docs', '斜杠不能进单个目录名')
-      assert.match(toWorkspacePath('/cwd/.dsh/gitee-docs', '/root/docs', '/root/docs/pj-1/a.md'), /\.dsh\/gitee-docs\/pj-1\/a\.md$/)
+      assert.match(toWorkspacePath('/cwd/.dsh/gitee-docs', '/root/docs', '/root/docs/pj-1/a.md'), /[\\/]\.dsh[\\/]gitee-docs[\\/]pj-1[\\/]a\.md$/,
+        '工作区路径按平台拼（Windows 是反斜杠），断言得两种分隔符都认')
       assert.equal(toWorkspacePath('/cwd/.dsh/gitee-docs', '/root/docs', '/etc/passwd'), null,
         '缓存根之外的路径不得被换算成工作区路径（否则等于给越权开了口子）')
 
