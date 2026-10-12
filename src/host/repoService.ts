@@ -101,7 +101,9 @@ export function createRepoService(deps: RepoServiceDeps) {
       const list = await docs.listRepositories(sessionId, scoped ? { programId } : { scope: 'internal-open' })
       return {
         ok: true,
-        enterpriseId: docs.enterpriseId,
+        // 现取（本地配置文件 / 环境变量 / 唯一企业自动）—— 不在装配期快照，
+        // 否则设置页切企业后这里会一直显示旧企业（见 host/enterpriseId.ts）。
+        enterpriseId: docs.resolveEnterpriseId(),
         mode: scoped ? 'project' : 'internal-open',
         programId: scoped ? programId : null,
         programName,

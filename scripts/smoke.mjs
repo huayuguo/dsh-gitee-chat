@@ -34,12 +34,19 @@ import {
   classifyPageState, rollupDocState, planPull, enterpriseLayer, safeSlug, pageRelPath,
   unwrapToolResult, DocError, createMcpDocs, createDocService,
   createRepoService, createWikiCache, toWorkspacePath, safeRepoSegment,
+  createEnterpriseIdResolver, resolveEnterpriseIdNow, noEnterpriseHint, unauthorizedEnterpriseHint,
   classifyAttachState, readAttachManifest, cacheStats, humanBytes,
   createMcpClient, giteeEntGatewayTool, PUBLIC_GATEWAY_TOOL_NAME, WRITE_TOOLS,
 } from '../lib/index.js'
 import { apply as applyAgent, rawMcpToolName } from '../lib/agent.js'
 import { createIssueWriter } from '../lib/index.js'
 import { codeMatches, codeOfTitle, computeExtendedAnalysis, parseTemplate, resolveThresholds, THRESHOLD_DEFAULTS } from '../scripts/gitee/analysis.mjs'
+
+/**
+ * 造一个"钉住企业"的解析器 —— `createMcpDocs` 的必填依赖（企业 id 现取）。
+ * @param {number} id - 钉住的企业 id（0 = 不钉，按 env → 本地配置 → 唯一企业自动解析）。
+ */
+const pinnedEnterprise = (id) => createEnterpriseIdResolver({ pinned: id })
 
 /**
  * 从 preset 里读能力矩阵声明的工具名。
@@ -925,12 +932,13 @@ process.stdin.on('data', (chunk) => {
     return client
   }
   try {
+    const gwMcp = gwClient({ command: process.execPath, args: [gwServer], timeoutMs: 10_000 })
     const gwTool = giteeEntGatewayTool({
-      client: gwClient({ command: process.execPath, args: [gwServer], timeoutMs: 10_000 }),
+      client: gwMcp,
       allowWrites: true,
       runtimeWrites: () => [],
       // 用**合成** id：真实企业 id 不进公开仓库（本文件会随包发布）
-      enterpriseId: 31415926,
+      enterpriseSelector: () => ({ id: 31415926, describe: '合成来源（冒烟用）' }),
     })
     assert.equal(gwTool.name, PUBLIC_GATEWAY_TOOL_NAME, '公开 gateway 的工具名必须是 gitee_ent')
     // 两级暴露的全部意义：**常驻的那一个 schema 必须很小**（48 个全量 ≈ 14.6K tokens）。
@@ -943,7 +951,18 @@ process.stdin.on('data', (chunk) => {
     assert.match(listed.text, /list_things/, '目录里必须能看见工具名')
     assert.match(listed.text, /create_enterprise_issue ✎/, '目录必须把写工具标成 ✎')
     assert.ok(!/第二行细节/.test(listed.text), '目录只取描述第一行（多行描述会撑大常驻成本）')
-    assert.match(listed.text, /31415926/, '目录抬头应带上本部署钉住的企业 id（此处用合成 id）')
+    assert.match(listed.text, /31415926/, '目录抬头应带上本部署生效的企业 id（此处用合成 id）')
+    assert.match(listed.text, /合成来源（冒烟用）/, '抬头必须带上企业 id 的来源：模型要知道"为什么是这家"才敢照抄这个 id')
+    // 反面：解析不出企业时，抬头**绝不能**写出一个 id（`enterprise_id: 0` 正是 2026-10-12 那个 401 的根因）。
+    const noEntTool = giteeEntGatewayTool({
+      client: gwMcp,
+      allowWrites: true,
+      runtimeWrites: () => [],
+      enterpriseSelector: () => ({ id: 0, describe: '未指定（唯一企业自动用，多家企业必须显式指定）' }),
+    })
+    const listedNoEnt = await noEntTool.execute({ op: 'list' }, {})
+    assert.match(listedNoEnt.text, /list_enterprises/, '解析不出企业时，抬头要让模型先去 list_enterprises')
+    assert.ok(!/当前生效的企业 id/.test(listedNoEnt.text), '解析不出企业时不得在抬头里声称有企业 id（尤其不能出现 0）')
 
     const schemaRes = await gwTool.execute({ op: 'schema', name: 'list_things' }, {})
     assert.match(schemaRes.text, /inputSchema/, 'op=schema 必须回参数表')
@@ -2494,7 +2513,7 @@ process.stdin.on('data', (chunk) => {
         agentOf: () => ({ id: 'sess-smoke' }),
         tools: () => fakeTools,
         toolPrefix: 'mcp__gitee_ent__',
-        enterpriseId: 11111111,
+        enterprise: pinnedEnterprise(11111111),
       })
       const svc = createDocService({ docs: docsClient, cacheRoot: join(sandboxHome, 'gitee', 'docs') })
       const tree = await svc.listNodes('sess-smoke', 9500001, 0)
@@ -2514,6 +2533,152 @@ process.stdin.on('data', (chunk) => {
       console.log('  ✓ 全链路：client → 委派(list_doc_nodes+agent) → 解包 → 节点行（fileId/ext/可读性都对）')
     }
 
+    // ── 企业 id：**"钉住值 0"绝不能被当成 enterprise_id 发出去**（2026-10-12 真实故障）──
+    //
+    // 🔴 症状：仓库面板与知识库面板**整体 401**（`企业未授权此应用进行访问`），
+    //    而看板、人格、工作项、周报全都正常。原因是两条通道的企业口径不一致：
+    //      · MCP：每个工具都**强制**要 enterprise_id，给 0 直接 401，没有回落；
+    //      · gq：允许"不指定"，脚本自己按 flag → env → 本地配置 → /list 解析。
+    //    宿主曾把配置里的钉住值（默认 0）原样透传给 MCP —— 于是"一半好用一半报错"，
+    //    报错还长得像 token 没权限，极难定位。这条用例把四件事钉死：
+    //      ① 钉住时不探测；② 没指定时探一次、唯一企业自动用；
+    //      ③ 多家企业报**可行动**的错并且不硬发数据调用；④ 顺序 flag > env > 本地配置文件。
+    {
+      const entFile = join(sandboxHome, '.gitee-chat', 'config.json')
+      const savedEnvId = process.env.GITEE_ENT_ID
+      const savedEnvChatId = process.env.GITEE_CHAT_ENTERPRISE_ID
+      const hadFile = pathExists(entFile)
+      const savedFile = hadFile ? readFileSync(entFile, 'utf8') : ''
+
+      /** 假 tools 注册表：记下每次调用，`list_enterprises` 按给定清单作答。 */
+      const fakeMcp = (enterprises) => {
+        const seen = []
+        return {
+          seen,
+          tools: {
+            async execute(exec) {
+              seen.push(exec)
+              const text = exec.name.endsWith('list_enterprises')
+                ? JSON.stringify({ total_count: enterprises.length, data: enterprises.map((id) => ({ id })) })
+                : JSON.stringify({ total_count: 1, data: [{ node_id: 1, name: 'a.md', file_type: 0 }] })
+              return { isError: false, value: { content: [{ type: 'text', text }] } }
+            },
+          },
+        }
+      }
+      /** 按给定企业清单造一个委派客户端。 */
+      const clientFor = (enterprises, pinned) => {
+        const fake = fakeMcp(enterprises)
+        return {
+          seen: fake.seen,
+          client: createMcpDocs({
+            agentOf: () => ({ id: 'sess-enterprise' }),
+            tools: () => fake.tools,
+            toolPrefix: 'mcp__gitee_ent__',
+            enterprise: pinnedEnterprise(pinned),
+          }),
+        }
+      }
+
+      try {
+        delete process.env.GITEE_ENT_ID
+        delete process.env.GITEE_CHAT_ENTERPRISE_ID
+        rmSync(entFile, { force: true })
+
+        // ① 钉住：不探测，直接用钉住值
+        {
+          const { seen, client } = clientFor([11111111, 22222222], 11111111)
+          await client.listDocuments('sess-enterprise')
+          assert.equal(seen.length, 1, '钉住企业时不得多问一次 list_enterprises')
+          assert.equal(seen[0].arguments.enterprise_id, 11111111)
+        }
+
+        // ② 没指定 + token 只看得见一家：探一次，然后用那一家（**不是 0**）
+        {
+          const { seen, client } = clientFor([33333333], 0)
+          await client.listDocuments('sess-enterprise')
+          assert.equal(seen.length, 2, '没指定时必须先用 list_enterprises 探一次')
+          assert.equal(seen[0].name, 'mcp__gitee_ent__list_enterprises')
+          assert.equal(seen[0].arguments.enterprise_id, undefined, '探测本身不能带 enterprise_id（带了必然 401）')
+          assert.equal(seen[1].name, 'mcp__gitee_ent__list_enterprise_documents')
+          assert.equal(seen[1].arguments.enterprise_id, 33333333, '唯一企业必须真的用上（发 0 就是 401）')
+        }
+
+        // ③ 多家企业：报可行动的错，且**不发数据调用**（不能猜一家拿错公司的数据）
+        {
+          const { seen, client } = clientFor([11111111, 22222222, 33333333], 0)
+          await assert.rejects(() => client.listDocuments('sess-enterprise'), (error) => {
+            assert.equal(error.code, 'no-enterprise')
+            assert.match(error.message, /3 家企业/, '要说清有几家可选')
+            assert.match(error.message, /设置/, '必须告诉他去哪儿选（只报 401 等于没说）')
+            return true
+          })
+          assert.equal(seen.length, 1, '选不出企业时不得硬着头皮发数据调用')
+        }
+
+        // ④ 顺序：本地配置文件 < env < 钉住值
+        {
+          await mkdir(dirname(entFile), { recursive: true })
+          await writeFile(entFile, JSON.stringify({ enterpriseId: 44444444 }), 'utf8')
+          assert.equal(resolveEnterpriseIdNow(0).source, 'file')
+          assert.equal(resolveEnterpriseIdNow(0).id, 44444444, '本地配置文件（设置页写的那份）必须生效')
+          process.env.GITEE_ENT_ID = '55555555'
+          assert.equal(resolveEnterpriseIdNow(0).id, 55555555, 'env 优先于本地配置文件')
+          assert.equal(resolveEnterpriseIdNow(66666666).id, 66666666, '钉住值优先于 env')
+        }
+
+        // ⑤ 「企业未授权此应用进行访问」这个 401 必须被翻译成可行动的话（2026-10-12 真实故障的正面教训）
+        //
+        // 那句话的字面意思是"没授权"，真实原因却是"企业 id 不对"，使用者会往 token 的方向白查。
+        {
+          const seen = []
+          const badTools = {
+            async execute(exec) {
+              seen.push(exec)
+              // 桥接层的错误信封：文本在**顶层 content**（不是 value.content），照抄线上的形状。
+              return {
+                isError: true,
+                content: [{
+                  type: 'text',
+                  text: 'Error: [api_error] API returned error status: 401 (code: 401, details: 企业未授权此应用进行访问)',
+                }],
+              }
+            },
+          }
+          const client = createMcpDocs({
+            agentOf: () => ({ id: 'sess-401' }),
+            tools: () => badTools,
+            toolPrefix: 'mcp__gitee_ent__',
+            enterprise: pinnedEnterprise(99999999),
+          })
+          await assert.rejects(() => client.listDocuments('sess-401'), (error) => {
+            assert.equal(error.code, 'tool-failed')
+            assert.match(error.message, /企业未授权此应用进行访问/, 'MCP 的原始报错要保留（不然对不上日志）')
+            assert.match(error.message, /99999999/, '必须写出本次实际用的是哪个企业 id')
+            assert.match(error.message, /不是 token 失效/, '要把人从"重配 token"这个错方向拉回来')
+            return true
+          })
+          assert.equal(seen[0].arguments.enterprise_id, 99999999, '先确认它确实把钉住值发出去了（问题在 id，不在"发没发"）')
+          // 别的报错一个字都不许改（免得每次都多一句无关的说明）
+          assert.equal(unauthorizedEnterpriseHint('调用 MCP 工具 x 失败：boom', 1, 'x'), '调用 MCP 工具 x 失败：boom')
+          assert.match(noEnterpriseHint({ id: 0, source: 'none', candidates: [] }), /设置/, '解析不出企业时同样要给可行动去处')
+        }
+
+        console.log('  ✓ 企业 id：钉住不探测 · 唯一企业自动用 · 多家报可行动错误 · 顺序 flag>env>file（永不发 0）· 401 被翻译成可行动的话')
+      } finally {
+        // 还原现场：后面的用例还要按"沙箱 DSH_HOME"跑。
+        rmSync(entFile, { force: true })
+        if (hadFile) {
+          await mkdir(dirname(entFile), { recursive: true })
+          await writeFile(entFile, savedFile, 'utf8')
+        }
+        if (savedEnvId === undefined) delete process.env.GITEE_ENT_ID
+        else process.env.GITEE_ENT_ID = savedEnvId
+        if (savedEnvChatId === undefined) delete process.env.GITEE_CHAT_ENTERPRISE_ID
+        else process.env.GITEE_CHAT_ENTERPRISE_ID = savedEnvChatId
+      }
+    }
+
     // ── 附件落盘：目录必须先存在（第二次真实事故的守卫）────────────────────
     //
     // 🔴 `ResolveWritableDirectory` 对 output_directory 做 `EvalSymlinks` + `Stat`：
@@ -2525,7 +2690,7 @@ process.stdin.on('data', (chunk) => {
       assert.equal(pathExists(freshRoot), false, '起点必须是"缓存根还不存在"')
       let sawDirExists = false
       const svc = createDocService({
-        docs: { enterpriseId: 11111111, async listNodes() { return [] }, async downloadAttachFile() { throw new Error('不该走到这里') } },
+        docs: { resolveEnterpriseId: () => 11111111, async listNodes() { return [] }, async downloadAttachFile() { throw new Error('不该走到这里') } },
         cacheRoot: freshRoot,
         readAttachmentContent: async (input) => {
           // 模拟 MCP 侧的校验：目录不存在就报 param_error。
@@ -2564,7 +2729,7 @@ process.stdin.on('data', (chunk) => {
       let downloads = 0
       const svc = createDocService({
         docs: {
-          enterpriseId: 11111111,
+          resolveEnterpriseId: () => 11111111,
           async listNodes() { return [] },
           async downloadAttachFile() { throw new Error('不该走到这里') },
         },
@@ -2688,7 +2853,7 @@ process.stdin.on('data', (chunk) => {
           },
         }),
         toolPrefix: 'mcp__gitee_ent__',
-        enterpriseId: 11111111,
+        enterprise: pinnedEnterprise(11111111),
       })
       const scoped = await repoClient.listRepositories('sess-gitee', { programId: 9500003 })
       assert.equal(seen[0].name, 'mcp__gitee_ent__list_enterprise_repositories', '仓库列表必须走 MCP 工具')
@@ -2708,7 +2873,7 @@ process.stdin.on('data', (chunk) => {
     // 2) 编排：口径决定 mode 与提示，且仓库行补上可见性
     {
       const fakeDocs = {
-        enterpriseId: 11111111,
+        resolveEnterpriseId: () => 11111111,
         async listRepositories(_s, options) {
           assert.ok(options.programId !== undefined || options.scope !== undefined, '两种口径必须二选一')
           return [{

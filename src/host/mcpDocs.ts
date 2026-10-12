@@ -26,6 +26,8 @@
  * @module dsh-gitee-chat/host/mcp-docs
  */
 
+import { noEnterpriseHint, unauthorizedEnterpriseHint, type EnterpriseIdResolver } from './enterpriseId.ts'
+
 /** 文档委派失败的原因（供路由映射 HTTP 状态）。 */
 export type DocErrorCode =
   /** 请求没带 sessionId。 */
@@ -34,6 +36,8 @@ export type DocErrorCode =
   | 'no-agent'
   /** 宿主没有 tools 注册表（组合不完整）。 */
   | 'no-tools'
+  /** 解析不出企业 id（没钉、没有本地配置、token 又对不上唯一企业）。 */
+  | 'no-enterprise'
   /** MCP 工具不存在（多半是该会话没挂 Gitee preset，或前缀配错了）。 */
   | 'unknown-tool'
   /** MCP 工具本身报错（参数、权限、网络…）。 */
@@ -78,8 +82,8 @@ export interface McpDocDeps {
   readonly tools: () => ToolsService | undefined
   /** MCP 工具名前缀（默认 `mcp__gitee_ent__`，跟 preset 的 serverName 走）。 */
   readonly toolPrefix: string
-  /** 企业 id（工具的第一个必填参数）。 */
-  readonly enterpriseId: number
+  /** 企业 id **解析器**（工具的第一个必填参数，每次调用现取 —— 见 host/enterpriseId.ts）。 */
+  readonly enterprise: EnterpriseIdResolver
   /** 单次调用超时（毫秒）。 */
   readonly timeoutMs?: number
 }
@@ -309,11 +313,46 @@ const DEFAULT_MAX_PAGE_CHARS = 200_000
  * **每一个方法都只做三件事**：拼参数 → 按作用域调 MCP → 裁剪成界面要的形状。
  * 任何"这个端点该怎么调"的知识都**不在这个文件里**，它在 MCP 工具的描述里。
  *
- * @param deps - agent 解析、tools 注册表、前缀与企业 id。
+ * @param deps - agent 解析、tools 注册表、前缀与企业 id 解析器。
  */
 export function createMcpDocs(deps: McpDocDeps) {
   const timeoutMs = deps.timeoutMs ?? 60_000
   let seq = 0
+
+  /**
+   * 问一次 MCP：**这个 token 看得见哪些企业**（`list_enterprises`）。
+   *
+   * 只有 flag / 环境变量 / 本地配置三处都没指定时才会走到这里 —— 它是「照 gq 的规矩
+   * 解析企业」的最后一步。失败一律当作"没看见"：真正可行动的那句话由
+   * `noEnterpriseHint` 去说，这里再抛一个 MCP 原始报错只会让使用者更看不懂。
+   *
+   * @param tools - tools 注册表（调用方已确认 `execute` 存在）。
+   * @param agent - 会话 agent（作用域；少了会拿到 UNKNOWN_TOOL）。
+   */
+  async function listVisibleEnterprises(tools: ToolsService, agent: unknown): Promise<number[]> {
+    if (tools.execute === undefined) return []
+    const name = `${deps.toolPrefix}list_enterprises`
+    // 探测用短超时：这条路走不通时应该尽快报"去设置页选企业"，而不是让人干等一分钟。
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 20_000))
+    try {
+      const result = await tools.execute({
+        callId: `gitee-chat-docs-enterprises-${Date.now()}-${seq++}`,
+        name,
+        arguments: {},
+        agent,
+        signal: controller.signal,
+      })
+      const record = asRecord(unwrapToolResult(name, result)) ?? {}
+      return arr(record.data ?? record.list ?? record.enterprises)
+        .map((item) => num(asRecord(item)?.id))
+        .filter((id) => id > 0)
+    } catch {
+      return []
+    } finally {
+      clearTimeout(timer)
+    }
+  }
 
   /**
    * 调一次 MCP 文档工具。
@@ -338,6 +377,11 @@ export function createMcpDocs(deps: McpDocDeps) {
     const name = `${deps.toolPrefix}${tool}`
     if (tools.execute === undefined) throw new DocError('no-tools', 'tools 服务没有 execute 方法。')
 
+    // 企业 id 必须**每次现取**（flag → env → 本地配置 → 唯一企业自动）：
+    // MCP 强制要这个参数，而把"钉住值 0"直接发过去就是 401（详见 host/enterpriseId.ts）。
+    const enterprise = await deps.enterprise.resolve(() => listVisibleEnterprises(tools, agent))
+    if (enterprise.id <= 0) throw new DocError('no-enterprise', noEnterpriseHint(enterprise))
+
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     let result: ToolExecutionLike
@@ -345,7 +389,7 @@ export function createMcpDocs(deps: McpDocDeps) {
       result = await tools.execute({
         callId: `gitee-chat-docs-${Date.now()}-${seq++}`,
         name,
-        arguments: { enterprise_id: deps.enterpriseId, ...args },
+        arguments: { enterprise_id: enterprise.id, ...args },
         agent,
         signal: controller.signal,
       })
@@ -358,12 +402,22 @@ export function createMcpDocs(deps: McpDocDeps) {
       if (/UNKNOWN_TOOL/i.test(message)) {
         throw new DocError('unknown-tool', `MCP 工具 ${name} 在本会话不可见。请确认该会话用的是 Gitee 预设，且 docs.mcpToolPrefix 与 preset 的 serverName 一致。`)
       }
-      throw new DocError('tool-failed', `调用 MCP 工具 ${name} 失败：${message}`)
+      throw new DocError('tool-failed', unauthorizedEnterpriseHint(`调用 MCP 工具 ${name} 失败：${message}`, enterprise.id, deps.enterprise.describe()))
     } finally {
       clearTimeout(timer)
     }
 
-    const value = unwrapToolResult(name, result)
+    // MCP 的报错是从这里抛出去的（`tool-failed`）—— 企业 id 不对时补一句人话再往外走：
+    // 否则使用者看到的是「企业未授权此应用进行访问」，会往 token 的方向白查（见 host/enterpriseId.ts）。
+    let value: unknown
+    try {
+      value = unwrapToolResult(name, result)
+    } catch (error) {
+      if (error instanceof DocError && error.code === 'tool-failed') {
+        throw new DocError('tool-failed', unauthorizedEnterpriseHint(error.message, enterprise.id, deps.enterprise.describe()))
+      }
+      throw error
+    }
     // execute 对不可见工具返回错误结果而不是抛 —— 这里再认一次。
     const record = asRecord(value)
     if (record !== undefined && typeof record.error === 'string' && /UNKNOWN_TOOL/i.test(record.error)) {
@@ -453,8 +507,13 @@ export function createMcpDocs(deps: McpDocDeps) {
   }
 
   return {
-    /** 本委派层使用的企业 id（诊断用）。 */
-    enterpriseId: deps.enterpriseId,
+    /**
+     * 当前生效的企业 id（**现取**：诊断用；缓存分层也以它为准）。
+     *
+     * 注意它是同步解析的第 1–3 步（flag/env/本地配置），自动识别出来的那家会作为
+     * 最近一次探测结果回报 —— 与真正发给 MCP 的 id 在自动识别场景下可能有一拍之差。
+     */
+    resolveEnterpriseId: () => deps.enterprise.id(),
     /** 工具名前缀（诊断用）。 */
     toolPrefix: deps.toolPrefix,
 

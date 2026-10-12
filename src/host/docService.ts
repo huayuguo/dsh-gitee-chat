@@ -126,7 +126,15 @@ const STATE_LABEL: Record<DocPageStateView, string> = {
 export function createDocService(deps: DocServiceDeps) {
   const { docs, cacheRoot } = deps
   const maxPageChars = deps.maxPageChars ?? 200_000
-  const enterpriseId = docs.enterpriseId
+  /**
+   * 当前生效的企业 id —— **每次用到时现取**，不在装配时快照。
+   *
+   * 这里曾经写成 `const enterpriseId = docs.enterpriseId`（装配期取一次）。两个问题：
+   * 一是那个值默认就是"钉住值 0"（MCP 侧的 401 与它同源，见 host/enterpriseId.ts）；
+   * 二是设置页切了企业它也不会变 —— 缓存分层会继续按旧企业分家。
+   * 现取的成本只是读一个三行 JSON。
+   */
+  const enterpriseId = (): number => docs.resolveEnterpriseId()
 
   /**
    * 把一条缓存路径换算成**会话工作区里可见**的路径。
@@ -162,7 +170,7 @@ export function createDocService(deps: DocServiceDeps) {
     const idx = index()
     return documentDir({
       cacheRoot,
-      enterpriseLayerPath: enterpriseLayer(cacheRoot, enterpriseId, idx),
+      enterpriseLayerPath: enterpriseLayer(cacheRoot, enterpriseId(), idx),
       programId: input.programId,
       documentId: input.documentId,
       name: input.name,
@@ -179,7 +187,7 @@ export function createDocService(deps: DocServiceDeps) {
   /** 记下定位信息并返回目录（用于首次落盘）。 */
   function ensureDir(input: { documentId: number; programId: number | null; name: string }): string {
     rememberDocument(cacheRoot, input.documentId, {
-      enterpriseId,
+      enterpriseId: enterpriseId(),
       programId: input.programId,
       name: input.name,
     })
@@ -347,7 +355,7 @@ export function createDocService(deps: DocServiceDeps) {
       // 记下"下载那一刻的远端事实" —— 下次就是靠它判"远端有没有变"。
       writeAttachManifest(dir, {
         schema: 1,
-        enterpriseId,
+        enterpriseId: enterpriseId(),
         nodeId: input.nodeId,
         fileId: input.fileId,
         name,
@@ -399,7 +407,7 @@ export function createDocService(deps: DocServiceDeps) {
       })
       const contentReadable = deps.readAttachmentContent !== undefined
       // 企业层路径**只算一次**（每算一次都要读根索引），逐节点复用。
-      const layer = enterpriseLayer(cacheRoot, enterpriseId, index())
+      const layer = enterpriseLayer(cacheRoot, enterpriseId(), index())
       const rows: DocNodeRow[] = nodes.map((node) => {
         const directory = node.fileType === 'DocDirectory'
         const readable = directory || contentReadable
@@ -428,7 +436,7 @@ export function createDocService(deps: DocServiceDeps) {
       })
       return {
         ok: true,
-        enterpriseId,
+        enterpriseId: enterpriseId(),
         roots: [{ programId, programName: '', nodes: rows }],
         total: rows.length,
         cacheRoot,
@@ -476,7 +484,7 @@ export function createDocService(deps: DocServiceDeps) {
 
       return {
         ok: true,
-        enterpriseId,
+        enterpriseId: enterpriseId(),
         scope: wanted === undefined ? 'common' : 'program',
         programId: wanted ?? null,
         total: result.total,
@@ -630,7 +638,7 @@ export function createDocService(deps: DocServiceDeps) {
       writeLocalPage(dir, relPath, content)
       const next: DocManifest = {
         schema: 1,
-        enterpriseId,
+        enterpriseId: enterpriseId(),
         programId,
         documentId,
         documentNodeId: 0,
@@ -712,7 +720,7 @@ export function createDocService(deps: DocServiceDeps) {
       const targetDir = cachedDirOf(documentId) ?? dir
       const next: DocManifest = {
         schema: 1,
-        enterpriseId,
+        enterpriseId: enterpriseId(),
         programId,
         documentId,
         documentNodeId: 0,
@@ -805,7 +813,7 @@ export function createDocService(deps: DocServiceDeps) {
     /** 某个项目/公共文档集合的本地目录（界面显示与批量清理都用它）。 */
     scopePath(programId: number | null): string {
       const idx = index()
-      return scopeDir(cacheRoot, enterpriseLayer(cacheRoot, enterpriseId, idx), programId)
+      return scopeDir(cacheRoot, enterpriseLayer(cacheRoot, enterpriseId(), idx), programId)
     },
 
     /**
@@ -827,7 +835,7 @@ export function createDocService(deps: DocServiceDeps) {
     /** 供 /ping 诊断：本地缓存根与已缓存文档数。 */
     snapshot(): { cacheRoot: string; documents: number; enterpriseId: number } {
       const idx = index()
-      return { cacheRoot, documents: Object.keys(idx.documents ?? {}).length, enterpriseId }
+      return { cacheRoot, documents: Object.keys(idx.documents ?? {}).length, enterpriseId: enterpriseId() }
     },
   }
   return service

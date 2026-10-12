@@ -25,6 +25,7 @@
  *
  * @module dsh-gitee-chat/host/mcp-docs
  */
+import { type EnterpriseIdResolver } from './enterpriseId.ts';
 /** 文档委派失败的原因（供路由映射 HTTP 状态）。 */
 export type DocErrorCode = 
 /** 请求没带 sessionId。 */
@@ -33,6 +34,8 @@ export type DocErrorCode =
  | 'no-agent'
 /** 宿主没有 tools 注册表（组合不完整）。 */
  | 'no-tools'
+/** 解析不出企业 id（没钉、没有本地配置、token 又对不上唯一企业）。 */
+ | 'no-enterprise'
 /** MCP 工具不存在（多半是该会话没挂 Gitee preset，或前缀配错了）。 */
  | 'unknown-tool'
 /** MCP 工具本身报错（参数、权限、网络…）。 */
@@ -77,8 +80,8 @@ export interface McpDocDeps {
     readonly tools: () => ToolsService | undefined;
     /** MCP 工具名前缀（默认 `mcp__gitee_ent__`，跟 preset 的 serverName 走）。 */
     readonly toolPrefix: string;
-    /** 企业 id（工具的第一个必填参数）。 */
-    readonly enterpriseId: number;
+    /** 企业 id **解析器**（工具的第一个必填参数，每次调用现取 —— 见 host/enterpriseId.ts）。 */
+    readonly enterprise: EnterpriseIdResolver;
     /** 单次调用超时（毫秒）。 */
     readonly timeoutMs?: number;
 }
@@ -221,11 +224,16 @@ export declare function unwrapToolResult(name: string, result: ToolExecutionLike
  * **每一个方法都只做三件事**：拼参数 → 按作用域调 MCP → 裁剪成界面要的形状。
  * 任何"这个端点该怎么调"的知识都**不在这个文件里**，它在 MCP 工具的描述里。
  *
- * @param deps - agent 解析、tools 注册表、前缀与企业 id。
+ * @param deps - agent 解析、tools 注册表、前缀与企业 id 解析器。
  */
 export declare function createMcpDocs(deps: McpDocDeps): {
-    /** 本委派层使用的企业 id（诊断用）。 */
-    enterpriseId: number;
+    /**
+     * 当前生效的企业 id（**现取**：诊断用；缓存分层也以它为准）。
+     *
+     * 注意它是同步解析的第 1–3 步（flag/env/本地配置），自动识别出来的那家会作为
+     * 最近一次探测结果回报 —— 与真正发给 MCP 的 id 在自动识别场景下可能有一拍之差。
+     */
+    resolveEnterpriseId: () => number;
     /** 工具名前缀（诊断用）。 */
     toolPrefix: string;
     /**

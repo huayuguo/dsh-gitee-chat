@@ -56,8 +56,13 @@ export interface GiteeEntGatewayDeps {
   readonly allowWrites: boolean
   /** 运行期写名单（`role.current()?.writes`）；未解析出来时返回空数组即可。 */
   readonly runtimeWrites?: () => readonly string[]
-  /** 本部署钉住的企业 id（>0 时写进目录抬头，省掉一次 list_enterprises）。 */
-  readonly enterpriseId?: number
+  /**
+   * 生效企业 id 的**现取**选择器：`() => ({ id, describe })`，`id <= 0` 表示没解析出来。
+   *
+   * 为什么是函数而不是一个数字：企业可以在「设置 → Gitee 企业项目」里随时切换，
+   * 目录抬头要跟着变，不能钉死在注册那一刻（见 `host/enterpriseId.ts` 的「每次现取」纪律）。
+   */
+  readonly enterpriseSelector?: () => { readonly id: number; readonly describe: string }
   /** 目录里每条描述截断到多少字符（默认 100）。 */
   readonly catalogChars?: number
   /** 单次结果最多回多少字节（默认 120000，超出截断并提示）。 */
@@ -133,8 +138,13 @@ export function giteeEntGatewayTool(deps: GiteeEntGatewayDeps): ToolDefinition {
       `# Gitee 企业工具目录（共 ${tools.length} 个${writes.size === 0 ? '' : '；✎ = 写操作'}）`,
       '',
     ]
-    if (deps.enterpriseId !== undefined && deps.enterpriseId > 0) {
-      head.push(`本部署钉住的企业 id：\`${deps.enterpriseId}\`（工具参数要 enterprise_id 时直接用它）。`, '')
+    const enterprise = deps.enterpriseSelector?.()
+    if (enterprise !== undefined && enterprise.id > 0) {
+      // 来源要说清楚：钉住 / 环境变量 / 本地配置 / 自动识别，四种都可能（见 host/enterpriseId.ts）。
+      // 这句话直接决定模型 `call` 时填哪个 enterprise_id —— 填 0 或填错都会拿到
+      // 「企业未授权此应用进行访问」那个 401，所以宁可多写一句来源。
+      const from = enterprise.describe === '' ? '' : `；来源：${enterprise.describe}`
+      head.push(`当前生效的企业 id：\`${enterprise.id}\`（工具参数要 enterprise_id 时直接用它${from}）。`, '')
     } else {
       head.push('企业 id 不确定时，先 `{"op":"call","name":"list_enterprises"}`。', '')
     }

@@ -25,6 +25,7 @@ import z from 'schemastery'
 import { createGqRunner, defaultScriptPath, packageRoot } from './host/gq.ts'
 import { dshHome, ensureMaterialized, inspectMcpBinary, readManifest } from './host/mcpBinary.ts'
 import { createRoleResolver } from './host/role.ts'
+import { createEnterpriseIdResolver } from './host/enterpriseId.ts'
 import { ROUTE_PREFIX, createRouteHandler } from './host/routes.ts'
 import { createIssueWriter } from './host/write.ts'
 import { createMcpDocs, type ToolsService } from './host/mcpDocs.ts'
@@ -335,6 +336,16 @@ export function compositionMountsRow(text: string, rowName: string): boolean {
 export function apply(ctx: any, config?: Config): void {
   const resolved = resolveConfig(config)
 
+  /**
+   * 「当前生效的企业 id」——**全插件只有这一个解析器**。
+   *
+   * 顺序（flag → env → 本地配置 → 唯一企业自动）与 `scripts/gitee/gq.mjs` 逐条对齐，
+   * 见 `host/enterpriseId.ts`。要点：**凡是要发给 MCP 的 enterprise_id 都从这里现取**，
+   * 不能再把补丁里的"钉住值"直接透传 —— 那个值默认是 0，而 MCP 收到 0 会直接 401
+   * （2026-10-12 的仓库/知识库面板全挂就是这条）。
+   */
+  const enterprise = createEnterpriseIdResolver({ pinned: resolved.enterpriseId })
+
   const runner = createGqRunner({
     scriptPath: resolved.scriptPath,
     timeoutMs: resolved.scriptTimeoutMs,
@@ -383,7 +394,11 @@ export function apply(ctx: any, config?: Config): void {
     const env: NodeJS.ProcessEnv = { ...process.env, ...childEnvOverrides(resolved) }
     const token = resolveToken()
     if (token !== '') env.GITEE_ENT_MCP_ACCESS_TOKEN = token
-    if (resolved.enterpriseId > 0) env.GITEE_ENT_ID = String(resolved.enterpriseId)
+    // 生效企业（不只是"钉住值"）：模型经 gateway 调 MCP 时若没自己带 enterprise_id，
+    // 二进制就回落到这个环境变量。多企业且没指定时 `now().id` 是 0 —— 那就不设，
+    // 让模型自己去 `list_enterprises` 选，**绝不替它猜一家**。
+    const effectiveEnterpriseId = enterprise.now().id
+    if (effectiveEnterpriseId > 0) env.GITEE_ENT_ID = String(effectiveEnterpriseId)
     return env
   }
   ctx.inject(['tools'], (child: any) => {
@@ -399,7 +414,9 @@ export function apply(ctx: any, config?: Config): void {
         client,
         allowWrites: resolved.allowWrites,
         runtimeWrites: () => role.current()?.writes ?? [],
-        enterpriseId: resolved.enterpriseId,
+        // 现取（不是注册那一刻的快照）：企业可以在设置里随时切换，目录抬头要跟着变。
+        // 解析不出来时 `id` 是 0 —— 那时抬头写"先 list_enterprises"，绝不写成 `enterprise_id: 0`。
+        enterpriseSelector: () => ({ id: enterprise.now().id, describe: enterprise.describe() }),
       })
       const unregister = child.tools.register(tool)
       ctx.logger?.info?.(
@@ -588,7 +605,7 @@ export function apply(ctx: any, config?: Config): void {
     agentOf,
     tools: toolsService,
     toolPrefix: resolved.docs.mcpToolPrefix,
-    enterpriseId: resolved.enterpriseId,
+    enterprise,
     timeoutMs: resolved.scriptTimeoutMs,
   })
   /**
@@ -718,6 +735,7 @@ export { WRITE_TOOLS, WRITE_TOOLS_BY_TIER } from './generated/tierWrites.ts'
 export type { McpClient, McpCallResult, McpToolInfo, McpClientOptions } from './host/mcpClient.ts'
 export type { GiteeEntGatewayDeps } from './host/gateway.ts'
 export { listEnterprises, switchEnterprise, invalidateAfterEnterpriseSwitch } from './host/enterprise.ts'
+export { createEnterpriseIdResolver, resolveEnterpriseIdNow, noEnterpriseHint, unauthorizedEnterpriseHint } from './host/enterpriseId.ts'
 export {
   DocError, createMcpDocs, unwrapToolResult,
 } from './host/mcpDocs.ts'
@@ -742,5 +760,6 @@ export type { GqRunner, RunRequest, RunResult } from './host/gq.ts'
 export type { McpBinaryReport, McpInspection, McpManifest } from './host/mcpBinary.ts'
 export type { RoleResolver, RoleSnapshot } from './host/role.ts'
 export type { EnterpriseEntry, EnterpriseListPayload, SwitchResult } from './host/enterprise.ts'
+export type { EnterpriseIdResolution, EnterpriseIdResolver, EnterpriseIdSource } from './host/enterpriseId.ts'
 export type { GiteeChatFace } from './host/face.ts'
 export type { PersonaKey, PersonaMode, PersonaTier, RolePayload } from './types.ts'

@@ -156,12 +156,13 @@ function errorResponse(error: unknown): { status: number; body: ErrorResponse } 
     return { status, body: { ok: false, code: error.code, message: error.message } }
   }
   if (error instanceof DocError) {
-    // 文档委派的失败要能一眼看出"是会话、是作用域、还是 MCP 本身"。
+    // 文档委派的失败要能一眼看出"是会话、是作用域、是没选企业、还是 MCP 本身"。
     const status = error.code === 'no-session' ? 400
       : error.code === 'no-agent' ? 409
-        : error.code === 'timeout' ? 504
-          : error.code === 'no-tools' || error.code === 'unknown-tool' ? 503
-            : 502
+        : error.code === 'no-enterprise' ? 409
+          : error.code === 'timeout' ? 504
+            : error.code === 'no-tools' || error.code === 'unknown-tool' ? 503
+              : 502
     return { status, body: { ok: false, code: 'script-failed', message: error.message } }
   }
   if (error instanceof WriteError) {

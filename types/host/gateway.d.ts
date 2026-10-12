@@ -37,8 +37,16 @@ export interface GiteeEntGatewayDeps {
     readonly allowWrites: boolean;
     /** 运行期写名单（`role.current()?.writes`）；未解析出来时返回空数组即可。 */
     readonly runtimeWrites?: () => readonly string[];
-    /** 本部署钉住的企业 id（>0 时写进目录抬头，省掉一次 list_enterprises）。 */
-    readonly enterpriseId?: number;
+    /**
+     * 生效企业 id 的**现取**选择器：`() => ({ id, describe })`，`id <= 0` 表示没解析出来。
+     *
+     * 为什么是函数而不是一个数字：企业可以在「设置 → Gitee 企业项目」里随时切换，
+     * 目录抬头要跟着变，不能钉死在注册那一刻（见 `host/enterpriseId.ts` 的「每次现取」纪律）。
+     */
+    readonly enterpriseSelector?: () => {
+        readonly id: number;
+        readonly describe: string;
+    };
     /** 目录里每条描述截断到多少字符（默认 100）。 */
     readonly catalogChars?: number;
     /** 单次结果最多回多少字节（默认 120000，超出截断并提示）。 */
