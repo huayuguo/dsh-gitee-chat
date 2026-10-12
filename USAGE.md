@@ -288,3 +288,60 @@ npm run doctor                 # 换机器/换同事前的可移植性体检
 - **不删数据**：MCP 没有删除能力（这是 Gitee 侧的限制），需要删请到网页操作。
 - **不替你猜企业**：多企业时必须显式指定 —— 拿错公司的数据比报错更糟。
 - **不把明细塞进对话**：模型只拿摘要，明细由标签页自己取。
+
+---
+
+## 附录：安装与升级的常见坑
+
+### PowerShell 执行策略（Windows）
+
+受管机器默认是 `Restricted`，`.ps1` 会被直接拒（`running scripts is disabled`）。
+npm 的全局 shim 有三份（`dsh`、`dsh.cmd`、`dsh.ps1`）：**PowerShell 优先挑 `.ps1`** 所以撞策略，
+而 cmd.exe 挑的是 `dsh.cmd`。看到下面这句不是装失败：
+
+```
+dsh : 无法加载文件 C:\Users\<你>\AppData\Roaming\npm\dsh.ps1，因为在此系统上禁止运行脚本。
+```
+
+`install-dsh.cmd` 会自己处理，口径是窄的：只把**出厂默认**的 `Restricted` 提到 `RemoteSigned`、
+**只作用于当前用户**（不需要管理员）；`AllSigned` 不动（那是有人故意选的更严档位，只提示）；
+被**组策略**压着时改不动，会把作用域表打出来并提示改用 `dsh.cmd`；5.1（`powershell.exe`）与 7
+（`pwsh.exe`）策略存储互相独立，两个都探。手工口径：
+
+```powershell
+Get-ExecutionPolicy -List                            # 看 MachinePolicy/UserPolicy 是不是 Undefined
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned  # 放宽
+Set-ExecutionPolicy -Scope CurrentUser Undefined     # 撤销（uninstall-dsh.cmd 就是这么还原的）
+```
+
+改完**当前那个窗口**还报同样的错，关掉重开一个（策略按进程读）。
+
+### `pnpm install` 卡在第一步（`ERR_PNPM_*`）
+
+- `ERR_PNPM_NO_MATCHING_VERSION`：`pnpm-workspace.yaml` 缺 `autoInstallPeers: false`。
+  `@deepseek-ai/dsh-*` 这些 peer 由 **DSH 的依赖闭包**在运行时提供，registry 上没有对应版本的
+  独立包，pnpm 默认会去装。用 npm 的等价物是 `npm install --legacy-peer-deps`。
+- `ERR_PNPM_IGNORED_BUILDS`（exit 1）：`allowBuilds.esbuild: true` 必须是**真布尔值**——
+  pnpm 10 起默认不跑依赖的构建脚本；仓库里原本躺着 pnpm 生成的占位串
+  `set this to true or false`，等于没放行。
+- `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`（`Lockfile failed supply-chain policy check`）：
+  profile 锁文件里有 **24 小时内刚发布**的包，pnpm 11 的供应链校验拦下。给那条命令补
+  `--config.minimumReleaseAge=0` 即可；**别去改 profile 的 `minimumReleaseAgeExclude`**（校验期不看它）。
+
+### `link:` 装法的坑（2026-09-21 同事机实测）
+
+`dsh plugin add <本包目录>` 记的是 `link:` 时，插件模块的 realpath 落在
+`$DSH_HOME/profiles/**` 之外，Node 的父目录回溯够不到 DSH 的依赖闭包
+（agent 半那句 `@deepseek-ai/dsh-tools` → `Cannot find package`）。它**只在起会话组装 preset 时**
+加载，所以装完、启动都正常，症状是**「选了工作区没反应」**（会话建不起来，前端静默退回）。
+`node scripts/setup.mjs apply` 会探针 + 自动补一跳；想彻底避开就用真目录装法
+`dsh plugin --profile <profile> add "file:$(pwd)"`。代价：`file:` 是副本，改完 `lib/` 要重新
+`add` 一次 —— 所以**开发时**用 `link:` + `apply` 自愈，**发给同事**用 `file:`。
+
+### 桌面版为什么必须用应用自带的 CLI
+
+全局装的 `dsh` 会拒绝 `--profile desktop`（*managed exclusively by the Electron application*）。
+用 `<应用目录>\resources\runtime\cli\bin\dsh.cmd`，或 GUI 的「设置 → 插件 → 添加插件」。
+
+> 顺带一提：`npm install -g` 在 npm 11 起会打印 5 条 `allow-scripts` 警告
+> （`node-pty` / `koffi` 等脚本被门禁挡下），**实测对本插件与 DSH 无影响**。
