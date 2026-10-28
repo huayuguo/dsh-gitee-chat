@@ -6,7 +6,7 @@
  *   - `./doc-cache` —— 按需缓存 + 页级四态判定（纯函数）
  *
  * 这一层**只做编排**：调哪个工具、什么时候落盘、哪些页该拉。
- * 它**不认识任何文档端点**（那是 MCP 的事）。
+ * 它**不认识任何文档端点**（那是 MCP 的事，见 `DOCS.md` §7）。
  *
  * 三条行为纪律：
  *
@@ -497,7 +497,7 @@ export function createDocService(deps: DocServiceDeps) {
     /**
      * 企业级关键词搜索。
      *
-     * ⚠️ **不能按项目过滤** —— MCP 的 `search` 与 `program_id` 互斥。
+     * ⚠️ **不能按项目过滤** —— MCP 的 `search` 与 `program_id` 互斥（`DOCS.md` §1.2）。
      * 响应里带 `enterpriseWide: true`，界面据此明确提示。
      *
      * @param sessionId - 会话 id。

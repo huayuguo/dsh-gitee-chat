@@ -1,7 +1,7 @@
 /**
  * 知识库文档的**按需缓存**与**页级版本核对**（host 平面）。
  *
- * 设计口径：两条最容易搞错、所以在这里写死的事：
+ * 设计口径见 `DOCS.md` §3–§5。两条最容易搞错、所以在这里写死的事：
  *
  *   1. 缓存**不是镜像** —— 只有"读过的那几篇、那几页"在本地。
  *      全量拉取被明确否掉（浪费空间 + 同步不及时）。
@@ -9,7 +9,7 @@
  *      而文档级的 `updated_at` 只配当"粗筛"。
  *
  * 判定逻辑全部是**纯函数**（`classifyPageState` / `rollupDocState` / `planPull`），
- * 因此可以被冒烟测试逐条断言 —— 这是「能用规则算的就别让模型算」
+ * 因此可以被冒烟测试逐条断言 —— 这是 `DESIGN.md` §13「能用规则算的就别让模型算」
  * 在本功能上的落点。
  *
  * @module dsh-gitee-chat/host/doc-cache
@@ -196,7 +196,42 @@ export interface DocsIndex {
 
 /** 当前时间戳（本地口径，与 Gitee 的字符串格式保持一致风格）。 */
 export function nowStamp(): string {
-  return new Date().toISOString().replace('T', ' ').slice(0, 19)
+  return stampOf(new Date())
+}
+
+/**
+ * 把时刻格式化成**本机时间**的字符串：`2026-10-27 13:02:11`。
+ *
+ * 为什么不是 `toISOString().slice(0,19)`：那是 UTC，界面上会印出「04:57」而
+ * 使用者手表是 12:57 —— 用户 2026-10-27 先指出「时间不对」，改成带 `+08:00`
+ * 偏移后又说「这个 +08:00 不用显示」。所以：**用本机时间，不打印时区段**。
+ * 单时区场景下这是最干净的显示；机器读的老数据由 `parseStamp()` 兜住。
+ *
+ * @param date - 要格式化的时刻。
+ * @returns 形如 `YYYY-MM-DD HH:mm:ss` 的字符串。
+ */
+export function stampOf(date: Date): string {
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+/**
+ * 解析时间戳，**新旧两种格式都认**。
+ *
+ * - 本机时间：`2026-10-27 12:57:40`（无偏移，按本机时区解释）
+ * - 带偏移：`2026-10-27 12:57:40 +08:00`（过渡期写出去过的串，仍要能读）
+ *
+ * @param raw - 时间戳字符串。
+ * @returns 毫秒时间戳；解析不出来时返回 `NaN`。
+ */
+export function parseStamp(raw: string): number {
+  const trimmed = raw.trim()
+  // 「日期 时间 偏移」→ ISO 的「日期T时间+偏移」（偏移前的空格是 Date.parse 的克星）
+  const isoish = trimmed.replace(' ', 'T').replace(/ ([+-]\d{2}:?\d{2})$/, '$1')
+  const at = Date.parse(isoish)
+  if (Number.isFinite(at)) return at
+  return Date.parse(trimmed)
 }
 
 /** 读 JSON 文件；不存在或坏了都返回 undefined（缓存坏了不该让功能挂掉）。 */
@@ -322,7 +357,7 @@ export function removeDocument(dir: string): void {
 //
 // 剩下来的问题只有一个：**远端那份还是不是我下载的那一份？**
 // 唯一可靠的信号是节点上的 `updated_at` 与 `attach_file.size`：
-//   · `updated_at` 变 → 内容变了（或节点被改过名/挪过位置 —— #1）
+//   · `updated_at` 变 → 内容变了（或节点被改过名/挪过位置 —— 见 DOCS.md §13.2 #1）
 //   · `size` 变      → 内容一定变了
 //
 // ⚠️ **不做 sha256**：那一列本来是为"本地被改过"准备的，而附件永远不被本地改。

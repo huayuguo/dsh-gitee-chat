@@ -1,7 +1,7 @@
 /**
  * preset 交付自检 + 可移植性体检（`--doctor`）。
  *
- * **preset 不是"拷到用户根的文件"**：DSH 已移除 `@deepseek-ai/dsh-agent-presets`
+ * **preset 不再是"拷到用户根的文件"**：DSH 0.1.7 起移除了 `@deepseek-ai/dsh-agent-presets`
  * （复数，扫 `$DSH_HOME/.agent-presets/` 的那个包），preset 改成声明式的
  * `@deepseek-ai/dsh-agent-preset`（单数）行，由 bundle 的 patch 交付 ——
  * 随发行版的 standard/ptc/minimal/cordis 就是这么发的（`dsh-web-app/presets/*.patch.yml`）。
@@ -13,9 +13,9 @@
  *   node scripts/check-presets.mjs --check    # 交付判据，CI/门禁用（`npm run check` 里跑）
  *   node scripts/check-presets.mjs --doctor   # 换机器 / 换同事前的可移植性体检（说人话）
  *
- * 本包不再有 `install-presets.mjs`（把目录拷到 `~/.dsh/.agent-presets/`）：
+ * 曾经的 `install-presets.mjs`（把目录拷到 `~/.dsh/.agent-presets/`）已删除：
  * 在新机制下那份文件**没有任何消费者**，装上也不会出现在 preset 列表里
- * 2026-09-28 在 DSH 0.1.7-rc.2 上实测。
+ * —— 2026-09-28 在 DSH 0.1.7-rc.2 上实测（见 DESIGN.md §29）。
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
@@ -37,9 +37,9 @@ const PRESET_ROW = '@deepseek-ai/dsh-agent-preset'
 /**
  * 本包 `dsh.bundle.patch` 声明的补丁文件的**合并文本**（字符串或数组都认）。
  *
- * 为什么不写死文件名：bundle 补丁不止一个文件 —— host 行在
+ * 为什么不写死文件名：bundle 补丁不止一个文件 —— 0.4.5 起 host 行在
  * `cordis.patch.yml`、skill 行在 `cordis.skills.patch.yml`（它必须带 config，
- * 而 host 那个文件必须留成纯 insert 供插件市场热挂载），
+ * 而 host 那个文件必须留成纯 insert 供插件市场热挂载，见 DESIGN.md §35），
  * preset 在 `presets/*.patch.yml`。所以"某一行在不在补丁里"这类判据要看**全部**。
  */
 function bundlePatchText() {
@@ -197,15 +197,17 @@ function checkEnvironment() {
     if (!existsSync(join(root, entry))) problems.push(`缺少构建产物/脚本：${entry}（先跑 npm run build）`)
   }
 
-  // 随包 MCP 二进制：落在**用户级 bin**（POSIX `$XDG_BIN_HOME`→`~/.local/bin`，
-  // Windows `%USERPROFILE%\.local\bin`）；没有才看 PATH。
+  // 随包 MCP 二进制：0.5.1 起落在**用户级 bin**（POSIX `$XDG_BIN_HOME`→`~/.local/bin`，
+  // Windows `%USERPROFILE%\.local\bin`）；0.5.0 的旧私有副本仍算"过渡期间可用"，
+  // 都没有才看 PATH。
   const ext = process.platform === 'win32' ? '.exe' : ''
   const xdg = process.env.XDG_BIN_HOME
   const binDir = process.platform === 'win32'
     ? join(homedir(), '.local', 'bin')
     : (typeof xdg === 'string' && xdg.trim() !== '' ? xdg.trim() : join(homedir(), '.local', 'bin'))
   const userBin = join(binDir, `mcp-gitee-ent${ext}`)
-  if (!existsSync(userBin)) {
+  const legacyBin = join(dshHome, '.gitee-chat', 'bin', `mcp-gitee-ent${ext}`)
+  if (!existsSync(userBin) && !existsSync(legacyBin)) {
     const sep = process.platform === 'win32' ? ';' : ':'
     const onPath = (process.env.PATH ?? '').split(sep).some((dir) => existsSync(join(dir, `mcp-gitee-ent${ext}`)))
     if (!onPath) {
@@ -226,13 +228,13 @@ function checkEnvironment() {
   const tokenFile = tokenCandidates.find((p) => existsSync(p))
   if (!envToken && tokenFile === undefined) {
     notes.push('没有找到 Gitee token。取数会报「未配置 token」，界面会明确提示而不是显示空数据。'
-      + '**推荐在界面里填**：应用「设置 → Gitee 企业项目」（存完即时生效）；'
+      + '**推荐在界面里填**：应用「设置 → Gitee 企业项目」（0.4.1 起，存完即时生效）；'
       + `也可以自己放：环境变量或 ${tokenCandidates.join(' / ')}`)
   }
 
   // skill：随包分发，由**本包 bundle 补丁**挂 provider 指向 <包>/skills。
-  // 这一行单独在 cordis.skills.patch.yml（它必须带 config，而
-  // cordis.patch.yml 要留成纯 insert 给插件市场热挂载用），
+  // 0.4.5 起这一行单独在 cordis.skills.patch.yml（它必须带 config，而
+  // cordis.patch.yml 要留成纯 insert 给插件市场热挂载用，见 DESIGN.md §35），
   // 所以按 dsh.bundle.patch 声明的文件一起找，不写死文件名。
   const skillFile = join(root, 'skills', 'dsh-gitee-chat', 'SKILL.md')
   const patchText = bundlePatchText()
@@ -250,7 +252,7 @@ function checkEnvironment() {
     const stale = readdirSync(staleRoot).filter((n) => n.startsWith('gitee-') && !n.includes('.bak-'))
     if (stale.length > 0) {
       notes.push(`旧机制的遗留目录：${stale.map((n) => join(staleRoot, n)).join(' / ')}`
-        + ' —— DSH 不再读 `$DSH_HOME/.agent-presets/`，这些目录可以删掉（删前确认没有别的手工 preset）')
+        + ' —— DSH 0.1.7 起不再读 `$DSH_HOME/.agent-presets/`，这些目录可以删掉（删前确认没有别的手工 preset）')
     }
   }
 
@@ -396,7 +398,7 @@ function selfTest() {
     "    - id: preset-gitee-exec",
     "      name: '@deepseek-ai/dsh-agent-preset'",
     '      config:',
-    '        id: gitee-exec',
+    '        id: gitee',
     '        plugins:',
     "          - id: persona",
     "            name: '@deepseek-ai/dsh-persona'",
@@ -420,13 +422,70 @@ function selfTest() {
   }
 }
 
+/**
+ * preset 插件行引用的**子路径**导出（`@scope/pkg/sub`）是跨版本最脆的一环：
+ * DSH 0.2.1-rc.3 把 `@deepseek-ai/dsh-tool-subagent-control/list-agents` 合进了包根，
+ * 子路径不再导出。导入失败的行在组合里没有 fiber，注册表把整条 preset 记为 broken
+ * （「never started」），表现就是**预设从新会话下拉里消失**，而且没有任何报错提示。
+ * 因此这里只拦「@deepseek-ai 子路径」，根包名照旧（跨版本最稳）。
+ */
+function checkSubpathRows() {
+  const problems = []
+  const allow = new Set(['dsh-gitee-chat/agent'])
+  for (const file of readdirSync(sourceRoot).filter((name) => name.endsWith('.yml'))) {
+    const text = readFileSync(join(sourceRoot, file), 'utf8')
+    for (const line of text.split('\n')) {
+      const match = /^\s*(?:-\s*)?name:\s*'([^']+)'\s*$/.exec(line)
+      if (match === null) continue
+      const name = match[1]
+      if (allow.has(name)) continue
+      const coreSubpath = /^@deepseek-ai\/(?:(?!\/).)*\/.+$/.test(name)
+      if (coreSubpath) {
+        problems.push(`presets/${file} 引用了核心包子路径 ${name}：核心 0.2.1-rc.3 已不再导出该子路径，`
+          + '这一行导入失败会让整条 preset 变 broken（预设从下拉里消失）。改用包根，或给该行加 disabled: true')
+      }
+    }
+  }
+  return { problems }
+}
+
+/**
+ * persona 模板里的 `{{…}}` 只认宿主**已注册**的提示词变量（当前是 `provider` 与 `model`）。
+ *
+ * 写成未知变量不会被忽略：提示词渲染阶段会抛
+ * `unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"`，
+ * 整个回合直接失败 —— 而且报错发生在**运行时**，静态检查能拦就一定要拦。
+ * `{{cwd}}` 曾经可用、0.2.1-rc.3 已移除（工作区路径改由注入的运行时上下文给出）。
+ */
+function checkPromptVariables() {
+  const problems = []
+  const registered = new Set(['provider', 'model'])
+  for (const file of readdirSync(sourceRoot).filter((name) => name.endsWith('.yml'))) {
+    const text = readFileSync(join(sourceRoot, file), 'utf8')
+    text.split('\n').forEach((line, index) => {
+      // 注释行不参与（说明性文字里写到变量名是合规的）。
+      if (/^\s*#/.test(line)) return
+      for (const match of line.matchAll(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g)) {
+        const name = match[1]
+        if (registered.has(name)) continue
+        problems.push(`presets/${file}:${index + 1} 用了未注册的提示词变量 {{${name}}}`
+          + `（宿主只注册 ${[...registered].map((n) => `{{${n}}}`).join(' / ')}）：`
+          + '渲染时会抛 unknown prompt variable，整个回合失败。改成静态文案，或删除该模板')
+      }
+    })
+  }
+  return { problems }
+}
+
 function main() {
   selfTest()
   const doctor = process.argv.includes('--doctor')
   const delivery = checkDelivery()
   const env = checkEnvironment()
   const expr = checkPresetExpressions()
-  const problems = [...delivery.problems, ...env.problems, ...expr.problems]
+  const subpaths = checkSubpathRows()
+  const vars = checkPromptVariables()
+  const problems = [...delivery.problems, ...env.problems, ...expr.problems, ...subpaths.problems, ...vars.problems]
   const notes = [...delivery.notes, ...env.notes, ...expr.notes]
 
   if (doctor) {

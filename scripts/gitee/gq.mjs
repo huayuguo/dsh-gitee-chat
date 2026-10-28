@@ -80,9 +80,31 @@ export function mcpUserAgent(env = process.env) {
 /** 单次取数最多翻几页（100/页）。企业工作项上千时靠它兜住时延。 */
 export const DEFAULT_MAX_PAGES = 5
 
+/**
+ * 首批并发探测多少页。
+ *
+ * 实测：企业版 issues 单页最多 100 条、单页 RTT ≈1.3s，但并行请求不排队
+ * （两页同时打 ≈ 一页的耗时）。先串行探首页再并发后续页，注定要多等一轮 RTT；
+ * 直接并发探 N 页，多探的页只会返回空数组，代价可忽略。
+ */
+export const PREFETCH_PAGES = 4
+
 export { THRESHOLD_DEFAULTS, resolveThresholds, parseTemplate, resolveRefs, codeOfTitle, codeMatches }
 
 /** 视为「未完成」的状态（用于逾期判定）。 */
+/**
+ * 本机时间戳：`2026-10-27 13:02:11`。
+ *
+ * 原来用 `new Date().toISOString().slice(0,19)`（UTC），面板上印出「04:57:40」
+ * 而本地是 12:57 —— 用户 2026-10-27 指出；补上 `+08:00` 后用户又说不要显示时区，
+ * 所以这里只给本机时间，不带偏移段。
+ */
+function localStamp(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
 const CLOSED_STATES = new Set(['closed', 'rejected'])
 
 // ── 参数解析 ────────────────────────────────────────────────────────────────
@@ -347,15 +369,31 @@ async function fetchPrograms(enterpriseId, auth) {
 async function fetchIssues(enterpriseId, filters, auth, opts = {}) {
   const maxPages = opts.maxPages ?? DEFAULT_MAX_PAGES
   const perPage = 100
-  const raw = []
-  let page = 1
-  for (; page <= maxPages; page++) {
-    const res = await apiGet(`/${enterpriseId}/issues`, { per_page: perPage, page, ...filters }, auth)
-    const batch = unwrap(res)
-    raw.push(...batch)
-    if (batch.length < perPage) break
+  const pageUrl = (page) => apiGet(`/${enterpriseId}/issues`, { per_page: perPage, page, ...filters }, auth)
+
+  // 实测：Gitee 企业版 `/issues` 的 per_page 上限就是 100（传 200/500 也只回 100），
+  // 单页 RTT ≈1.3s，但**并行请求不会排队**（两页同时打 ≈ 一页的耗时）。
+  // 所以不能「先串行探首页、再并发后续页」——那至少要两轮 RTT。
+  // 这里直接按页码并发试探前 PREFETCH_PAGES 页，首页回来后用 total_count 决定还要不要继续翻。
+  const firstBatch = Math.min(maxPages, PREFETCH_PAGES)
+  const early = await Promise.all(Array.from({ length: firstBatch }, (_, i) => pageUrl(i + 1)))
+  const raw = [...unwrap(early[0])]
+  const total = Number(early[0].total_count ?? early[0].total ?? 0)
+  const lastPage = total > 0 ? Math.min(Math.ceil(total / perPage), maxPages) : maxPages
+  for (let i = 1; i < firstBatch; i++) {
+    if (i + 1 > lastPage) break // 已知没有这页：试探结果丢掉
+    const rows = unwrap(early[i])
+    raw.push(...rows)
+    if (total <= 0 && rows.length < perPage) break // 没有 total_count：短页即到底
   }
-  const truncated = page > maxPages
+  // 探测批次之外还有页：仍然每批并行。
+  for (let start = firstBatch + 1; start <= lastPage; start += PREFETCH_PAGES) {
+    const pages = []
+    for (let page = start; page < Math.min(start + PREFETCH_PAGES, lastPage + 1); page++) pages.push(page)
+    const rest = await Promise.all(pages.map((page) => pageUrl(page)))
+    for (const res of rest) raw.push(...unwrap(res))
+  }
+  const truncated = total > 0 ? total > maxPages * perPage : raw.length >= maxPages * perPage
   return { rows: raw.map(mapIssue), truncated }
 }
 
@@ -389,6 +427,14 @@ function mapIssue(it) {
     parentId: Number(it.parent_id ?? 0),
     rootId: Number(it.root_id ?? 0),
     commentsCount: Number(it.comments_count ?? 0),
+    /**
+     * 协作者（列表接口就带，实测 `/enterprises/{eid}/issues` 的 `collaborators` 是数组，
+     * 通常为空）。「我工作项」要区分「我是负责人」和「我是协作者」，就靠这里。
+     */
+    collaborators: (Array.isArray(it.collaborators) ? it.collaborators : [])
+      .map((u) => String(u?.name ?? u?.login ?? '')).filter((s) => s !== ''),
+    collaboratorIds: (Array.isArray(it.collaborators) ? it.collaborators : [])
+      .map((u) => Number(u?.id ?? 0)).filter((n) => n > 0),
   }
 }
 
@@ -854,20 +900,35 @@ const READ_COMMON = [
   'get_enterprise_repository_file_content', 'list_enterprise_repo_releases',
   'list_enterprise_pulls', 'get_enterprise_pull_detail', 'get_enterprise_pull_diff',
   'list_enterprise_pull_comments',
+  // 0.5.4 起：PR 面板要显示「变更文件」和「我的真实权限」。
+  // `auths` 决定界面上那排权限 chips（能不能审/测/合并），不靠角色猜；
+  // `files` 是抽屉「变更文件」页的数据源（没有它只能退化成整份 diff 文本）。
+  'get_enterprise_pull_auth', 'list_enterprise_pull_files',
 ]
 
 /** 执行档就能用的写工具（围绕本人工作项）。 */
 const WRITE_EXEC = [
   'create_enterprise_issue', 'update_enterprise_issue', 'comment_enterprise_issue',
   'create_enterprise_repo_pull', 'comment_enterprise_pull', 'update_enterprise_pull',
+  // 0.5.4 起：审查通过/驳回/撤销、测试通过 —— 都是「本人对该 PR 的表态」，
+  // 与改状态同级（不是企业级动作），所以放执行档；能不能真的点得动由
+  // `get_enterprise_pull_auth` 的 canCheck/canTest 决定。
+  'review_enterprise_pull', 'test_enterprise_pull',
   // 文档写入：在「他能获取到的写入目录」内建/改文档不受限（需求方口径）
   'create_doc_node', 'attach_doc_file',
+  // 上游 0.2.2 起：建**文档本体**、在文档内建**页面/文件夹**
+  // （与 create_doc_node 同属「可写目录内建东西」，只是打的是 docs/{doc}/… 那半边）
+  'create_enterprise_document', 'create_enterprise_document_node',
   // 改页面正文（带 expected_version 乐观锁，版本变了服务端会拒绝）与批量导入
   'update_enterprise_document_page', 'upload_enterprise_document_files',
 ]
 
 /** 负责人档追加的写工具（本项目范围内）。 */
-const WRITE_PROJECT = ['create_scrum_sprint', 'create_wiki', 'move_doc_node']
+const WRITE_PROJECT = [
+  'create_scrum_sprint', 'create_wiki', 'move_doc_node',
+  // 上游 0.2.2 起：文档内文件夹改名（结构性调整，与 move_doc_node 同档）
+  'rename_enterprise_document_folder',
+]
 
 /** 管理者档追加的写工具（企业级 / 不可逆动作）。 */
 const WRITE_MANAGER = [
@@ -915,7 +976,7 @@ export const TIERS = {
     ],
     cannot: [
       '不可转让企业所有权、不可解散企业（Gitee 侧限制）',
-      '不可删除任何实体（MCP 无删除能力，只能到 Web UI 操作）',
+      '面板没有删除入口：清理知识库节点要走 MCP 的 recycle_doc_node / delete_doc_node（不可逆，动手前先确认）',
     ],
     analyses: ['组合健康度', '资源负载', '风险汇总', '里程碑偏差', '交付趋势', 'WBS 合理性审核'],
     tools: [...READ_COMMON, ...READ_SCOPED, ...WRITE_EXEC, ...WRITE_PROJECT, ...WRITE_MANAGER],
@@ -1080,7 +1141,7 @@ export function renderPersonaContext(role) {
   lines.push('    <rule>读**仓库 WIKI**：先 list_enterprise_repositories 看该仓库的 `wiki_enabled_with_content` —— '
     + 'false 就是没有 WIKI，别去试。要读正文就 `git clone https://gitee.com/{path_with_namespace}.wiki.git`。'
     + '⚠️ 必须用 `path_with_namespace`，**不能用 `name`**：两者经常不同（name=demo-docs 而 path=docs），用错就是 404。</rule>')
-  lines.push('    <rule>插件的「Gitee 项目」标签页里有「仓库」与「知识库」两个分段，已经能浏览仓库列表、仓库 WIKI、知识库节点树与附件正文。'
+  lines.push('    <rule>插件的「Gitee 项目」是一个整页工作台，六个页签（概览 / 项目 / 我的工作项 / 合并请求 / 知识库 / 固定分析），已经能浏览项目与仓库（仓库卡片可下钻三栏）、工作项详情与评论、合并请求与 AI 审核、知识库节点树与附件正文。'
     + '用户问"有哪些文档 / 看下 XX 仓库的 WIKI"时，先告诉他去标签页看，**不要用工具把清单念一遍**。</rule>')
   lines.push('    <wikiinfo>上面（c）那种形态**仅当该企业确实有**才用：先 list_enterprise_documents，返回 0 就跳过整段。'
     + '有的话：list_enterprise_document_pages 一次带回全部页的 version，与本地清单比对，只 get 变化的那一页；'
@@ -1125,9 +1186,19 @@ export function renderRoleSummary(role) {
 /** 打印三档能力矩阵对照表（用于评审「人格到底有哪些功能」）。 */
 export function renderMatrix() {
   const L = []
-  L.push('# Gitee 人格能力矩阵')
+  L.push('# Gitee 能力矩阵（按 token 的云端权限判定）')
   L.push('')
-  L.push('2 个人格：**管理者** / **项目执行**；项目执行内部按「是否项目负责人」开合项目管理与分析功能。')
+  L.push('只有一个 agent 预设：**Gitee 项目管理**（0.5.4 起「项目管理 / 项目执行」双预设合并为单预设，见 `docs/decisions/0002-single-preset.md`）。')
+  L.push('能力边界不由「选哪个预设」决定，而由 **token 在 Gitee 云端的角色与项目关系**推导：')
+  L.push('')
+  L.push('| 云端事实 | 落到哪一档 | 表现 |')
+  L.push('|---|---|---|')
+  L.push('| 企业拥有者 / 超管 / 管理员 | 管理者（manager） | 55 个 MCP 工具；跨项目组合视图、资源负载、跨项目风险汇总 |')
+  L.push('| 不是管理员，但在某些项目里是负责人 | 负责人档（project） | 48 个工具；本项目进度偏差、风险清单、成员负载、迭代容量 |')
+  L.push('| 既不是管理员也不是任何项目负责人 | 执行档（exec） | 40 个工具；只推进本人相关的工作项与子任务风险，项目管理与分析不开 |')
+  L.push('')
+  L.push('换企业 / 换 token 即时改档：不用重启、不用换预设。判定在每次取数时做——企业角色取 `GET /{eid}/members` 的')
+  L.push('`enterprise_role.ident`，负责人关系取 `programs[].assignee`，再经 `deriveTier()` 得档；聚焦到非本人负责的项目时按执行档处理。')
   L.push('')
   L.push('| | 管理者 | 项目执行 · 负责人档 | 项目执行 · 执行档 |')
   L.push('|---|---|---|---|')
@@ -1160,6 +1231,16 @@ export function renderMatrix() {
     for (const item of TIERS[key].cannot) L.push(`- ${item}`)
     L.push('')
   }
+  L.push('## 工具入口：原生 MCP 与公开网关')
+  L.push('')
+  L.push('| 入口 | 谁注册 | 谁能看到 | 受不受档位门禁 |')
+  L.push('|---|---|---|---|')
+  L.push('| `mcp__gitee_ent__*`（55 个原生 MCP 工具） | preset 里 `mcp-gitee` 行 | 只挂在「Gitee 项目管理」预设的会话 | ✅ 按档位硬拦：越权调用被拒，并回一份「你当前是哪档、缺哪个权限」的说明 |')
+  L.push('| `gitee_ent`（公开网关，两级 `list → schema → call`） | host 半（profile 级，对所有 preset 生效） | 其余所有会话（公开暴露） | ⚠️ 不按档位裁剪（只读部署时拦写操作）；在 Gitee 会话里被刻意 `restrict` 隐藏，避免绕过门禁 |')
+  L.push('')
+  L.push('两边的权限最终都落在 **token 在 Gitee 云端的能力**上：档位门禁只是把「云端本来就会拒的操作」提前拦下并给出可读理由，')
+  L.push('所以即使走公开网关、没有档位裁剪，越权操作也照样会被 Gitee 返回 403。')
+  L.push('')
   L.push('## MCP 工具集（可直接给 --enabled-toolsets）')
   L.push('')
   for (const key of ['manager', 'project', 'exec']) {
@@ -1236,7 +1317,7 @@ export async function resolveRole(enterpriseId, auth, mode = 'auto', focusProgra
 
   const role = {
     ok: true,
-    generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    generatedAt: localStamp(),
     mode,
     enterprise: { id: enterpriseId },
     me,
@@ -1262,6 +1343,193 @@ export async function resolveRole(enterpriseId, auth, mode = 'auto', focusProgra
 }
 
 /**
+ * 拉取**单个仓库**（企业版里 project_id 就是仓库）的工作项清单。
+ *
+ * 与 `listProgramIssues` 的差别只有过滤键：这里用 `project_id`。Gitee 企业版
+ * 的工作项可以挂在「项目(program)」上，也可以再挂到「仓库(project)」上；
+ * 仓库详情页要的是后者（用户口径：仓库下面归属 工作项 / PR / WIKI）。
+ *
+ * @param {number} enterpriseId
+ * @param {number} repoId
+ * @param {{ token: string }} auth
+ * @param {{ state?: string }} [opts]
+ */
+export async function listRepoIssues(enterpriseId, repoId, auth, opts = {}) {
+  const now = Date.now()
+  const filters = { project_id: repoId }
+  if (opts.state) filters.state = opts.state
+  const { rows: raw, truncated } = await fetchIssues(enterpriseId, filters, auth)
+  const issues = raw.map((it) => ({
+    ...it,
+    overdue: isOverdue(it, now),
+    overdueDays: isOverdue(it, now) ? overdueDays(it, now) : 0,
+  }))
+  const byState = new Map()
+  for (const it of issues) byState.set(it.state, (byState.get(it.state) ?? 0) + 1)
+  return {
+    ok: true,
+    generatedAt: localStamp(),
+    repoId,
+    total: issues.length,
+    truncated,
+    issues,
+    distribution: [...byState.entries()].map(([st, count]) => ({ state: st, count })).sort((a, b) => b.count - a.count),
+  }
+}
+
+/**
+ * 比较两个分支（新建 PR 前给 AI 起草用的「这次改了什么」）。
+ *
+ * 企业版接口：`GET /{eid}/projects/{repoId}/compare/{base}...{head}`（斜杠要 encode），
+ * 返回 `{ too_more_commits, commits_size, commits_limit_size, diffs_size, commits[], diffs[] }`。
+ * `commits[]` 有 `title/message/author`，`diffs[]` 有
+ * `{ filename, status, additions, deletions, patch }`。
+ *
+ * 口径：`compare/{target}...{source}` = 「源分支比目标分支多的东西」= 这个 PR 要合进去的改动。
+ *
+ * @param {number} enterpriseId
+ * @param {number} repoId
+ * @param {string} base - 目标分支（合到哪）
+ * @param {string} head - 源分支（从哪合）
+ * @param {{ token: string }} auth
+ * @param {{ patches?: boolean, maxPatchChars?: number }} [opts] - patches=true 才带 diff 正文
+ */
+export async function compareRefs(enterpriseId, repoId, base, head, auth, opts = {}) {
+  const path = `/${enterpriseId}/projects/${repoId}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
+  const res = await apiGet(path, {}, auth)
+  const commits = (Array.isArray(res.commits) ? res.commits : []).map((c) => ({
+    shortId: String(c.short_id ?? ''),
+    title: String(c.title ?? c.message ?? '').split('\n')[0].slice(0, 200),
+    author: String((c.author ?? {}).name ?? ''),
+    date: String(c.committed_date ?? c.authored_date ?? ''),
+  }))
+  const maxPatch = Number.isFinite(opts.maxPatchChars) ? Number(opts.maxPatchChars) : 8000
+  const diffs = (Array.isArray(res.diffs) ? res.diffs : []).map((d) => ({
+    filename: String(d.filename ?? ''),
+    status: String(d.status ?? ''),
+    additions: Number(d.additions ?? 0),
+    deletions: Number(d.deletions ?? 0),
+    patch: opts.patches === true ? String(d.patch ?? '').slice(0, maxPatch) : '',
+  }))
+  return {
+    ok: true,
+    generatedAt: localStamp(),
+    repoId,
+    base,
+    head,
+    tooManyCommits: res.too_more_commits === true,
+    commitsLimit: Number(res.commits_limit_size ?? 0),
+    commitsSize: Number(res.commits_size ?? commits.length),
+    diffsSize: Number(res.diffs_size ?? diffs.length),
+    commits,
+    diffs,
+  }
+}
+
+/**
+ * 列仓库的分支（新建 PR 时选「源分支 / 目标分支」）。
+ *
+ * 企业版接口：`GET /{eid}/projects/{repoId}/branches`，返回
+ * `{ total_count, can_create_branch, data:[{name, is_default, branch_type, commit:{id,short_id,title}}] }`。
+ *
+ * 为什么要有它：MCP 的 55 个工具里**没有**「列分支」，所以 0.5.4 之前面板只能让人手输
+ * 分支名（输错要等 Gitee 报错）。这条走宿主自己的 HTTP 通道（与其它取数同一条），
+ * 不依赖 MCP 工具表；拿不到时界面回退成输入框，不阻断建 PR。
+ *
+ * @param {number} enterpriseId
+ * @param {number} repoId - 仓库 id（`program_id` 口径）
+ * @param {{ token: string }} auth
+ */
+export async function listRepoBranches(enterpriseId, repoId, auth) {
+  const res = await apiGet(`/${enterpriseId}/projects/${repoId}/branches`, { per_page: 100 }, auth)
+  const rows = unwrap(res)
+  const items = rows.map((b) => ({
+    name: String(b.name ?? ''),
+    isDefault: b.is_default === true,
+    protected: b.protection_rule != null,
+    commit: {
+      id: String((b.commit ?? {}).id ?? ''),
+      shortId: String((b.commit ?? {}).short_id ?? ''),
+      title: String((b.commit ?? {}).title ?? ''),
+    },
+  }))
+  const fallback = items.find((b) => b.isDefault) ?? items[0]
+  return {
+    ok: true,
+    generatedAt: localStamp(),
+    repoId,
+    total: items.length,
+    defaultBranch: fallback === undefined ? '' : fallback.name,
+    items,
+  }
+}
+
+/**
+ * 列项目的**工作项类型**（新建工作项时选「任务 / 需求 / 缺陷」）。
+ *
+ * 企业版接口：`GET /{eid}/issue_types?program_id=<id>`，返回
+ * `{ total_count, data:[{id, ident, title, category, color, is_system}] }`。
+ *
+ * @param {number} enterpriseId
+ * @param {number} programId
+ * @param {{ token: string }} auth
+ */
+export async function listIssueTypes(enterpriseId, programId, auth) {
+  const res = await apiGet(`/${enterpriseId}/issue_types`, { program_id: programId }, auth)
+  const rows = unwrap(res)
+  return {
+    ok: true,
+    programId,
+    items: rows.map((t) => ({
+      id: Number(t.id ?? 0),
+      ident: String(t.ident ?? ''),
+      title: String(t.title ?? ''),
+      category: String(t.category ?? ''),
+      color: String(t.color ?? ''),
+      system: t.is_system === true,
+    })),
+  }
+}
+
+/**
+ * 新建工作项。
+ *
+ * 企业版接口：`POST /{eid}/issues`，JSON body。标题必填；归属可以给
+ * `program_id`（项目）或 `project_id`（仓库）或两者都给；
+ * `issue_type_id` 决定是任务/需求/缺陷（缺省由服务端给默认类型，界面会让用户选）。
+ *
+ * @param {number} enterpriseId
+ * @param {{ title: string, programId?: number, repoId?: number, typeId?: number,
+ *           description?: string, assigneeId?: number, priority?: number }} input
+ * @param {{ token: string }} auth
+ */
+export async function createIssue(enterpriseId, input, auth) {
+  const title = String(input.title ?? '').trim()
+  if (title === '') throw new Error('新建工作项需要标题')
+  const body = { title }
+  if (Number.isFinite(input.programId) && input.programId > 0) body.program_id = input.programId
+  if (Number.isFinite(input.repoId) && input.repoId > 0) body.project_id = input.repoId
+  if (Number.isFinite(input.typeId) && input.typeId > 0) body.issue_type_id = input.typeId
+  if (typeof input.description === 'string' && input.description.trim() !== '') body.description = input.description
+  if (Number.isFinite(input.assigneeId) && input.assigneeId > 0) body.assignee_id = input.assigneeId
+  if (Number.isFinite(input.priority) && input.priority > 0) body.priority = input.priority
+  // 计划时间是一段：开始 `plan_started_at` + 结束 `deadline`（企业版字段名，
+  // 都接受 2026-11-02 或 2026-11-02T00:00:00，实测只传日期也能落库）。
+  if (typeof input.planStartedAt === 'string' && input.planStartedAt.trim() !== '') body.plan_started_at = input.planStartedAt.trim()
+  if (typeof input.deadline === 'string' && input.deadline.trim() !== '') body.deadline = input.deadline.trim()
+  const raw = await apiSend('POST', `/${enterpriseId}/issues`, body, auth)
+  return {
+    ok: true,
+    id: Number(raw.id ?? 0),
+    ident: String(raw.ident ?? ''),
+    title: String(raw.title ?? title),
+    state: String(raw.state ?? ''),
+    programId: raw.program_id == null ? 0 : Number(raw.program_id),
+    repoId: raw.project_id == null ? 0 : Number(raw.project_id),
+  }
+}
+
+/**
  * 拉取单个项目的工作项清单（整屏视图下钻用）。
  * @param {number} enterpriseId
  * @param {number} programId
@@ -1282,7 +1550,7 @@ export async function listProgramIssues(enterpriseId, programId, auth, state) {
   for (const it of issues) byState.set(it.state, (byState.get(it.state) ?? 0) + 1)
   return {
     ok: true,
-    generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    generatedAt: localStamp(),
     programId,
     total: issues.length,
     /** true = 工作项超过翻页上限，列表被截断（界面会明说）。 */
@@ -1319,26 +1587,42 @@ const COMMENT_MAX_CHARS = 4000
  * @param {{ token: string }} auth
  * @param {{ commentLimit?: number }} [opts]
  */
+/**
+ * 企业级工作项索引：只在「描述里真有前置依赖」时才需要（用来把编号/WBS 反查成状态）。
+ * 一次要翻 4–5 页（~1s），所以按企业缓存 60s —— 同一次点击会话里点十个工作项只付一次。
+ */
+const issueIndexCache = new Map()
+const ISSUE_INDEX_TTL_MS = 60_000
+
+async function issueIndex(enterpriseId, auth) {
+  const hit = issueIndexCache.get(enterpriseId)
+  if (hit !== undefined && Date.now() - hit.at < ISSUE_INDEX_TTL_MS) return hit.rows
+  let rows = []
+  try {
+    rows = (await fetchIssues(enterpriseId, {}, auth, { maxPages: DEFAULT_MAX_PAGES })).rows
+  } catch { /* 索引取不到不影响详情主体，只是依赖项无法标注状态 */ }
+  issueIndexCache.set(enterpriseId, { at: Date.now(), rows })
+  return rows
+}
+
 export async function issueDetail(enterpriseId, ident, auth, opts = {}) {
   const commentLimit = opts.commentLimit ?? 50
-  const raw = await apiGet(`/${enterpriseId}/issues/${ident}`, { qt: 'ident' }, auth)
-  const notesRaw = await apiGet(`/${enterpriseId}/issues/${ident}/notes`, {
-    qt: 'ident', per_page: commentLimit, page: 1, sort: 'created_at', direction: 'asc',
-  }, auth).catch(() => ({ data: [] }))
-
-  // 编号索引：一次企业级列表，用来解析「前置依赖」里的编号指向哪个工作项
-  const index = new Map()
-  try {
-    const { rows } = await fetchIssues(enterpriseId, {}, auth, { maxPages: DEFAULT_MAX_PAGES })
-    for (const it of rows) index.set(it.ident, it)
-  } catch { /* 索引取不到不影响详情主体，只是依赖项无法标注状态 */ }
+  // 详情与评论互不依赖：并发取。以前是串行三连（详情→评论→企业索引），点一个工作项要 1.9s。
+  const [raw, notesRaw] = await Promise.all([
+    apiGet(`/${enterpriseId}/issues/${ident}`, { qt: 'ident' }, auth),
+    apiGet(`/${enterpriseId}/issues/${ident}/notes`, {
+      qt: 'ident', per_page: commentLimit, page: 1, sort: 'created_at', direction: 'asc',
+    }, auth).catch(() => ({ data: [] })),
+  ])
 
   const milestone = raw.milestone ?? null
   const description = String(raw.description ?? '')
   const tpl = parseTemplate(description)
+  // 没有依赖段就完全跳过企业索引（大多数工作项如此）——这一跳能省掉整趟翻页。
+  const index = tpl.dependencyRefs.length === 0 ? [] : await issueIndex(enterpriseId, auth)
   // 依赖引用可能是 Gitee 编号，也可能是标题里的 WBS 编码（`ME-02` ↔ `DEMO900-ME-02`），
   // 所以交给 resolveRefs 统一反查，而不是在这里按编号硬查。
-  const dependencies = resolveRefs(tpl.dependencyRefs, [...index.values()], String(raw.ident ?? ident))
+  const dependencies = resolveRefs(tpl.dependencyRefs, index, String(raw.ident ?? ident))
   const blockers = dependencies.filter((d) => d.known && !d.done && !d.self)
 
   const comments = (Array.isArray(notesRaw?.data) ? notesRaw.data : []).map((n) => ({
@@ -1354,7 +1638,7 @@ export async function issueDetail(enterpriseId, ident, auth, opts = {}) {
 
   return {
     ok: true,
-    generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    generatedAt: localStamp(),
     enterpriseId,
     detail: {
       ident: String(raw.ident ?? ident),
@@ -1494,7 +1778,13 @@ export async function assignIssue(enterpriseId, ident, assigneeId, auth) {
 
 /** 项目成员（改派时的候选人；取不到就给空数组，不阻断流程）。 */
 export async function listProgramMembers(enterpriseId, programId, auth) {
-  const raw = await apiGet(`/${enterpriseId}/programs/${programId}/users`, { per_page: 100 }, auth).catch(() => null)
+  // 企业版真实端点是 `/programs/{id}/members`（`/users` 会 404 HTML 页）。
+  // 项目里还没配成员时回落到企业成员表，否则「负责人」下拉会是空的（实测 prtest 项目）。
+  const fromProgram = await apiGet(`/${enterpriseId}/programs/${programId}/members`, { per_page: 100 }, auth).catch(() => null)
+  let raw = fromProgram
+  if (raw === null || unwrap(raw).length === 0) {
+    raw = await apiGet(`/${enterpriseId}/members`, { per_page: 100 }, auth).catch(() => null)
+  }
   const list = raw === null ? [] : unwrap(raw)
   return {
     ok: true,
@@ -1587,7 +1877,7 @@ export function fixtureIssueDetail(ident) {
   const dependencies = resolveRefs(tpl.dependencyRefs, index, target.ident)
   return {
     ok: true,
-    generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    generatedAt: localStamp(),
     enterpriseId: 0,
     detail: {
       ident: target.ident,
@@ -1784,7 +2074,7 @@ function finalize({ scope, enterprise, source, board, me, issues, truncated = fa
     ok: true,
     scope,
     source,
-    generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    generatedAt: localStamp(),
     enterprise,
     me: me ? { id: me.id, name: me.name } : null,
     /** true = 工作项超过翻页上限被截断（所有统计都只覆盖已取到的部分）。 */
@@ -1801,6 +2091,23 @@ function finalize({ scope, enterprise, source, board, me, issues, truncated = fa
     },
   }
   payload.summary = renderSummary(payload)
+  // 「我工作项」页签：负责人或协作者是我。零额外请求 —— 全部来自已经取到的那批工作项
+  // （`finalize` 手里就有 issues + programs，再打一遍接口纯属浪费）。
+  payload.myIssues = me === null ? [] : issuesSafe
+    .filter((it) => it.assigneeId === me.id
+      || (Array.isArray(it.collaboratorIds) && it.collaboratorIds.includes(me.id)))
+    .map((it) => ({
+      id: it.id,
+      ident: it.ident,
+      title: it.title,
+      programId: it.programId,
+      programName: String((payload.programs.find((p) => p.id === it.programId) ?? {}).name ?? ''),
+      state: it.state,
+      priorityHuman: it.priorityHuman,
+      deadline: it.deadline,
+      overdue: it.overdue === true,
+      role: it.assigneeId === me.id ? 'owner' : 'collaborator',
+    }))
   return payload
 }
 
@@ -1817,7 +2124,7 @@ export function fixtureRole(mode = 'auto', focusProgramId = undefined) {
 
   const role = {
     ok: true,
-    generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    generatedAt: localStamp(),
     mode,
     enterprise: { id: 0 },
     me: { id: 901, name: '成员甲', login: 'member-a' },
@@ -1878,7 +2185,7 @@ export function fixtureProgramIssues(programId) {
   for (const it of mine) byState.set(it.state, (byState.get(it.state) ?? 0) + 1)
   return {
     ok: true,
-    generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    generatedAt: localStamp(),
     programId: Number(programId),
     total: mine.length,
     kpi: {
@@ -1916,6 +2223,24 @@ export async function health() {
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
+/**
+ * 写完 stdout 再退出。
+ *
+ * `process.stdout.write(大块 JSON)` 紧跟 `process.exit()` 在**管道**模式下会截断：
+ * 管道缓冲区 64 KiB，超出部分还排在排空队列里，exit 当场结束进程。
+ * 实测 `node gq.mjs issues --program <id> --json | cat` 稳定截断在 65536 字节 ——
+ * 而 host 侧 execFile 正是管道，于是拿到半截 JSON，报「gq issues 输出不是 JSON」。
+ *
+ * 这里用一次空写把回调排到队列末尾：所有先前写入落盘后才触发，再退出。
+ * 调用方必须 `return exitAfterFlush(...)`，否则退出前还会继续往下跑别的分支。
+ *
+ * @param {number} [code] 退出码。
+ */
+function exitAfterFlush(code = 0) {
+  process.exitCode = code
+  process.stdout.write('', () => process.exit(code))
+}
+
 async function main() {
   const { cmd, flags } = parseArgs(process.argv.slice(2))
   const scope = cmd === 'mywork' ? 'mywork' : 'portfolio'
@@ -1930,7 +2255,7 @@ async function main() {
     if (cmd === 'health') {
       const result = await health()
       process.stdout.write(JSON.stringify(result, null, 2) + '\n')
-      process.exit(result.ok ? 0 : 3)
+      return exitAfterFlush(result.ok ? 0 : 3)
     }
 
     // ── 工作项详情（描述 / 前置依赖 / 评论讨论）──────────────────────────
@@ -1960,7 +2285,7 @@ async function main() {
         }
         process.stdout.write(L.join('\n') + '\n')
       }
-      process.exit(0)
+      return exitAfterFlush(0)
     }
 
     // ── 状态选项（改状态的候选）─────────────────────────────────────────
@@ -1977,7 +2302,7 @@ async function main() {
           })()
       process.stdout.write(flags.json ? JSON.stringify(result) + '\n'
         : result.states.map((s) => `- \`${s.id}\` ${s.title}`).join('\n') + '\n')
-      process.exit(0)
+      return exitAfterFlush(0)
     }
 
     // ── 项目成员（改派候选）─────────────────────────────────────────────
@@ -1994,7 +2319,7 @@ async function main() {
           })()
       process.stdout.write(flags.json ? JSON.stringify(result) + '\n'
         : result.members.map((m) => `- \`${m.id}\` ${m.name}`).join('\n') + '\n')
-      process.exit(0)
+      return exitAfterFlush(0)
     }
 
     // ── 写操作（唯一写入口，三个子命令）─────────────────────────────────
@@ -2019,7 +2344,7 @@ async function main() {
         result = await assignIssue(ent.id, ident.toUpperCase(), assigneeId, auth)
       }
       process.stdout.write(JSON.stringify(result) + '\n')
-      process.exit(0)
+      return exitAfterFlush(0)
     }
 
     if (cmd === 'enterprises') {
@@ -2041,12 +2366,12 @@ async function main() {
           process.stdout.write(`已选定企业：${hit.name}（${id}）\n写入 ${configPath()}\n` +
             '后续所有取数都用这个企业；随时可用 `gq enterprises --use <id>` 切换。\n')
         }
-        process.exit(0)
+        return exitAfterFlush(0)
       }
       if (flags.clear === true) {
         writeConfig({ enterpriseId: 0 })
         process.stdout.write('已清除企业选择，恢复为自动模式（多企业时会报错要求指定）。\n')
-        process.exit(0)
+        return exitAfterFlush(0)
       }
 
       // 「当前生效」要综合考虑来源优先级：flag > env > 配置文件 > 未指定
@@ -2071,7 +2396,7 @@ async function main() {
       process.stdout.write((flags.json
         ? JSON.stringify({ ok: true, enterprises: list, current: current || null, source, fileEnterpriseId: fileId || null, configPath: configPath() })
         : lines.join('\n')) + '\n')
-      process.exit(0)
+      return exitAfterFlush(0)
     }
 
     if (cmd === 'issues') {
@@ -2096,12 +2421,110 @@ async function main() {
         }
         process.stdout.write(L.join('\n') + '\n')
       }
-      process.exit(0)
+      return exitAfterFlush(0)
+    }
+
+    // ── 仓库维度工作项（仓库详情页的「工作项」页签）────────────────────
+    if (cmd === 'repo-issues') {
+      const rid = flags.repo !== undefined && flags.repo !== true ? Number(flags.repo) : NaN
+      if (!Number.isFinite(rid) || rid <= 0) throw new Error('repo-issues 需要 --repo <仓库id>')
+      const auth = resolveToken()
+      if (!auth) throw new Error(`未找到 Gitee 企业版 token。请设置 GITEE_ENT_MCP_ACCESS_TOKEN，或写入 ${tokenFileCandidates()[0]}。`)
+      const ent = await resolveEnterprise(flags.enterprise, auth)
+      const result = await listRepoIssues(ent.id, rid, auth, {
+        state: typeof flags.state === 'string' ? flags.state : undefined,
+      })
+      if (flags.json) {
+        process.stdout.write(JSON.stringify(result) + '\n')
+      } else {
+        const L = [`## 仓库 ${rid} 工作项（${result.total}）`, '']
+        for (const it of result.issues.slice(0, 30)) {
+          L.push(`- \`${it.ident}\` ${it.title} · ${it.assignee || '未指派'} · ${it.state}`)
+        }
+        process.stdout.write(L.join('\n') + '\n')
+      }
+      return exitAfterFlush(0)
+    }
+
+    // ── 比较两个分支（AI 起草 PR 内容用）──────────────────────────────
+    if (cmd === 'compare') {
+      const rid = flags.repo !== undefined && flags.repo !== true ? Number(flags.repo) : NaN
+      if (!Number.isFinite(rid) || rid <= 0) throw new Error('compare 需要 --repo <仓库id>')
+      const base = typeof flags.base === 'string' ? flags.base : ''
+      const head = typeof flags.head === 'string' ? flags.head : ''
+      if (base === '' || head === '') throw new Error('compare 需要 --base <目标分支> --head <源分支>')
+      const auth = resolveToken()
+      if (!auth) throw new Error(`未找到 Gitee 企业版 token。请设置 GITEE_ENT_MCP_ACCESS_TOKEN，或写入 ${tokenFileCandidates()[0]}。`)
+      const ent = await resolveEnterprise(flags.enterprise, auth)
+      const result = await compareRefs(ent.id, rid, base, head, auth, { patches: flags.patches === true })
+      if (flags.json) {
+        process.stdout.write(JSON.stringify(result) + '\n')
+      } else {
+        const L = [`## ${base} ← ${head}（${result.commitsSize} 个提交 / ${result.diffsSize} 个文件）`, '']
+        for (const c of result.commits.slice(0, 20)) L.push(`- ${c.shortId} ${c.title}`)
+        L.push('')
+        for (const d of result.diffs.slice(0, 30)) L.push(`- ${d.filename} (${d.status}, +${d.additions}/-${d.deletions})`)
+        process.stdout.write(L.join('\n') + '\n')
+      }
+      return exitAfterFlush(0)
+    }
+
+    // ── 仓库分支（建 PR 选源/目标分支）────────────────────────────────
+    if (cmd === 'branches') {
+      const rid = flags.repo !== undefined && flags.repo !== true ? Number(flags.repo) : NaN
+      if (!Number.isFinite(rid) || rid <= 0) throw new Error('branches 需要 --repo <仓库id>')
+      const auth = resolveToken()
+      if (!auth) throw new Error(`未找到 Gitee 企业版 token。请设置 GITEE_ENT_MCP_ACCESS_TOKEN，或写入 ${tokenFileCandidates()[0]}。`)
+      const ent = await resolveEnterprise(flags.enterprise, auth)
+      const result = await listRepoBranches(ent.id, rid, auth)
+      if (flags.json) {
+        process.stdout.write(JSON.stringify(result) + '\n')
+      } else {
+        process.stdout.write(result.items.map((b) => `- ${b.name}${b.isDefault ? '（默认）' : ''}`).join('\n') + '\n')
+      }
+      return exitAfterFlush(0)
+    }
+
+    // ── 工作项类型（新建工作项要选 任务/需求/缺陷）──────────────────────
+    if (cmd === 'issue-types') {
+      const pid = flags.program !== undefined && flags.program !== true ? Number(flags.program) : NaN
+      if (!Number.isFinite(pid) || pid <= 0) throw new Error('issue-types 需要 --program <项目id>')
+      const auth = resolveToken()
+      if (!auth) throw new Error(`未找到 Gitee 企业版 token。请设置 GITEE_ENT_MCP_ACCESS_TOKEN，或写入 ${tokenFileCandidates()[0]}。`)
+      const ent = await resolveEnterprise(flags.enterprise, auth)
+      const result = await listIssueTypes(ent.id, pid, auth)
+      if (flags.json) {
+        process.stdout.write(JSON.stringify(result) + '\n')
+      } else {
+        process.stdout.write(result.items.map((t) => `- ${t.title}（${t.ident} · id ${t.id}）`).join('\n') + '\n')
+      }
+      return exitAfterFlush(0)
+    }
+
+    // ── 新建工作项 ───────────────────────────────────────────────────
+    if (cmd === 'create-issue') {
+      const auth = resolveToken()
+      if (!auth) throw new Error(`未找到 Gitee 企业版 token。请设置 GITEE_ENT_MCP_ACCESS_TOKEN，或写入 ${tokenFileCandidates()[0]}。`)
+      const ent = await resolveEnterprise(flags.enterprise, auth)
+      const numFlag = (name) => (flags[name] !== undefined && flags[name] !== true ? Number(flags[name]) : undefined)
+      const result = await createIssue(ent.id, {
+        title: typeof flags.title === 'string' ? flags.title : '',
+        programId: numFlag('program'),
+        repoId: numFlag('repo'),
+        typeId: numFlag('type'),
+        description: typeof flags.description === 'string' ? flags.description : undefined,
+        assigneeId: numFlag('assignee'),
+        priority: numFlag('priority'),
+        planStartedAt: typeof flags['plan-start'] === 'string' ? flags['plan-start'] : undefined,
+        deadline: typeof flags.deadline === 'string' ? flags.deadline : undefined,
+      }, auth)
+      process.stdout.write(JSON.stringify(result) + '\n')
+      return exitAfterFlush(0)
     }
 
     if (cmd === 'matrix') {
       process.stdout.write(renderMatrix() + '\n')
-      process.exit(0)
+      return exitAfterFlush(0)
     }
 
     if (cmd === 'role') {
@@ -2122,7 +2545,7 @@ async function main() {
         )
       }
       process.stdout.write(flags.json ? JSON.stringify(role) + '\n' : role.summary + '\n')
-      process.exit(0)
+      return exitAfterFlush(0)
     }
 
     const key = `${scope}:${flags.program ?? 'all'}:${flags.fixture ? 'fx' : 'live'}`
@@ -2138,7 +2561,7 @@ async function main() {
       if (ttl > 0) writeCache(key, payload)
     }
     process.stdout.write(flags.json ? JSON.stringify(payload) + '\n' : payload.summary + '\n')
-    process.exit(0)
+    return exitAfterFlush(0)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (flags.json) {
@@ -2146,7 +2569,7 @@ async function main() {
     } else {
       process.stderr.write(`gq 失败：${message}\n`)
     }
-    process.exit(1)
+    return exitAfterFlush(1)
   }
 }
 

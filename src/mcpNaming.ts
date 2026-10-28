@@ -38,7 +38,7 @@ export const PUBLIC_GATEWAY_TOOL_NAME = 'gitee_ent'
  *
  * ⚠️ 必须按 **server 前缀**过滤，不能只看 `mcp__`。
  *
- * 一个 preset 里往往还挂着别的 MCP server，
+ * 一个 preset 里往往还挂着别的 MCP server（OpenViking 记忆、钉钉、Apifox…），
  * 它们的工具名同样以 `mcp__` 开头，但**不归本插件的门禁管**。只看 `mcp__`
  * 会让 Gitee 的能力档表去审别家的工具：`mcp__openviking__remember` 被剥成
  * `remember`、`mcp__openviking__write` 被剥成 `write`，两个都"不在本档工具集内"，

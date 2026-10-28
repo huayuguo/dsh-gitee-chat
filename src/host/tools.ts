@@ -48,6 +48,40 @@ export interface GiteeChatToolDeps {
    * 那是 MCP 通道的问题，取数自检（gq 脚本那条路）看不出来。
    */
   readonly mcp?: () => McpInspection
+  /**
+   * 会话里的 AI 是否可读快照（`cache.agentReadable`，默认 true）。
+   *
+   * 只影响 `gitee_board_snapshot` 这一个工具；界面读 `/payload` 不受它管。
+   */
+  readonly agentReadable?: boolean | (() => boolean)
+}
+
+/**
+ * 把一次取数的时效渲染成**给人和模型看的一行**。
+ *
+ * 为什么每个工具输出都要带：用户明确要求「时效性说明要让 AI 和人都知道，
+ * 做到提醒义务」（m02223）。只写在 SKILL.md 里不够——模型可能没读。
+ * @param result - 带 `fetchedAt/ageMs/stale/ttlMs/source` 的取数结果。
+ * @returns 单行 Markdown（含中文说明 + 机器可读数字）。
+ */
+export function freshnessLine(result: {
+  fetchedAt: number
+  ageMs: number
+  stale: boolean
+  ttlMs: number
+  source: 'remote' | 'memory' | 'disk'
+}): string {
+  const ageSeconds = Math.round(result.ageMs / 1000)
+  const ttlSeconds = Math.round(result.ttlMs / 1000)
+  const layer = result.source === 'remote' ? '现拉' : result.source === 'memory' ? '内存缓存' : '落盘快照'
+  if (result.ttlMs <= 0) {
+    return `> 数据时效：现拉（缓存已关闭）。fetchedAt=${new Date(result.fetchedAt).toISOString()} ageSeconds=${ageSeconds} stale=false ttlSeconds=0 source=${result.source}`
+  }
+  const verdict = result.stale
+    ? `**已超过新鲜期（${ttlSeconds} s）——可能不是最新，必要时用刷新或「gitee_board」重新拉**`
+    : `新鲜期内（${ttlSeconds} s）`
+  return `> 数据时效：${layer}，抓取于 ${ageSeconds} 秒前，${verdict}。`
+    + ` fetchedAt=${new Date(result.fetchedAt).toISOString()} ageSeconds=${ageSeconds} stale=${result.stale} ttlSeconds=${ttlSeconds} source=${result.source}`
 }
 
 /** 把执行器错误转成给模型看的可行动说明（而不是裸 stack）。 */
@@ -76,7 +110,10 @@ function describeFailure(error: unknown): string {
  * @returns 可注册进 `ctx.tools` 的工具定义数组。
  */
 export function giteeChatTools(deps: GiteeChatToolDeps): ToolDefinition[] {
-  const { runner, role, mcp } = deps
+  const { runner, role, mcp, agentReadable } = deps
+  /** 现取：设置页里 `cache.agentReadable` 改了要立刻生效（volatile）。 */
+  const canReadSnapshot = (): boolean =>
+    typeof agentReadable === 'function' ? agentReadable() !== false : agentReadable !== false
 
   return [
     defineTool({
@@ -198,11 +235,82 @@ export function giteeChatTools(deps: GiteeChatToolDeps): ToolDefinition[] {
           if (result.degraded || payload.source === 'fixture') {
             notes.push('⚠️ 当前展示的是**样例数据**（未配置 token 或显式开启降级），不是真实企业数据。')
           }
-          if (result.cached) notes.push('（本次命中宿主缓存；用户可要求刷新）')
+          // 时效性提醒（用户口径 m02223）：**无论命中缓存与否都写一行**，
+          // 让模型和用户在同一个数字上对话，而不是让模型假设「刚拉的就是最新」。
+          notes.push(freshnessLine(result))
           return { text: notes.length > 0 ? `${notes.join('\n')}\n\n${payload.summary}` : payload.summary }
         } catch (error) {
           return { text: describeFailure(error) }
         }
+      },
+    }),
+
+    defineTool({
+      name: 'gitee_board_snapshot',
+      description:
+        '**不联网**读取上一次的 Gitee 看板快照（宿主缓存/落盘），并明确告诉你这份数据有多旧。'
+        + '当用户问「刚才那个数据」「缓存里有吗」「离线看一眼现状」「上次拉到的是什么」时使用。'
+        + '返回内容带 `freshness`：`ageSeconds`（多少秒前）与 `stale`（是否已超过新鲜期）；'
+        + '`stale: true` 时**必须**在回答里说明数据可能不是最新，并建议用户点刷新或改用 `gitee_board`。',
+      parameters: {
+        scope: {
+          type: 'string',
+          description: '范围：portfolio=企业全部项目（默认）；mywork=与我相关的工作项。',
+        },
+        program: {
+          type: 'integer',
+          description: '聚焦单个项目（program）的 id。',
+        },
+        format: {
+          type: 'string',
+          description: 'compact=只要计数与时效（默认）；full=额外带项目与我的工作项明细。',
+        },
+      },
+      output: TEXT_OUTPUT,
+      execute: (args) => {
+        if (!canReadSnapshot()) {
+          return Promise.resolve({
+            text: '快照对会话不可读：设置 → 插件 → dsh-gitee-chat 里 `cache.agentReadable` 是关的。'
+              + '请让用户打开它，或改用 `gitee_board` 现拉（会联网）。',
+          })
+        }
+        const scope = (args.scope === 'mywork' ? 'mywork' : 'portfolio') as BoardScope
+        const snapshot = runner.snapshot({
+          scope,
+          program: typeof args.program === 'number' ? args.program : undefined,
+        })
+        if (snapshot === undefined) {
+          return Promise.resolve({
+            text: '本机还没有可用的看板快照（宿主重启过、且 `cache.persist` 关着，或者从没拉过）。'
+              + '请用 `gitee_board` 现拉一次。',
+          })
+        }
+        const payload = snapshot.payload
+        const freshness = {
+          fetchedAt: new Date(snapshot.fetchedAt).toISOString(),
+          ageSeconds: Math.round(snapshot.ageMs / 1000),
+          stale: snapshot.stale,
+          ttlSeconds: Math.round(snapshot.ttlMs / 1000),
+          source: snapshot.source,
+        }
+        const full = args.format === 'full'
+        const compact = {
+          enterprise: payload.enterprise,
+          generatedAt: payload.generatedAt,
+          counts: {
+            programs: payload.programs.length,
+            issues: payload.issues?.length ?? null,
+            myIssues: payload.myIssues?.length ?? null,
+          },
+          freshness,
+          ...(full
+            ? {
+                programs: payload.programs.map((p) => ({ id: p.id, name: p.name, open: p.open, overdue: p.overdue })),
+                myIssues: payload.myIssues ?? [],
+              }
+            : {}),
+        }
+        return Promise.resolve({ text: `${freshnessLine(snapshot)}\n\n\`\`\`json\n${JSON.stringify(compact)}\n\`\`\`` })
       },
     }),
 

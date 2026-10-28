@@ -17,7 +17,7 @@
  * 也被注入了 Gitee 人格、也能看到 Gitee 工具——这是错误的平面归属。
  * 现在这些东西只在**挂了本行的 preset**（两个 Gitee 模式）里才有；
  * 唯一的例外是公开 gateway（MCP 是工具类后端，用户 2026-10-10 要求公共化），
- * 它由 host 半注册、再由本文件 `restrict` 从 Gitee 会话里隐藏。
+ * 它由 host 半注册、再由本文件 `restrict` 从 Gitee 会话里隐藏（DESIGN.md §37）。
  *
  * @module dsh-gitee-chat/agent
  */
@@ -90,7 +90,12 @@ export function apply(ctx: any, config?: Config): void {
   const mcpPrefix = face.hostConfig.mcpToolPrefix ?? DEFAULT_MCP_TOOL_PREFIX
 
   // 1) 触发型工具（只对挂了本行的 preset 可见）
-  for (const tool of giteeChatTools({ runner, role })) {
+  for (const tool of giteeChatTools({
+    runner,
+    role,
+    // 快照工具是否对会话可读（`cache.agentReadable`，默认 true）
+    agentReadable: () => face.hostConfig.cache?.agentReadable !== false,
+  })) {
     ctx.effect(() => ctx.tools.register(tool))
   }
 
@@ -100,12 +105,12 @@ export function apply(ctx: any, config?: Config): void {
   //     `--enabled-toolsets` 静态裁剪、再由下面的门禁按身份档硬拦），gateway
   //     在这里是重复入口，而且它的名字（`gitee_ent`）不在 MCP 前缀里，
   //     能力档门禁按设计不管它 —— 留着等于开了一个绕过档位裁剪的后门
-  //     （公开 gateway 不裁剪：48 个工具全都可达，只守只读那条线）。
+  //     （公开 gateway 不裁剪：55 个工具全都可达，越档由 tools.guard 硬拦；见 DESIGN.md §40）。
   //
   //     用 `restrict`（agent 作用域内过滤**全局**工具）结构性隐藏：模型连看都
-  //     看不到，比"提示词里叮嘱别用"硬。
+  //     看不到，比"提示词里叮嘱别用"硬。DESIGN.md §37。
   //
-  //     两个易错点：
+  //     两个易错点（0.5.0 第一版踩了第 ① 条，第二版才修好，见 §37 ⑧）：
   //     ① 参数是 `{ allow?, deny? }` **对象**，不是名字数组 —— 传数组会被
   //        `restrict({})` 的 no-op 守卫当面拒掉（异常又被下面的 catch 吞成
   //        warn，表现就是"没隐藏"，静默失效）；
@@ -129,19 +134,31 @@ export function apply(ctx: any, config?: Config): void {
   })
 
   // 2) 人格注入：由身份关系推导，注入进每一轮
+  //
+  //  ⚠️ 必须用 `ctx.inject(['systemPrompt'], …)`（可选依赖）而不是在 apply 里
+  //  同步 `ctx.get('systemPrompt')`。原因：cordis 的 `get(name, strict=true)`
+  //  只返回 **正在运行** 的服务；preset 行比 `dsh-system-prompt` 先起来时
+  //  `get()` 拿到 undefined，早先的实现就此 `warn` 一次、**永不重试** ——
+  //  表现正是「人格与三档能力矩阵似乎失效」（提示词里没有 `<gitee-role>`，
+  //  模型不知道自己是管理者/执行档，只剩门禁在硬拦）。
+  //  `inject` 是惰性的：服务晚到也照样回调，服务始终没有则安静跳过，
+  //  不会把整个 preset 拖成装配失败。
   if (resolved.injectPersona) {
-    const systemPrompt = ctx.get('systemPrompt') as {
-      context: (input: { name: string; order: number; text: string | ((c: unknown) => string) }) => () => void
-    } | undefined
-    if (systemPrompt === undefined) {
-      ctx.logger?.warn?.(`[${name}] systemPrompt 不可用，人格上下文未注入`)
-    } else {
-      ctx.effect(() => systemPrompt.context({
+    ctx.inject(['systemPrompt'], (scope) => {
+      const systemPrompt = scope.get('systemPrompt') as {
+        context: (input: { name: string; order: number; text: string | ((c: unknown) => string) }) => () => void
+      } | undefined
+      if (systemPrompt === undefined) {
+        scope.logger?.warn?.(`[${name}] systemPrompt 不可用，人格上下文未注入`)
+        return
+      }
+      scope.effect(() => systemPrompt.context({
         name: 'gitee-role',
         order: 50,
         text: () => role.text(),
       }))
-    }
+      scope.logger?.info?.(`[${name}] 人格上下文已注入（gitee-role，tier=${role.tier() ?? '解析中'}）`)
+    })
   }
 
   // 3) 门禁：两件事都在这一个 guard 里，但**触发条件不同**。

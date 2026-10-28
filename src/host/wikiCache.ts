@@ -3,7 +3,7 @@
  *
  * ## 为什么这里出现了 git —— 以及它为什么**不是**越界
  *
- * 本层守一条纪律：**MCP 是文档能力的唯一实现**，插件不拼任何 Gitee 端点。
+ * `DOCS.md` §7 定了纪律：**MCP 是文档能力的唯一实现**，插件不拼任何 Gitee 端点。
  * 仓库 WIKI 是这条纪律的**唯一例外**，理由是可验证的事实，不是偏好：
  *
  * 实测（2026-09-15）穷举了两侧：
@@ -118,7 +118,7 @@ function stripExt(name: string): string {
  *
  * 侧边栏的文件围栏（`workspaceFence`）按**会话 cwd 的 realpath** 判定，
  * 而缓存根在工作区之外 —— 所以必须经由 `<cwd>/.dsh/gitee-docs` 这条软链接
- * 才能让侧边栏读到。
+ * 才能让侧边栏读到（DOCS.md §14.2）。
  *
  * @param link - `<cwd>/.dsh/gitee-docs`（软链接绝对路径）。
  * @param cacheRoot - 缓存根绝对路径。
@@ -322,7 +322,7 @@ export function createWikiCache(deps: WikiCacheDeps) {
    * 确保会话工作区里存在指向缓存根的软链接，并保证它被 git 忽略。
    *
    * 为什么需要它：侧边栏的文件围栏按**会话 cwd** 判定，缓存根在工作区之外，
-   * 直接把缓存路径交给 `betterSidebar.openFile` 会被 403 拒绝。
+   * 直接把缓存路径交给 `betterSidebar.openFile` 会被 403 拒绝（DOCS.md §14.2）。
    *
    * 忽略规则用 `<repo>/.git/info/exclude` 而不是 `.gitignore`：
    * 后者是**被跟踪的文件**，插件不该改用户仓库里的受版本控制内容。

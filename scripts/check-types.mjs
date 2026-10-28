@@ -1,31 +1,35 @@
 #!/usr/bin/env node
 /**
- * 类型声明**生成 + 一致性**守卫。
+ * 对外类型声明生成（按 DSH 官方包约定：声明产物落在 `lib/types/`，随 `lib` 一起发）。
  *
- * 为什么要有它：对外类型声明不再手写，而是由 `tsc -p tsconfig.types.json`（`--emitDeclarationOnly`）
- * 从 `src/` 生成到 `types/`。tsc 的产物是确定的，所以「生成后工作区仍然干净」就等于
- * 「types/ 与 src/ 同步」——改了源码却忘了重新生成，这里就会红。
+ *   node scripts/check-types.mjs           # 生成到 lib/types/（build 与 prepare 会调用）
+ *   node scripts/check-types.mjs --check   # 生成后自检：入口齐全、没有泄漏 src/ 相对路径
  *
- * 用法：
- *   node scripts/check-types.mjs          重新生成 types/，不校验（= pnpm run types:gen）
- *   node scripts/check-types.mjs --check  重新生成后再要求 git 干净，否则非 0 退出（挂进 pnpm run check / prepublishOnly）
+ * 为什么不再「生成结果与 git 比对」：`lib/` 本来就是不入库的构建产物（与官方包一致，
+ * `files` 只发 `lib`），类型声明跟着 lib 走，没必要在仓库里另存一份。
  */
 
 import { spawnSync } from 'node:child_process'
-import { rmSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
+const outDir = join(root, 'lib', 'types')
 const check = process.argv.includes('--check')
 
 /** 定位 tsc：走包解析，不依赖 PATH，也不依赖平台上的 .bin 后缀。 */
-const require = createRequire(import.meta.url)
-const tsc = require.resolve('typescript/bin/tsc')
+const require = createRequire(join(root, 'package.json'))
+let tsc
+try {
+  tsc = require.resolve('typescript/bin/tsc')
+} catch {
+  console.error('找不到 typescript —— 先 `npm install`（devDependencies 里有 typescript）')
+  process.exit(1)
+}
 
-const typesDir = join(root, 'types')
-rmSync(typesDir, { recursive: true, force: true })
+rmSync(outDir, { recursive: true, force: true })
 
 const run = spawnSync(process.execPath, [tsc, '-p', 'tsconfig.types.json'], {
   cwd: root,
@@ -36,27 +40,40 @@ if (run.status !== 0) {
   process.exit(run.status ?? 1)
 }
 
-if (!check) {
-  console.log('类型声明已重新生成到 types/ ✅')
-  process.exit(0)
+// ① 对外入口必须齐：exports 里声明了 types 的，就得真产出这个文件
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const declared = []
+for (const [sub, target] of Object.entries(pkg.exports ?? {})) {
+  if (typeof target === 'object' && target !== null && target.types) {
+    declared.push([sub, target.types])
+  }
+}
+for (const [sub, rel] of declared) {
+  if (!existsSync(join(root, rel))) {
+    console.error(`✗ exports["${sub}"].types 指向 ${rel}，但 tsc 没产出它`)
+    process.exit(1)
+  }
 }
 
-// 与「暂存内容」比对：重新生成后工作区应与 index 一致、且没有未跟踪文件。
-// （用 git diff 而不是 git status：后者会把尚未提交的暂存改动也算脏，本地开发会误报。）
-const diff = spawnSync('git', ['diff', '--quiet', '--', 'types'], { cwd: root })
-if (diff.status !== 0) {
-  console.error('types/ 与暂存内容不一致 —— 源码改了就要重新生成并提交：')
-  spawnSync('git', ['--no-pager', 'diff', '--stat', '--', 'types'], { cwd: root, stdio: 'inherit' })
-  console.error('跑 `npm run types:gen` 重新生成，再 git add types 后一并提交。')
+// ② 声明文件里不能出现指回 src/ 的相对路径（那说明产物依赖了未发布的源码）
+const walk = (dir) =>
+  readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const p = join(dir, e.name)
+    return e.isDirectory() ? walk(p) : [p]
+  })
+const files = existsSync(outDir) ? walk(outDir) : []
+const leaked = files.filter((f) => /from\s+['"][^'"]*\/src\//.test(readFileSync(f, 'utf8')))
+if (leaked.length > 0) {
+  console.error(
+    `✗ 以下声明文件引用了 src/ 路径（发布后不存在）：\n${leaked
+      .map((f) => `  ${f.slice(root.length + 1)}`)
+      .join('\n')}`,
+  )
   process.exit(1)
 }
-const untracked = spawnSync('git', ['ls-files', '--others', '--exclude-standard', '--', 'types'], {
-  cwd: root,
-  encoding: 'utf8',
-})
-if (untracked.status !== 0 || untracked.stdout.trim() !== '') {
-  console.error('types/ 有未跟踪的生成文件 —— 生成后要 git add：')
-  console.error(untracked.stdout)
-  process.exit(1)
-}
-console.log('类型声明与源码一致（tsc 生成结果无 diff）✅')
+
+const bytes = files.reduce((n, f) => n + statSync(f).size, 0)
+const label = `lib/types：${files.length} 个 .d.ts · ${(bytes / 1024).toFixed(0)} KB`
+console.log(
+  check ? `类型声明自检通过 ✅（${label}；入口 ${declared.length} 个）` : `类型声明已生成 ✅（${label}）`,
+)

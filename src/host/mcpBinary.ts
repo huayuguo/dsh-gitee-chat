@@ -10,9 +10,10 @@
  *   2. preset 的 `command: !!js …` —— 指向它（表达式里只能用 `process`）；
  *   3. `scripts/setup.mjs` —— 安装时先落地一份，让新会话立刻能用。
  *
- * 落点是**跨平台用户级 bin**（POSIX `$XDG_BIN_HOME` → `~/.local/bin`；
+ * 0.5.1 起落点是**跨平台用户级 bin**（POSIX `$XDG_BIN_HOME` → `~/.local/bin`；
  * Windows `%USERPROFILE%\.local\bin`，见 `userBinDir()`）：MCP 后端是**公开**工具，
- * 就该待在标准位置、任何 MCP 客户端都能从 PATH 调到它。
+ * 就该待在标准位置、任何 MCP 客户端都能从 PATH 调到它 —— 而不是塞在插件私有的
+ * `$DSH_HOME/.gitee-chat/bin/`（那是 0.5.0 及之前的位置，0.5.1 起只作为迁移残留被清理）。
  * 早先那份原型补丁写成 `profiles/<写死的名字>/node_modules/…`，换个 profile 名就废
  * ——这是本模块存在的第二个理由。
  *
@@ -95,7 +96,7 @@ export function binaryName(platform: string = process.platform): string {
 }
 
 /**
- * 安装目录 —— **跨平台用户级 bin**。
+ * 安装目录 —— **跨平台用户级 bin**（0.5.1 起）。
  *
  * 这是「公开 MCP 后端」该待的地方：与 `pipx` / `uv`（以及一大批 MCP server）
  * 的约定一致，装完任何 MCP 客户端都能从 PATH 直接调到它。
@@ -140,6 +141,17 @@ export function materializedPath(
   return join(userBinDir(platform, env, home), binaryName(platform))
 }
 
+/**
+ * 0.5.0 及之前的**私有**落地位置（`$DSH_HOME/.gitee-chat/bin/…`）。
+ *
+ * 只用于两件事：迁移时删掉它、以及新位置落地失败时的过渡回落。
+ * 不再作为安装目标。
+ * @param platform - 默认取 `process.platform`（测试可注入）。
+ * @param home - DSH_HOME，默认 `dshHome()`（测试可注入）。
+ */
+export function legacyMaterializedPath(platform: string = process.platform, home: string = dshHome()): string {
+  return join(home, '.gitee-chat', 'bin', binaryName(platform))
+}
 
 /**
  * 目录是否在 PATH 上（Windows 不区分大小写；两侧都去掉尾部斜杠）。
@@ -179,6 +191,8 @@ export interface McpBinaryReport {
   copied: boolean
   /** 安装目录是否在 PATH 上（不在就给用户加 PATH 的提示）。 */
   onPath: boolean
+  /** 本次是否清理掉了 0.5.0 的私有副本（`$DSH_HOME/.gitee-chat/bin/…`）。 */
+  legacyRemoved: boolean
   /** 人类可读的一句话，直接进 `/health` 与 `verify`。 */
   detail: string
 }
@@ -189,6 +203,28 @@ function overrideCommand(env: NodeJS.ProcessEnv = process.env): string | null {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
 }
 
+/**
+ * 删掉 0.5.0 的私有副本（文件 + 遗留 `.tmp-*`，目录空了也一并删）。
+ *
+ * 迁移用：新位置装好之后才调用。**绝不抛** —— Windows 上旧会话可能正占着
+ * 那个 `.exe`，删不掉就留着，下次启动再试。
+ * @returns 是否真的删掉了文件。
+ */
+function removeLegacy(legacy: string): boolean {
+  let removed = false
+  try {
+    sweepTmpFiles(legacy)
+    if (existsSync(legacy)) {
+      rmSync(legacy, { force: true })
+      removed = true
+    }
+  } catch { /* 占用/权限：留着 */ }
+  try {
+    const dir = dirname(legacy)
+    if (readdirSync(dir).length === 0) rmSync(dir, { recursive: true, force: true })
+  } catch { /* 目录不在/非空/占用，都无所谓 */ }
+  return removed
+}
 
 /**
  * 清理落地过程中留下的临时文件（`<target>.tmp-<pid>`）。
@@ -219,22 +255,28 @@ function sweepTmpFiles(target: string): void {
  * 幂等、可重复调用（装配时调一次即可自愈；每次会话不重复拷）。
  * **不抛异常**：装不上时降级并说明原因，绝不让插件树起不来。
  *
+ * 迁移：新位置就位（本来就对，或这次拷成功）之后，顺手删掉 0.5.0 的私有副本
+ * `$DSH_HOME/.gitee-chat/bin/…`；删不掉只记 `legacyRemoved: false`，不报错。
+ *
  * @param options.platform - 注入平台（测试用）。
  * @param options.env - 注入环境（测试用）。
  * @param options.home - 注入用户主目录（测试用）。
+ * @param options.dshHome - 注入 DSH_HOME，只用于定位旧私有副本（测试用）。
  */
 export function ensureMaterialized(options: {
   platform?: string
   env?: NodeJS.ProcessEnv
   home?: string
+  dshHome?: string
 } = {}): McpBinaryReport {
   const platform = options.platform ?? process.platform
   const env = options.env ?? process.env
   const home = options.home ?? homedir()
   const target = materializedPath(platform, env, home)
+  const legacy = legacyMaterializedPath(platform, options.dshHome ?? dshHome())
   const onPath = isOnPath(dirname(target), env, platform)
   /** 早退分支共用的两个新字段。 */
-  const bare = { onPath }
+  const bare = { onPath, legacyRemoved: false }
 
   const override = overrideCommand(env)
   if (override !== null) {
@@ -284,14 +326,16 @@ export function ensureMaterialized(options: {
   if (existsSync(target)) {
     try {
       if (statSync(target).size === entry.size && sha256Of(target) === entry.sha256) {
+        const legacyRemoved = removeLegacy(legacy)
         return {
           onPath,
+          legacyRemoved,
           source: 'vendored',
           command: target,
           bundledForPlatform: true,
           copied: false,
           detail: `随包 MCP 二进制已就位：${target}（${manifest.toolCount} 个工具）`
-            + pathHint,
+            + (legacyRemoved ? '；已清掉 0.5.0 的私有副本' : '') + pathHint,
         }
       }
     } catch { /* 读不到就当作需要重拷 */ }
@@ -322,27 +366,34 @@ export function ensureMaterialized(options: {
       try { rmSync(tmp, { force: true }) } catch { /* 占用中 */ }
       throw error
     }
+    const legacyRemoved = removeLegacy(legacy)
     return {
       onPath,
+      legacyRemoved,
       source: 'vendored',
       command: target,
       bundledForPlatform: true,
       copied: true,
       detail: `已落地随包 MCP 二进制：${target}（${manifest.toolCount} 个工具）`
         + (backedUp ? `；原文件不是随包版本，已备份为 ${target}.bak` : '')
-        + pathHint,
+        + (legacyRemoved ? '；已清掉 0.5.0 的私有副本' : '') + pathHint,
     }
   } catch (error) {
     // Windows 上旧会话可能正占着这个 .exe；升级二进制需重启，与"改代码需重启"同一条规则。
     const stillThere = existsSync(target)
+    // 过渡回落：新位置没写成、但 0.5.0 那份还在 → 先用旧的，别让 preset 找不到命令。
+    const fallbackLegacy = !stillThere && existsSync(legacy)
     return {
       onPath,
-      source: stillThere ? 'vendored' : 'missing',
-      command: target,
+      legacyRemoved: false,
+      source: stillThere || fallbackLegacy ? 'vendored' : 'missing',
+      command: fallbackLegacy ? legacy : target,
       bundledForPlatform: true,
       copied: false,
       detail: `随包 MCP 二进制落地失败（${(error as Error).message}）`
-        + (stillThere ? `；沿用已存在的 ${target}（若刚升级过二进制，重启 dsh 即可换新）` : ''),
+        + (fallbackLegacy
+          ? `；暂用 0.5.0 的旧副本 ${legacy}（重启 dsh 会重试迁移）`
+          : stillThere ? `；沿用已存在的 ${target}（若刚升级过二进制，重启 dsh 即可换新）` : ''),
     }
   }
 }
@@ -376,7 +427,7 @@ export interface McpInspection {
   platform: string
   /** 随包清单是否覆盖当前平台。 */
   bundled: boolean
-  /** 已落地的位置（preset 指向它）—— 是用户级 bin。 */
+  /** 已落地的位置（preset 指向它）—— 0.5.1 起是用户级 bin。 */
   target: string
   /** 该文件是否存在。 */
   installed: boolean
@@ -386,6 +437,8 @@ export interface McpInspection {
   overridden: boolean
   /** 安装目录是否在 PATH 上。 */
   onPath: boolean
+  /** 0.5.0 的私有残留（迁移是否完成看它）。 */
+  legacy: { path: string; present: boolean }
 }
 
 /** @see McpInspection */
@@ -395,6 +448,7 @@ export function inspectMcpBinary(): McpInspection {
   const entry = manifest?.platforms?.[key]
   const target = materializedPath()
   const installed = existsSync(target)
+  const legacy = legacyMaterializedPath()
   return {
     manifest: manifest === null ? null : {
       toolCount: manifest.toolCount,
@@ -408,5 +462,6 @@ export function inspectMcpBinary(): McpInspection {
     matchesManifest: entry !== undefined && installed && sha256Of(target) === entry.sha256,
     overridden: overrideCommand() !== null,
     onPath: isOnPath(dirname(target)),
+    legacy: { path: legacy, present: existsSync(legacy) },
   }
 }

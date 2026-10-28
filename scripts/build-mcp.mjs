@@ -63,22 +63,34 @@ const DEFAULT_PLATFORMS = ['linux/amd64', 'windows/amd64']
  * 为什么要把这个数字记进 manifest：排查"为什么某个工具没有"时，第一件事就是
  * 判断这份二进制到底是谁编的、基于哪一版上游。同时它也是合并上游的起点
  * —— 差距、互补关系与冲突点写在同级仓库的 `dsh-mcp-gitee-ent/FORK.md`。
+ *
+ * 盘点：0.2.1（2026-09-14 首次合并）→ 0.2.4（2026-10-26）→ **0.2.5（2026-10-27）**。中间跳过并入
+ * 0.2.2/0.2.3，但工具与文件都包含在 0.2.4 里（0.2.3 把 page/folder 两个工具
+ * 合并成了 create_enterprise_document_node）。
  */
-const UPSTREAM_BASE = '0.2.1'
+const UPSTREAM_BASE = '0.2.5'
 
 /**
  * 编进二进制里的版本号（`-X .../utils.Version=`）。
  *
  * 上游的 `utils/constants.go`（0.2.x 起）默认是 `dev`，靠发布时注入。
- * 我们沿用这套：`0.2.1-dsh.4` = 基于上游 0.2.1 + 本 fork 的改动
- * （.1 加文档工具，.2 目录作用域改成跟随会话工作区，.3 加 download_attach_file 读知识库附件内容，
- *   .4 补声明 `Repository.wiki_enabled_with_content` —— 仓库 WIKI 的唯一判据）。
+ * 我们沿用这套：`<上游基线>-dsh.<本 fork 的第几次构建>`。
  * 握手时 MCP 的 `serverInfo.version` 报的就是它 —— 排查时一眼能看出是哪份。
+ *
+ *   0.2.1-dsh.1 加文档工具
+ *   0.2.1-dsh.2 目录作用域改成跟随会话工作区
+ *   0.2.1-dsh.3 加 download_attach_file 读知识库附件内容
+ *   0.2.1-dsh.4 补声明 `Repository.wiki_enabled_with_content`（仓库 WIKI 的唯一判据）
+ *   0.2.4-dsh.5 上游基线抬到 v0.2.4（+3 个上游文档工具：48 → 51）
+ *   0.2.4-dsh.6 为 0.5.4 的 PR 面板补 4 个工具：审查(accept/reject/reset)、
+ *               测试通过、auths 权限、变更文件列表（51 → 55），并给 update_pull 加 10 个参数
+ *   0.2.5-dsh.7 上游基线抬到 v0.2.5：PR 六个工具的参数 `pull_request_id` → `pull_request_iid`
+ *               （语义本来就是 iid，改名消歧；我们自有的 review/test/auth/files 四个工具同步改名）
  */
-const BINARY_VERSION = '0.2.1-dsh.4'
+const BINARY_VERSION = '0.2.5-dsh.7'
 
 /**
- * **从上游并进来的**那 6 个工具（v0.2.0/0.2.1）。
+ * **从上游并进来的**那 9 个工具（v0.2.0–v0.2.4）。
  *
  * ⚠️ 它们**不是**"另一族 API"。别被目录名骗了：上游的 `operations/documents/`
  * 与我们的 `operations/doc_nodes/` 打的是**同一个 `/{eid}/doc_nodes` 家族**
@@ -98,12 +110,17 @@ const BINARY_VERSION = '0.2.1-dsh.4'
  *
  * ## 为什么记进 manifest
  *
- * 失败模式是「换成上游 npm 版 → 静默少工具」，所以这 6 个**必须在**：
+ * 曾经的失败模式是「换成上游 npm 版 → 静默少工具」。现在这 9 个**必须在**：
  * 若哪天又不见了，`--check` 直接失败，而不是让线上悄悄变弱。
+ *
+ * 末尾 3 个是 v0.2.2 起上游新增的文档结构工具（0.2.3 把 page/folder 两个合成
+ * `create_enterprise_document_node`；文件夹改名仍单列）。它们打的是 `docs/{doc}/…`，
+ * 与我们的 `doc_nodes/{id}/…`（节点树变更）不是一回事，互补而非重叠。
  */
 const MERGED_UPSTREAM_TOOLS = [
   'list_enterprise_documents', 'get_enterprise_document_page', 'update_enterprise_document_page',
   'list_enterprise_document_pages', 'upload_enterprise_document_files', 'download_enterprise_document',
+  'create_enterprise_document', 'create_enterprise_document_node', 'rename_enterprise_document_folder',
 ]
 
 /** 上游 npm 包做不到的那几个工具（换二进制时最先丢的就是它们）。 */
@@ -114,12 +131,18 @@ const FORK_ONLY_TOOLS = [
   // 读附件内容（v0.2.1-dsh.3）：`list_doc_nodes` 只给文件名，正文/二进制靠它取。
   // 上游至今没有这个工具 —— 而本企业知识库全是 AttachFile，所以它是**唯一**能读的路。
   'download_attach_file',
+  // PR 审查/测试（0.2.4-dsh.6，0.5.4 的 PR 面板要用的那 4 个）。
+  // 上游 8 个 PR 工具里**没有**「审查通过 / 测试通过 / 权限 / 变更文件」——
+  // 网页上能点「审核通过」「测试通过」而 MCP 做不到，是这次补它们的唯一理由。
+  'review_enterprise_pull', 'test_enterprise_pull',
+  'get_enterprise_pull_auth', 'list_enterprise_pull_files',
 ]
 // 注：v0.2.1-dsh.4 **没有新增工具**，只补了一个被静默丢掉的字段 ——
 // `list_enterprise_repositories` 的 `wiki_enabled_with_content`（"这个仓库有没有 WIKI"
 // 的唯一判据）。它早先没在 fork 的 `types.Repository` 里声明，Go 的 `json.Unmarshal`
 // 只填声明过的字段，于是客户端**永远拿到 false**（与 `DocNode.FileId` 同一类坑）。
 // 所以工具数不变（仍 48），变的是**已存在工具的返回契约**。
+// 工具数真正变化是 v0.2.4-dsh.5：上游 0.2.2 的 3 个文档工具并入 → 51。
 
 /** 把 `linux/amd64` 翻成 vendor 里的文件名与 DSH 侧的键。 */
 function describePlatform(spec) {
@@ -238,7 +261,7 @@ async function probeTools(binary, timeoutMs = 20_000) {
  * 所以要把 `- ` 前缀与引号剥掉，否则会把首尾两个名字解析坏。
  */
 function presetToolsets() {
-  const text = readPresetPatchText('gitee-manager')
+  const text = readPresetPatchText('gitee')
   const at = text.indexOf('--enabled-toolsets')
   if (at < 0) return []
   // 取下一行的**第一行**：不切行会把整个文件尾巴都吞进最后一个名字里。

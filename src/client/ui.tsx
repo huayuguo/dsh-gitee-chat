@@ -10,24 +10,31 @@
 import { createElement as h, type ReactNode } from 'react'
 import css from './board.module.css'
 
-/** 卡片：视图里所有内容的容器单位。 */
-export function Card(props: { children?: ReactNode; style?: Record<string, unknown>; grow?: boolean }) {
+/**
+ * 卡片：视图里所有内容的容器单位。
+ * @param props.tone - `'warm'` = 暖色细边（知识库/仓库这类内容卡片，用户口径 m02229 ③）。
+ */
+export function Card(props: { children?: ReactNode; style?: Record<string, unknown>; grow?: boolean; tone?: 'warm' }) {
   return h('div', {
-    className: css.gqVCard,
+    className: props.tone === 'warm' ? `${css.gqVCard} ${css.gqVCardWarm}` : css.gqVCard,
     style: props.grow === true ? { ...props.style, flex: 1 } : props.style,
   }, props.children)
 }
 
 /**
- * 卡头：左侧标题（不换行）+ 可选说明 + 右侧控件（自动靠右）。
+ * 卡头：左侧标题（不换行）+ 可选说明 + 可选左起按钮组 + 右侧控件（自动靠右）。
  * @param props.title - 标题文本。
  * @param props.note - 标题右侧的次要说明。
+ * @param props.actions - 紧跟说明的**左起**按钮组（新建类主操作放这里，用户口径 m02229 ②）。
  * @param props.right - 右侧控件（通常是分段开关）。
  */
-export function CardTitle(props: { title: ReactNode; note?: ReactNode; right?: ReactNode }) {
+export function CardTitle(props: { title: ReactNode; note?: ReactNode; actions?: ReactNode; right?: ReactNode }) {
   return h('div', { className: css.gqVCardTitle },
     h('span', { className: css.gqVTitleText }, props.title),
     props.note === undefined || props.note === null ? null : h('span', { className: css.gqVTitleNote }, props.note),
+    props.actions === undefined || props.actions === null
+      ? null
+      : h('span', { className: css.gqVTitleActions }, props.actions),
     props.right ?? null,
   )
 }
@@ -37,6 +44,8 @@ export interface SegOption {
   key: string
   label: ReactNode
   title?: string
+  /** 暖浅色着色（仓库详情的三个页签各用一色，便于一眼分开）。 */
+  tone?: 'sand' | 'rose' | 'olive'
 }
 
 /**
@@ -51,14 +60,22 @@ export function Segmented(props: {
   value: string
   onChange: (key: string) => void
   disabled?: boolean
+  /** 去掉外层灰底/边框，让各项自己带底色（暖浅色页签用）。 */
+  plain?: boolean
 }) {
-  return h('div', { className: css.gqVSeg }, props.options.map((o) =>
+  const toneClass = (tone: SegOption['tone'], on: boolean): string => {
+    if (tone === 'sand') return on ? css.gqVSegSandOn : css.gqVSegSand
+    if (tone === 'rose') return on ? css.gqVSegRoseOn : css.gqVSegRose
+    if (tone === 'olive') return on ? css.gqVSegOliveOn : css.gqVSegOlive
+    return on ? css.gqVSegOn : ''
+  }
+  return h('div', { className: `${css.gqVSeg} ${props.plain === true ? css.gqVSegPlain : ''}` }, props.options.map((o) =>
     h('button', {
       key: o.key,
       type: 'button',
       title: o.title,
       disabled: props.disabled === true,
-      className: `${css.gqVSegBtn} ${props.value === o.key ? css.gqVSegOn : ''}`,
+      className: `${css.gqVSegBtn} ${toneClass(o.tone, props.value === o.key)}`,
       onClick: () => props.onChange(o.key),
     }, o.label),
   ))
@@ -103,6 +120,41 @@ export function Pill(props: { children?: ReactNode; tone?: 'warn' | 'err' | 'ok'
   return h('span', { className: `${css.gqVPill} ${tone}`, title: props.title }, props.children)
 }
 
+/**
+ * 工作项状态 → 药丸配色。
+ *
+ * 用户 2026-10-27 口径：待办浅灰 / 进行中浅绿 / 已完成绿色 / 已取消浅黑。
+ * 各企业的状态名不一样（`pending` / `progressing` / `closed` / 中文名），
+ * 所以这里同时认英文 state 和中文标题，认不出的一律按「待办」处理。
+ */
+export type StateTone = 'todo' | 'doing' | 'done' | 'cancelled'
+
+export function stateToneOf(state: string): StateTone {
+  const s = state.trim()
+  if (s === 'closed' || s === 'closed_issue' || s === 'done' || s === '已完成' || s === '已关闭') return 'done'
+  if (s === 'rejected' || s === 'cancelled' || s === 'canceled' || s === 'terminated'
+    || s === '已取消' || s === '已拒绝' || s === '已废弃') return 'cancelled'
+  if (s === 'progressing' || s === 'open' || s === 'doing' || s === 'started'
+    || s === '进行中' || s === '处理中') return 'doing'
+  return 'todo'
+}
+
+const STATE_TONE_CLASS: Record<StateTone, string> = {
+  todo: css.gqVStateTodo,
+  doing: css.gqVStateDoing,
+  done: css.gqVStateDone,
+  cancelled: css.gqVStateCancelled,
+}
+
+/** 工作项状态药丸（四种配色，见 {@link stateToneOf}）。 */
+export function StatePill(props: { state: string; label?: ReactNode; title?: string }) {
+  const tone = stateToneOf(props.state)
+  return h('span', {
+    className: `${css.gqVStatePill} ${STATE_TONE_CLASS[tone]}`,
+    title: props.title ?? props.state,
+  }, props.label ?? props.state)
+}
+
 /** 彩色圆点（图例 / 健康度）。 */
 export function Dot(props: { color: string; title?: string }) {
   return h('span', { className: css.gqVDot, style: { background: props.color }, title: props.title })
@@ -128,12 +180,17 @@ export function Row(props: {
   title?: string
   active?: boolean
   onClick?: () => void
+  /** 悬停/聚焦钩子：列表里用来预取详情，让点击不再等网络。 */
+  onMouseEnter?: () => void
+  onFocus?: () => void
 }) {
   const cls = `${css.gqVRow} ${props.onClick === undefined ? '' : css.gqVRowBtn} ${props.active === true ? css.gqVRowOn : ''}`
   return h('div', {
     className: cls,
     title: props.title,
     onClick: props.onClick,
+    onMouseEnter: props.onMouseEnter,
+    onFocus: props.onFocus,
     role: props.onClick === undefined ? undefined : 'button',
     tabIndex: props.onClick === undefined ? undefined : 0,
   },

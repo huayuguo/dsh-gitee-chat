@@ -3,7 +3,7 @@
  *
  * ## 这个文件存在的唯一理由
  *
- * 本层只守一条纪律：**MCP 是文档能力的唯一实现**。
+ * `DOCS.md` §7 定了一条纪律：**MCP 是文档能力的唯一实现**。
  * 插件**不实现任何文档端点** —— 不拼 `/doc_nodes/tile`、不拼 `/docs/{id}/files`、
  * 不自己调 `/docs/{id}/export`。所有文档数据都经 MCP 工具获得。
  *
@@ -14,7 +14,7 @@
  *   2. 它**只在该 preset 的 agent 作用域可见** —— profile 层的全局视角看不到；
  *   3. 所以调用必须带 `agent`，否则拿到 `UNKNOWN_TOOL`。
  *
- * 这与「客户端插件拿不到会话的 preset」是同一类事实，
+ * 这与「客户端插件拿不到会话的 preset」是同一类事实（见 `DESIGN.md` §12），
  * 解法也同款：**由 host 按 sessionId 解析出作用域**。
  *
  * ## 白拿的好处
@@ -27,6 +27,7 @@
  */
 
 import { noEnterpriseHint, unauthorizedEnterpriseHint, type EnterpriseIdResolver } from './enterpriseId.ts'
+import type { McpClient } from './mcpClient.ts'
 
 /** 文档委派失败的原因（供路由映射 HTTP 状态）。 */
 export type DocErrorCode =
@@ -84,6 +85,15 @@ export interface McpDocDeps {
   readonly toolPrefix: string
   /** 企业 id **解析器**（工具的第一个必填参数，每次调用现取 —— 见 host/enterpriseId.ts）。 */
   readonly enterprise: EnterpriseIdResolver
+  /**
+   * **进程级直连通道**（0.5.4 起）。
+   *
+   * 有它就不再要求「当前会话挂了 Gitee preset」：PR / 文档面板在任何模式下都能取数
+   * （用户 2026-10-26 口径：「任何模式都可以，而不是必须 agent 预设选 gitee 项目会话模式」）。
+   * 走的是插件自己的 MCP stdio 客户端（`host/mcpClient.ts`），与公开 gateway 同一套
+   * token/企业规则；权限仍然由 token 角色与 `get_enterprise_pull_auth` 决定。
+   */
+  readonly direct?: McpClient
   /** 单次调用超时（毫秒）。 */
   readonly timeoutMs?: number
 }
@@ -221,6 +231,126 @@ function num(value: unknown): number {
 }
 
 /** 从数组字段里取第一个数组（缺失返回空数组）。 */
+/* ── PR 形状归一化（0.5.4）───────────────────────────────────────────────
+ * Gitee v8 的 PR JSON 是 snake_case、字段还会缺；这里统一成 `types.ts`
+ * 里的 camelCase 形状，**让上层（prService / client）不再碰原始 JSON**。
+ * 原则：缺字段给安全默认值，绝不凭角色猜权限（auth 单独取，取不到就是 null）。
+ */
+
+/** `state` 归一。 */
+function prStateOf(value: unknown): 'opened' | 'merged' | 'closed' {
+  const v = str(value)
+  return v === 'merged' || v === 'closed' ? v : 'opened'
+}
+
+/** 审查/测试状态归一：只认 0/1/2，其它当 0。 */
+function prTriState(value: unknown): 0 | 1 | 2 {
+  const n = num(value)
+  return n === 1 || n === 2 ? n : 0
+}
+
+/** 人（作者/审查人/测试人/评论人）。 */
+function toPrPerson(value: unknown): PrPerson {
+  const r = asRecord(value) ?? {}
+  const st = num(r.state)
+  return {
+    id: num(r.id),
+    name: str(r.name) || str(r.username),
+    username: str(r.username),
+    state: st === 1 ? 1 : st === 2 ? 2 : 0,
+  }
+}
+
+/** 权限（`get_enterprise_pull_auth`）。字段名是 snake_case，逐个别名认。 */
+function toPrAuth(value: unknown): PrAuth | null {
+  const r = asRecord(value)
+  if (r === undefined || Object.keys(r).length === 0) return null
+  const f = (camel: string, snake: string): boolean => r[camel] === true || r[snake] === true
+  return {
+    read: f('read', 'read'),
+    createNote: f('createNote', 'create_note'),
+    update: f('update', 'update'),
+    canCheck: f('canCheck', 'can_check'),
+    canTest: f('canTest', 'can_test'),
+    canMerge: f('canMerge', 'can_merge'),
+    forceChecked: f('forceChecked', 'force_checked'),
+    forceTested: f('forceTested', 'force_tested'),
+    canClose: f('canClose', 'can_close'),
+    canReopen: f('canReopen', 'can_reopen'),
+    canDeleteSource: f('canDeleteSource', 'can_delete_source'),
+  }
+}
+
+/** 列表行 / 详情共用部分。 */
+function toPrSummary(value: unknown): PrSummary {
+  const r = asRecord(value) ?? {}
+  const project = asRecord(r.project) ?? {}
+  const src = asRecord(r.source_branch) ?? {}
+  const tgt = asRecord(r.target_branch) ?? {}
+  const assignees = arr(r.assignees).map(toPrPerson)
+  const testers = arr(r.testers).map(toPrPerson)
+  const checkState = prTriState(r.check_state)
+  const testState = prTriState(r.test_state)
+  const canMerge = r.can_merge === true
+  const iid = num(r.iid)
+  const repoPath = str(project.path_with_namespace)
+  return {
+    id: num(r.id),
+    iid,
+    title: str(r.title),
+    state: prStateOf(r.state),
+    draft: r.draft === true,
+    repoId: num(project.id) || num(r.project_id),
+    repoPath,
+    sourceBranch: str(src.branch),
+    targetBranch: str(tgt.branch),
+    author: toPrPerson(r.author),
+    checkState,
+    testState,
+    prAssignNum: num(r.pr_assign_num),
+    prTestNum: num(r.pr_test_num),
+    checkPassed: assignees.filter((p) => p.state === 1).length,
+    testPassed: testers.filter((p) => p.state === 1).length,
+    mergeable: canMerge && checkState === 2 && testState === 2,
+    updatedAt: str(r.updated_at),
+    url: repoPath === '' || iid <= 0 ? '' : `https://gitee.com/${repoPath}/pulls/${iid}`,
+  }
+}
+
+/** 变更文件：`patch` 是 `{diff,new_path,old_path,a_mode,b_mode,...}`，摊平。 */
+function toPrFile(value: unknown): PrFile {
+  const r = asRecord(value) ?? {}
+  const patch = asRecord(r.patch) ?? {}
+  const st = str(r.status)
+  const status: PrFile['status'] = st === 'added' || st === 'renamed' || st === 'deleted' ? st : 'modified'
+  return {
+    filename: str(r.filename),
+    oldPath: str(patch.old_path) || str(r.old_path) || str(r.filename),
+    newPath: str(patch.new_path) || str(r.new_path) || str(r.filename),
+    status,
+    additions: num(r.additions),
+    deletions: num(r.deletions),
+    diff: str(patch.diff) || str(r.diff),
+  }
+}
+
+/**
+ * 评论：`list_enterprise_pull_comments` 返回 `{notes:[…]}` 或 `{data:[…]}`，两条都认。
+ *
+ * 正文的键名实测是 **`content`**（不是 `body`）：只看 `body` 会把每条评论渲染成
+ * 空壳（作者、时间都在，正文空白），AI 结论也因此永远「找不到」。
+ */
+function toPrComment(value: unknown): PrComment {
+  const r = asRecord(value) ?? {}
+  return {
+    id: num(r.id),
+    body: str(r.content) || str(r.body) || str(r.note),
+    author: toPrPerson(r.author),
+    createdAt: str(r.created_at),
+  }
+}
+
+
 function arr(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
 }
@@ -283,6 +413,18 @@ export function unwrapToolResult(name: string, result: ToolExecutionLike): unkno
 }
 
 /** 把工具返回的文本解析成 JSON；不是 JSON 就明确报错（不要静默给空对象）。 */
+/**
+ * 写工具的返回是**一句人话**（如 `Operation completed successfully`），不是 JSON。
+ * 直连通道不能因此报 bad-response —— 那会把成功的写当故障；具体状态由调用方
+ * 重新取详情确认（prService.action 就是这么做的）。
+ */
+function parsePayloadLoose(name: string, text: string): unknown {
+  const trimmed = text.trim()
+  if (trimmed === '') return {}
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) return parsePayload(name, trimmed)
+  return { ok: true, text: trimmed }
+}
+
 function parsePayload(name: string, text: string): unknown {
   try {
     return JSON.parse(text)
@@ -360,7 +502,40 @@ export function createMcpDocs(deps: McpDocDeps) {
    * @param tool - MCP 原始工具名（不含前缀）。
    * @param args - 工具参数（不含 enterprise_id，本方法会补）。
    */
+  /**
+   * 直连通道调用（无 session）：企业 id 用同一套解析器，取不到的可见企业就问一次
+   * `list_enterprises`；MCP 报错翻成 `DocError`。
+   */
+  async function callDirect(tool: string, args: Record<string, unknown>): Promise<unknown> {
+    const client = deps.direct
+    if (client === undefined) throw new DocError('no-tools', '直连通道缺失（deps.direct 未注入）。')
+    const visible = async (): Promise<number[]> => {
+      try {
+        const result = await client.call('list_enterprises', {})
+        const parsed = parsePayload('list_enterprises', result.text)
+        const list = Array.isArray(parsed) ? parsed : asRecord(parsed)?.data
+        const ids = Array.isArray(list) ? list.map((item) => num(asRecord(item)?.id)) : []
+        return ids.filter((id) => id > 0)
+      } catch {
+        return []
+      }
+    }
+    const enterprise = await deps.enterprise.resolve(visible)
+    if (enterprise.id <= 0) throw new DocError('no-enterprise', noEnterpriseHint(enterprise))
+    let result
+    try {
+      result = await client.call(tool, { enterprise_id: enterprise.id, ...args })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new DocError('tool-failed', `调用 MCP 工具 ${tool} 失败：${message}`)
+    }
+    if (result.isError) throw new DocError('tool-failed', result.text || `MCP 工具 ${tool} 返回错误`)
+    return parsePayloadLoose(tool, result.text)
+  }
+
   async function call(sessionId: string, tool: string, args: Record<string, unknown> = {}): Promise<unknown> {
+    // 直连优先：有进程级客户端时，会话只是「谁发起的」标注，不再决定能不能取数。
+    if (deps.direct !== undefined) return await callDirect(tool, args)
     if (sessionId === '') throw new DocError('no-session', '缺少 sessionId：文档取数必须知道是哪个会话（作用域与门禁都靠它）。')
     // 先看会话在不在，再看宿主有没有 tools 注册表。
     //
@@ -606,10 +781,14 @@ export function createMcpDocs(deps: McpDocDeps) {
      * @param sessionId - 会话 id。
      * @param options - programId（项目下）或 scope（内置枚举），二者互斥使用。
      */
-    async listRepositories(sessionId: string, options: { programId?: number; scope?: string; perPage?: number } = {}): Promise<RepoSummary[]> {
+    async listRepositories(
+      sessionId: string,
+      options: { programId?: number; scope?: string; perPage?: number; page?: number } = {},
+    ): Promise<RepoSummary[]> {
       const args: Record<string, unknown> = { per_page: options.perPage ?? 100 }
       if (options.programId !== undefined && options.programId > 0) args.program_id = options.programId
       if (options.scope !== undefined && options.scope !== '') args.scope = options.scope
+      if (options.page !== undefined && options.page > 1) args.page = options.page
       const value = await call(sessionId, 'list_enterprise_repositories', args)
       const record = asRecord(value) ?? {}
       // 与 listNodes 同款：`list_enterprise_repositories` 返回原始分页信封
@@ -718,6 +897,166 @@ export function createMcpDocs(deps: McpDocDeps) {
       const value = await call(sessionId, 'update_enterprise_document_page', args)
       const record = asRecord(value) ?? {}
       return toPage(asRecord(record.page) ?? {})
+    },
+    /** 当前 token 对应的用户（`get_user_info`）——「我提出的」口径要用它的 id。 */
+    async currentUser(sessionId: string): Promise<{ id: number; name: string; username: string }> {
+      const value = await call(sessionId, 'get_user_info', {})
+      const r = asRecord(value) ?? {}
+      return { id: num(r.id), name: str(r.name) || str(r.username), username: str(r.username) }
+    },
+
+    /* ── 合并请求（PR）· 0.5.4 ──────────────────────────────────────────
+     * 委派 8 个原有 PR 工具 + 4 个 0.2.4-dsh.6 新增工具（审查/测试/权限/文件）。
+     * 端点与 `pr_qt=iid` 的细节由 MCP 工具内部处理 —— 这里**绝不自己拼 URL**。
+     */
+
+    /** 列 PR。`scope` 由上层翻好（assign/test/create/related_to_me）。 */
+    async listPulls(sessionId: string, options: {
+      scope?: string
+      state?: string
+      repoId?: number
+      search?: string
+      sort?: string
+      page?: number
+      perPage?: number
+    } = {}): Promise<{ items: PrSummary[]; total: number }> {
+      const args: Record<string, unknown> = {
+        page: options.page ?? 1,
+        per_page: options.perPage ?? 20,
+      }
+      if (options.scope !== undefined && options.scope !== '') args.scope = options.scope
+      if (options.state !== undefined && options.state !== '') args.state = options.state
+      if (options.search !== undefined && options.search !== '') args.search = options.search
+      if (options.sort !== undefined && options.sort !== '') args.sort = options.sort
+      if (options.repoId !== undefined && options.repoId > 0) args.project_id = options.repoId
+      const value = await call(sessionId, 'list_enterprise_pulls', args)
+      const record = asRecord(value) ?? {}
+      const rows = Array.isArray(record.data) ? record.data : arr(record.pulls)
+      return { items: rows.map(toPrSummary), total: num(record.total_count) || rows.length }
+    },
+
+    /** PR 详情（原始 detail 形状 → 归一化）。 */
+    async getPullDetail(sessionId: string, input: { repoId: number; iid: number }): Promise<Record<string, unknown>> {
+      const value = await call(sessionId, 'get_enterprise_pull_detail', {
+        project_id: input.repoId,
+        pull_request_iid: input.iid,
+      })
+      return asRecord(value) ?? {}
+    },
+
+    /** 当前 token 对某 PR 的真实权限；取不到返回 null（**不猜**）。 */
+    async getPullAuth(sessionId: string, input: { repoId: number; iid: number }): Promise<PrAuth | null> {
+      const value = await call(sessionId, 'get_enterprise_pull_auth', {
+        project_id: input.repoId,
+        pull_request_iid: input.iid,
+      })
+      return toPrAuth(value)
+    },
+
+    /** 变更文件列表。 */
+    async listPullFiles(sessionId: string, input: { repoId: number; iid: number; perPage?: number }): Promise<PrFile[]> {
+      const value = await call(sessionId, 'list_enterprise_pull_files', {
+        project_id: input.repoId,
+        pull_request_iid: input.iid,
+        per_page: input.perPage ?? 100,
+      })
+      const record = asRecord(value) ?? {}
+      return arr(record.data).map(toPrFile)
+    },
+
+    /** 审查：accept 通过 · reject 驳回 · reset 撤销本人审查。 */
+    async reviewPull(sessionId: string, input: { repoId: number; iid: number; action: 'accept' | 'reject' | 'reset'; force?: boolean }): Promise<void> {
+      await call(sessionId, 'review_enterprise_pull', {
+        project_id: input.repoId,
+        pull_request_iid: input.iid,
+        action: input.action,
+        force_accept: input.force === true ? 1 : 0,
+      })
+    },
+
+    /** 测试通过。 */
+    async testPull(sessionId: string, input: { repoId: number; iid: number; force?: boolean }): Promise<void> {
+      await call(sessionId, 'test_enterprise_pull', {
+        project_id: input.repoId,
+        pull_request_iid: input.iid,
+        force_accept: input.force === true ? 1 : 0,
+      })
+    },
+
+    /** 合并。 */
+    async mergePull(sessionId: string, input: { repoId: number; iid: number; method?: 'merge' | 'squash' | 'rebase'; title?: string; description?: string }): Promise<void> {
+      const args: Record<string, unknown> = {
+        project_id: input.repoId,
+        pull_request_iid: input.iid,
+        merge_method: input.method ?? 'merge',
+      }
+      if (input.title !== undefined && input.title !== '') args.title = input.title
+      if (input.description !== undefined && input.description !== '') args.description = input.description
+      await call(sessionId, 'merge_enterprise_pull', args)
+    },
+
+    /**
+     * 建 PR（UI 对话框与 agent 直接调 MCP 是**同一条**能力，只是入口不同）。
+     *
+     * `project_id` 接受仓库 id 或 path_with_namespace；分支名只能由调用方给
+     * —— MCP 没有「列分支」的工具，所以 UI 侧是手输 + 默认分支兜底。
+     */
+    async createPull(sessionId: string, input: {
+      repoId: number
+      repoPath?: string
+      sourceBranch: string
+      targetBranch: string
+      title: string
+      body?: string
+      prAssignNum?: number
+      prTestNum?: number
+      draft?: boolean
+    }): Promise<Record<string, unknown>> {
+      const args: Record<string, unknown> = {
+        project_id: input.repoPath !== undefined && input.repoPath !== '' ? input.repoPath : String(input.repoId),
+        source_branch: input.sourceBranch,
+        target_branch: input.targetBranch,
+        title: input.title,
+      }
+      if (input.body !== undefined && input.body !== '') args.body = input.body
+      if (input.prAssignNum !== undefined) args.pr_assign_num = input.prAssignNum
+      if (input.prTestNum !== undefined) args.pr_test_num = input.prTestNum
+      if (input.draft === true) args.draft = 'true'
+      return asRecord(await call(sessionId, 'create_enterprise_repo_pull', args)) ?? {}
+    },
+
+    /** 发评论。 */
+    async commentPull(sessionId: string, input: { repoId: number; iid: number; body: string }): Promise<void> {
+      await call(sessionId, 'comment_enterprise_pull', {
+        project_id: input.repoId,
+        pull_request_iid: input.iid,
+        body: input.body,
+      })
+    },
+
+    /** 列评论。 */
+    async listPullComments(sessionId: string, input: { repoId: number; iid: number }): Promise<PrComment[]> {
+      const value = await call(sessionId, 'list_enterprise_pull_comments', {
+        project_id: input.repoId,
+        pull_request_iid: input.iid,
+      })
+      const record = asRecord(value) ?? {}
+      const rows = Array.isArray(record.notes) ? record.notes : Array.isArray(record.data) ? record.data : arr(record.comments)
+      return rows.map(toPrComment)
+    },
+
+    /**
+     * 改 PR（标题/正文/状态/审查人/测试人/开启审查或测试）。
+     *
+     * 「开启审核/测试」只能建完 PR 再 PUT（`check_state`/`test_state` 不在建 PR 的参数里，
+     * 这是 M0 实测结论）—— 所以 openCheck/openTest 也走这里。
+     */
+    async updatePull(sessionId: string, input: { repoId: number; iid: number; patch: Record<string, unknown> }): Promise<void> {
+      await call(sessionId, 'update_enterprise_pull', {
+        project_id: input.repoId,
+        pull_request_iid: input.iid,
+        ...input.patch,
+      })
     },
   }
 }

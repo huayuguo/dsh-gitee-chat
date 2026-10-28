@@ -24,7 +24,8 @@ import { createElement as h, useCallback, useEffect, useState } from 'react'
 import css from './board.module.css'
 import { fetchCacheInfo, fetchDocAttachment, fetchDocNodes, forgetCache } from './api.ts'
 import { sidebarAvailable, sidebarOpenFile } from './sidebar.ts'
-import { Card, CardTitle, Empty, ErrorState, Markdown, Note, Pill, Segmented, Stat, StatGrid, day } from './ui.tsx'
+import { ColResizer, useColWidth } from './resize.tsx'
+import { Card, CardTitle, Empty, ErrorState, Markdown, Note, Pill, Stat, StatGrid, day } from './ui.tsx'
 import type { CacheInfoResponse } from './api.ts'
 import type { AttachStateView, DocAttachmentResponse, DocNodeRow, DocTreeResponse } from '../types.ts'
 
@@ -131,6 +132,8 @@ export function DocPanel(props: DocPanelProps) {
    * 所以这里不会为了找东西把整棵树拉下来 —— 界面也如实写明这一点。
    * 文件夹恒显示（里面可能有没展开的命中项），只过滤文件。
    */
+  /** 知识库列表栏宽（与仓库页同一套可拖拽，用户 2026-10-27：「知识库也按照项目列表方式展示」）。 */
+  const [docsWidth, setDocsWidth] = useColWidth('docs', 320)
   const [filter, setFilter] = useState('')
   /** 缓存用量（A2）。与树一起拉：清缓存后要重新拉一次才能刷新徽标。 */
   const [cache, setCache] = useState<CacheInfoResponse | null>(null)
@@ -338,29 +341,34 @@ export function DocPanel(props: DocPanelProps) {
   const totalFiles = top.filter((n) => !n.directory).length
   const totalDirs = top.filter((n) => n.directory).length
 
-  const listCard = h(Card, null,
+  // 暖色细边（用户口径 m02229 ③：知识库卡片别再用灰色外框）
+  const listCard = h(Card, { tone: 'warm' },
     h(CardTitle, {
       title: '知识库',
       note: tree === null ? '按需展开：点文件夹才拉它的下一层'
         : `顶层 ${tree.total} 项（文件夹 ${totalDirs} / 文件 ${totalFiles}）· 缓存根 ${tree.cacheRoot}`,
-      right: h('span', { style: { marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' } },
-        h('input', {
-          type: 'search',
-          value: filter,
-          placeholder: '按文件名过滤（只过滤已展开的层）',
-          'aria-label': '知识库节点过滤',
-          style: { width: 200, padding: '2px 6px', borderRadius: 5, border: '1px solid var(--dsw-alias-border-l2)', background: 'transparent', color: 'inherit', fontSize: 12 },
-          onChange: (e: { target?: { value?: string } }) => setFilter(e?.target?.value ?? ''),
-        }),
-        h(Segmented, {
-          options: [
-            { key: 'project', label: '本项目' },
-            { key: 'common', label: '公共知识库' },
-          ],
-          value: scope,
-          onChange: (key) => setScope(key === 'common' ? 'common' : 'project'),
+    }),
+    // 工具栏分两行（用户 2026-10-27：「分行展示。本项目删除这个胶囊，默认打开就是本项目的知识库」）：
+    // 第一行过滤框占满，第二行是范围胶囊与操作按钮。
+    h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0 8px' } },
+      h('input', {
+        type: 'search',
+        value: filter,
+        placeholder: '按文件名过滤（只过滤已展开的层）',
+        'aria-label': '知识库节点过滤',
+        style: { width: '100%', boxSizing: 'border-box', padding: '4px 8px', borderRadius: 5, border: '1px solid var(--dsw-alias-border-l2)', background: 'transparent', color: 'inherit', fontSize: 12 },
+        onChange: (e: { target?: { value?: string } }) => setFilter(e?.target?.value ?? ''),
+      }),
+      h('div', { style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' } },
+        // 只要一枚「公共知识库」胶囊：默认（灰）= 本项目知识库，点一下切到公共知识库（浅蓝）。
+        h('button', {
+          type: 'button',
+          className: scope === 'common' ? `${css.gqVScopeChip} ${css.gqVScopeChipOn}` : css.gqVScopeChip,
+          'aria-pressed': scope === 'common',
           disabled: programId === null,
-        }),
+          title: scope === 'common' ? '点一下回到本项目知识库' : '点一下只看企业级公共知识库',
+          onClick: () => setScope(scope === 'common' ? 'project' : 'common'),
+        }, '公共知识库'),
         h('button', {
           type: 'button',
           className: css.gqVSegBtn,
@@ -376,7 +384,7 @@ export function DocPanel(props: DocPanelProps) {
           onClick: () => void loadRoot(),
         }, '刷新'),
       ),
-    }),
+    ),
     // 缓存用量：附件与仓库 WIKI **分开报** —— 两套语义，合起来会误导
     // （清掉附件腾不出仓库 WIKI 那份空间）。
     cache === null
@@ -384,7 +392,6 @@ export function DocPanel(props: DocPanelProps) {
       : h(Note, null,
           `缓存：附件 ${cache.attachments.count} 个 / ${human(cache.attachments.bytes)}`
           + ` · 仓库 WIKI ${cache.wikis.count} 个文件 / ${human(cache.wikis.bytes)}`
-          + ` · 根目录 ${cache.cacheRoot}`
           + (cache.truncated ? '（数量太大，统计已截断）' : '')),
     cacheNote !== ''
       ? h(Note, null, h('span', { className: css.gqVDim }, cacheNote))
@@ -407,7 +414,7 @@ export function DocPanel(props: DocPanelProps) {
             : h('div', { className: css.gqVNavScroll, style: { maxHeight: 460 } }, shown),
   )
 
-  const detailCard = h(Card, null,
+  const detailCard = h(Card, { tone: 'warm' },
     h(CardTitle, { title: selected === null ? '节点信息' : selected.name, note: selected === null ? '左侧点选一个节点' : typeLabel(selected.fileType) }),
     selected === null
       ? h(Empty, null, '左侧选择文件或文件夹')
@@ -425,34 +432,28 @@ export function DocPanel(props: DocPanelProps) {
             h('div', { className: css.gqVFieldValue }, selected.updatedAt || '—'),
           ),
           selected.directory
-            ? h(Note, null, '这是文件夹。点它展开下一层（只拉这一层，不做全量遍历）。')
+            ? h(Note, null, '这是文件夹，点它展开下一层。')
             : selected.readable
               ? h('div', null,
                   reading ? h(Empty, null, '正在读取并缓存到本地…') : null,
                   readError !== '' ? h(ErrorState, { message: '读取失败', detail: readError, onRetry: () => void readAttachment(selected) }) : null,
                   delegated
                     ? h(Note, null,
-                        '已在**侧边栏**打开：',
+                        '已在侧边栏打开：',
                         h('code', null, delegatedPath),
-                        h('br'),
-                        '本插件不再自己渲染预览 —— 用什么方式显示由侧边栏的预览器决定。',
                         attachment === null ? null : h('br'),
-                        attachment === null ? null : `本地缓存：${attachment.savedPath}（${(attachment.bytes / 1024).toFixed(1)} KB）`,
-                        h('br'),
-                        h('span', { className: css.gqVDim },
-                          '若侧边栏提示"路径在工作区之外"，那是它的**文件围栏**（默认开）在拦 —— 按它给的按钮关掉即可。'))
+                        attachment === null ? null : `本地缓存：${attachment.savedPath}（${(attachment.bytes / 1024).toFixed(1)} KB）`)
                     : attachment === null
                       ? (reading ? null : h(Note, null,
                           sidebarAvailable()
-                            ? '点这一行即可读取：文件会缓存到本地，然后**在侧边栏打开**。'
-                            : '点这一行即可读取内容，文件会缓存到本地知识库目录（本插件只内联预览 .md）。'))
+                            ? '点这一行读取内容（文件会缓存到本地，并在侧边栏打开）。'
+                            : '点这一行读取内容（文件会缓存到本地，.md 直接预览）。'))
                       : h('div', null,
                           h(Note, null,
                             `已缓存到 ${attachment.savedPath}（${(attachment.bytes / 1024).toFixed(1)} KB）`,
-                            h('br'),
                             attachment.fromCache
-                              ? h('span', { className: css.gqVDim }, '本次**直接读的本地缓存**，没有重新下载。')
-                              : h('span', { className: css.gqVDim }, '本次是新下载并写入缓存的。')),
+                              ? h('span', { className: css.gqVDim }, '（读的本地缓存）')
+                              : null),
                           // 远端已更新：**只提示，不自动覆盖** —— 附件不可变，
                           // 要不要用新版由人决定。
                           attachment.state === 'remote-ahead'
@@ -479,16 +480,13 @@ export function DocPanel(props: DocPanelProps) {
                           // 这两种的处置完全不同，含糊其辞会让下一个人白查半天。
                           sidebarAvailable()
                             ? h(Note, null, h('span', { className: css.gqVWarn },
-                                '已检测到侧边栏，但这次没能把文件交给它（见下面的缓存路径，可直接用别的工具打开）。'))
+                                '没能交给侧边栏，可直接用下面的缓存路径打开。'))
                             : null,
                           INLINE_PREVIEW_EXT.has(attachment.ext)
                             ? h('div', { className: css.gqVMd, style: { maxHeight: 420, overflow: 'auto', marginTop: 6 } },
                                 h(Markdown, { text: attachment.content ?? '' }))
                             : h(Note, null, h('span', { className: css.gqVWarn },
-                                `本插件不预览 .${attachment.ext || '未知'} 类型。`
-                                + (sidebarAvailable()
-                                  ? ''
-                                  : '装 `dsh-better-sidebar` 后，点击即由侧边栏的预览器打开。'))),
+                                `.${attachment.ext || '未知'} 类型不支持内联预览，已缓存到本地。`)),
                           attachment.truncated ? h(Note, null, h('span', { className: css.gqVWarn }, '⚠ 正文超长已截断显示。')) : null,
                         ),
                 )
@@ -500,17 +498,10 @@ export function DocPanel(props: DocPanelProps) {
   )
 
   return h('div', null,
-    h(Note, null,
-      `本企业知识库是「文件夹 + 上传附件」的形态（DocDirectory / AttachFile），不是 WikiInfo 文档 —— `
-      + `所以这里列的是**节点树**，按需展开。当前范围：${scope === 'common' ? '企业级公共知识库' : `项目「${programName || programId}」`}。`,
-      h('br'),
-      sidebarAvailable()
-        ? '预览分工：点文件 → 交给**侧边栏**（dsh-better-sidebar）打开，用什么方式显示取决于它的预览器。'
-        : '预览分工：本插件只内联预览 **.md**；装 `dsh-better-sidebar` 后，其它类型（图片 / PDF / Office…）由它打开。',
-    ),
-    h('div', { className: css.gqVCols },
-      h('div', { className: css.gqVCol, style: { flex: '0 1 420px' } }, listCard),
-      h('div', { className: css.gqVCol }, detailCard),
+    h('div', { className: css.gqVSplit },
+      h('div', { style: { flex: '0 0 auto', width: docsWidth, minWidth: 0, alignSelf: 'stretch' } }, listCard),
+      h(ColResizer, { width: docsWidth, onResize: setDocsWidth }),
+      h('div', { className: css.gqVSplitMain }, detailCard),
     ),
   )
 }

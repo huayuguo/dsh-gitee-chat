@@ -15,6 +15,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { BoardPayload, BoardScope, HealthResponse } from '../types.ts'
+import type { SnapshotRecord, SnapshotStore } from './snapshotStore.ts'
 
 /** 包根目录（bundle 位于 <root>/lib/index.js）。 */
 export function packageRoot(): string {
@@ -42,6 +43,16 @@ export interface RunResult {
   cached: boolean
   /** 是否降级为样例数据。 */
   degraded: boolean
+  /** 这份数据的**抓取时刻**（epoch ms）；命中缓存时是原抓取时刻，不是当下。 */
+  fetchedAt: number
+  /** 数据已存在多久（毫秒）。 */
+  ageMs: number
+  /** 是否已超过新鲜期（TTL）——调用方必须据此提醒「可能不是最新」。 */
+  stale: boolean
+  /** 当前生效的新鲜期（毫秒，0 = 不做缓存）。 */
+  ttlMs: number
+  /** 数据来自哪一层：`remote` 现拉、`memory` 进程内、`disk` 落盘快照。 */
+  source: 'remote' | 'memory' | 'disk'
 }
 
 /** 执行器配置。 */
@@ -50,6 +61,19 @@ export interface RunnerOptions {
   scriptPath?: string
   /** 单次脚本执行超时（毫秒）。 */
   timeoutMs?: number
+  /**
+   * 进程内结果的新鲜期（毫秒）。
+   *
+   * 不设上限的缓存会把「十分钟前拉到的看板」一直端出来，用户以为数据没更新；
+   * 超时后虽然复用缓存的旧值会更快，但必须让刷新真正能拿到新数据，所以给个 TTL。
+   */
+  /**
+   * 新鲜期（毫秒）。`0` = 不读缓存（每次现拉）。
+   *
+   * 可以是函数：设置页里 `cache.ttlSeconds` 是 volatile 字段，改了要立刻生效，
+   * 所以宿主传进来的是「现取」的函数而不是装配期的常量。
+   */
+  memoTtlMs?: number | (() => number)
   /** 传给脚本的 API base（可选覆盖）。 */
   apiBase?: string
   /** 无 token 时是否自动降级为样例数据。 */
@@ -66,6 +90,15 @@ export interface RunnerOptions {
    * 让「配置在哪设」与「阈值单一真源在脚本里」两件事不冲突。
    */
   env?: NodeJS.ProcessEnv
+  /**
+   * 落盘快照仓库（可选）。
+   *
+   * 加上它以后：进程重启后第一次打开面板也能先端出上一次的快照（`source: 'disk'`），
+   * 再由下一次刷新纠正——这正是「重启后首屏 1.5 s → 0」的那一半。
+   */
+  persist?: SnapshotStore
+  /** 是否允许读写落盘快照（`cache.persist` 的实时开关；缺省 true）。 */
+  persistEnabled?: () => boolean
 }
 
 /** 取数失败：带一个可判定的 code，供路由映射 HTTP 语义。 */
@@ -109,8 +142,45 @@ export function createGqRunner(options: RunnerOptions = {}) {
   const allowFixtureFallback = options.allowFixtureFallback ?? false
   const enterpriseId = options.enterpriseId ?? 0
 
-  /** 进程内结果（不是数据库：进程退出即消失）。 */
-  const memo = new Map<string, BoardPayload>()
+  /** 进程内结果（不是数据库：进程退出即消失）。现取，兼容常量与函数两种写法。 */
+  const memoTtlMsOf = (): number => {
+    const raw = options.memoTtlMs
+    const value = typeof raw === 'function' ? raw() : raw ?? 60_000
+    return Number.isFinite(value) ? Math.max(0, Number(value)) : 60_000
+  }
+  /** 进程内结果（带时间戳，过期即视为未命中）。 */
+  const memo = new Map<string, { payload: BoardPayload; at: number }>()
+  /** 落盘快照（可选；重启后仍能端出上次的数据）。 */
+  const persist = options.persist
+  /** 落盘是否启用（实时开关）。 */
+  const persistOn = (): boolean => persist !== undefined && options.persistEnabled?.() !== false
+  /**
+   * 最近一次「有人在用面板」的时刻（epoch ms）。
+   *
+   * 自动刷新拿它当闸门：没人看的时候不要每 60 秒去翻 4 页 Gitee，
+   * 那既浪费限流额度，也会让日志里全是无人消费的取数。
+   */
+  let lastActivityAt = 0
+
+  /** 记一次活动（路由/工具每次被调用时打点）。 */
+  function touch(): void {
+    lastActivityAt = Date.now()
+  }
+
+  /** 把一条缓存记录翻译成带新鲜度元数据的取数结果。 */
+  function asResult(record: SnapshotRecord, source: 'memory' | 'disk'): RunResult {
+    const ageMs = Math.max(0, Date.now() - record.fetchedAt)
+    return {
+      payload: record.payload,
+      cached: true,
+      degraded: record.payload.source === 'fixture',
+      fetchedAt: record.fetchedAt,
+      ageMs,
+      stale: memoTtlMsOf() <= 0 || ageMs > memoTtlMsOf(),
+      ttlMs: memoTtlMsOf(),
+      source,
+    }
+  }
 
   /**
    * 起飞前检查脚本本身是否可用。
@@ -223,11 +293,28 @@ export function createGqRunner(options: RunnerOptions = {}) {
     },
     /** 缓存里的当前值（不触发拉取）。 */
     peek(key: string): BoardPayload | undefined {
-      return memo.get(key)
+      return memo.get(key)?.payload
     },
-    /** 清空进程内缓存。 */
+    /** 读一份快照（进程内 → 落盘），**不发任何网络请求**；没有则 undefined。 */
+    snapshot(request: RunRequest): RunResult | undefined {
+      const key = cacheKeyOf(request)
+      const hit = memo.get(key)
+      if (hit !== undefined) return asResult({ payload: hit.payload, fetchedAt: hit.at }, 'memory')
+      const onDisk = persistOn() ? persist?.read(key) : undefined
+      return onDisk === undefined ? undefined : asResult(onDisk, 'disk')
+    },
+    /** 记一次活动（自动刷新用它判断「还有没有人在看」）。 */
+    touch,
+    /** 最近一次活动距今多久（毫秒；从未活动返回 Infinity）。 */
+    idleMs(): number {
+      return lastActivityAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastActivityAt
+    },
+    /** 当前生效的新鲜期（毫秒）。 */
+    ttlMs: memoTtlMsOf(),
+    /** 清空进程内缓存与落盘快照。 */
     clear(): void {
       memo.clear()
+      persist?.clear()
     },
     /**
      * 取数：命中缓存直接返回；否则执行脚本。
@@ -235,9 +322,18 @@ export function createGqRunner(options: RunnerOptions = {}) {
      */
     async run(request: RunRequest): Promise<RunResult> {
       const key = cacheKeyOf(request)
+      touch()
       if (!request.refresh) {
         const hit = memo.get(key)
-        if (hit !== undefined) return { payload: hit, cached: true, degraded: hit.source === 'fixture' }
+        if (hit !== undefined && memoTtlMsOf() > 0 && Date.now() - hit.at < memoTtlMsOf()) {
+          return asResult({ payload: hit.payload, fetchedAt: hit.at }, 'memory')
+        }
+        // 进程内没有（例如刚重启）→ 看落盘快照是否还在新鲜期内
+        const onDisk = persist?.read(key)
+        if (onDisk !== undefined && memoTtlMsOf() > 0 && Date.now() - onDisk.fetchedAt < memoTtlMsOf()) {
+          memo.set(key, { payload: onDisk.payload, at: onDisk.fetchedAt })
+          return asResult(onDisk, 'disk')
+        }
       }
 
       const args = [request.scope]
@@ -245,14 +341,35 @@ export function createGqRunner(options: RunnerOptions = {}) {
 
       try {
         const payload = parsePayload(await spawnGq(args, false))
-        memo.set(key, payload)
-        return { payload, cached: false, degraded: false }
+        const at = Date.now()
+        memo.set(key, { payload, at })
+        if (persistOn()) persist?.write(key, { payload, fetchedAt: at })
+        return {
+          payload,
+          cached: false,
+          degraded: false,
+          fetchedAt: at,
+          ageMs: 0,
+          stale: false,
+          ttlMs: memoTtlMsOf(),
+          source: 'remote',
+        }
       } catch (error) {
         const failure = error instanceof GqError ? error : classify(error)
         if (allowFixtureFallback && failure.code === 'no-token') {
           const payload = parsePayload(await spawnGq(args, true))
-          memo.set(key, payload)
-          return { payload, cached: false, degraded: true }
+          const at = Date.now()
+          memo.set(key, { payload, at })
+          return {
+            payload,
+            cached: false,
+            degraded: true,
+            fetchedAt: at,
+            ageMs: 0,
+            stale: false,
+            ttlMs: memoTtlMsOf(),
+            source: 'remote',
+          }
         }
         throw failure
       }

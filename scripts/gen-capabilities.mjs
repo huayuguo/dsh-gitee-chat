@@ -1,21 +1,22 @@
 /**
- * 从能力矩阵派生出**两份会被代码消费的产物**。
+ * 从能力矩阵生成 CAPABILITIES.md。
  *
  * 存在的意义：矩阵的唯一真源是 `scripts/gitee/gq.mjs` 里的 `TIERS`，
- * 以下两份都从它派生，再由 `--check` 断言「产物 == 真源」——于是产物不可能与行为漂移：
- *   1. `src/generated/tierWrites.ts` —— 只读部署硬拦写工具用的三档并集；
- *   2. 两个 preset 的 `--enabled-toolsets` 行。
+ * 文档由它派生，冒烟测试再断言「文档 == 生成结果」——于是文档不可能与行为漂移。
  *
- * 用法：node scripts/gen-capabilities.mjs        # 写出产物
+ * 用法：node scripts/gen-capabilities.mjs        # 写出 CAPABILITIES.md
  *       node scripts/gen-capabilities.mjs --check # 只校验是否最新（CI 用）
  */
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { presetPatchPath } from './preset-files.mjs'
-import { TIERS } from './gitee/gq.mjs'
+import { renderMatrix, TIERS } from './gitee/gq.mjs'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
+const target = join(root, 'docs', 'CAPABILITIES.md')
+const header = '<!-- 本文件由 scripts/gen-capabilities.mjs 从 gq.mjs 的 TIERS 生成，请勿手改 -->\n\n'
+const content = header + renderMatrix() + '\n'
 
 /**
  * 第二份派生物：`src/generated/tierWrites.ts`。
@@ -53,14 +54,12 @@ const generatedContent = [
  * 普通成员会落到不同档。所以 preset 必须启用**它下面可能出现的最高档**，
  * 由门禁（`ctx.tools.guard`）按推导出的档做硬拦截。
  *
- * `gitee-exec` 之所以给 **project** 而不是 exec：它的 `preset.yml` 自己写着
- * 「若你在某项目里是负责人，该项目会自动开启项目管理与分析」。给 exec 档会让
- * 负责人**静默少 13 个工具**（含 `create_wiki`/`move_doc_node`/`list_enterprise_members`），
- * 与它自己的说明矛盾。
+ * 0.5.4 起只剩一个 preset（`gitee`），按「执行 / 管理两模式合并」的决策
+ * （见 `docs/decisions/0002-single-preset.md`）：工具**全量**给到 manager 档，
+ * 能不能写由云端 token 的角色与 PR 的 `auths` 决定，不再靠预选模式。
  */
 const PRESET_TIERS = {
-  'gitee-manager': 'manager',
-  'gitee-exec': 'project',
+  gitee: 'manager',
 }
 
 /** 把 preset 里 `--enabled-toolsets` 那一行换成 TIERS 派生的列表。 */
@@ -89,6 +88,16 @@ const drifted = presets.filter((p) => p.text !== p.next)
 
 if (process.argv.includes('--check')) {
   let bad = false
+  // CAPABILITIES.md 是「只在本机维护、不入库」的内部文档（见 .gitignore 与 AGENTS.md）。
+  // 公开仓库/CI 的干净检出里没有这个文件 —— 那种情况下跳过比对，而不是判红：
+  // 真正的防漂移靠下面的 tierWrites.ts 与 preset 工具集，这两份都是入库产物。
+  const current = await readFile(target, 'utf8').catch(() => null)
+  // 比的是内容，不是字节。Windows 检出（core.autocrlf=true）把 CAPABILITIES.md
+  // 写成 CRLF，而上面那份是按 '\n' 拼的 —— 原样比较会在 Windows 开发机/CI 上恒红。
+  if (current !== null && current.replace(/\r\n/g, '\n') !== content) {
+    console.error(`${target} 与代码里的能力矩阵不一致。请运行：node scripts/gen-capabilities.mjs`)
+    bad = true
+  }
   const currentGenerated = await readFile(generatedTarget, 'utf8').catch(() => '')
   // 比的是内容，不是字节：Windows 检出（core.autocrlf=true）会把工作区文件写成 CRLF，
   // 而这里是按 '\n' 生成的 —— 原样比较会在 Windows 开发机/CI 上恒红：
@@ -102,8 +111,11 @@ if (process.argv.includes('--check')) {
     bad = true
   }
   if (bad) process.exit(1)
-  console.log(`能力矩阵派生物一致 ✓（${presets.length} 个 preset 的工具集 + ${writeTools.length} 个写工具）`)
+  const docNote = current === null ? '未入库的内部文档已跳过' : 'CAPABILITIES.md 与能力矩阵一致'
+  console.log(`${docNote} ✓（含 ${presets.length} 个 preset 的工具集 + ${writeTools.length} 个写工具）`)
 } else {
+  await writeFile(target, content)
+  console.log(`已写出 ${target}（${content.length} 字符）`)
   await mkdir(dirname(generatedTarget), { recursive: true })
   await writeFile(generatedTarget, generatedContent)
   console.log(`已写出 ${generatedTarget}（写工具并集 ${writeTools.length} 个）`)

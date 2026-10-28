@@ -8,12 +8,13 @@
  *
  * 这也正好符合规则本身：**人格由 token 的身份关系决定，与会话无关**。
  *   - 基础人格：进程级一次解析（谁持有 token → 企业角色 / 负责哪些项目）
- *   - 当前项目里的角色：会话级的「聚焦项目」决定
+ *   - 当前项目里的角色：会话级的「聚焦项目」决定（见 DESIGN.md §7）
  *
  * @module dsh-gitee-chat/host/role
  */
 
 import type { GqRunner } from './gq.ts'
+import { parseStamp } from './docCache.ts'
 import type { PersonaKey, PersonaMode, PersonaTier, RolePayload } from '../types.ts'
 
 /** 解析器选项。 */
@@ -58,7 +59,7 @@ export function createRoleResolver(options: RoleResolverOptions) {
     if (cache === null) return false
     if (stale) return false
     if (ttlMs <= 0) return true
-    const at = Date.parse(cache.generatedAt.replace(' ', 'T'))
+    const at = parseStamp(cache.generatedAt)
     return Number.isFinite(at) && Date.now() - at < ttlMs
   }
 

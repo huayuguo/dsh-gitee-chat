@@ -256,8 +256,8 @@ async function main() {
   const sectionHtml = renderToStaticMarkup(h(GiteeSettingsSection, {}))
   assert.ok(sectionHtml.includes('Gitee 企业版 Token'), '设置分节缺少标题')
   assert.ok(sectionHtml.includes('.gitee-chat/token'), '设置分节必须写明 token 存到哪个文件')
-  assert.ok(sectionHtml.includes('Gitee 企业项目管理') && sectionHtml.includes('Gitee 项目执行'),
-    '设置分节必须告诉使用者配好之后选哪个预设')
+  assert.ok(sectionHtml.includes('Gitee 项目管理'),
+    '设置分节必须告诉使用者配好之后选哪个预设（预设名就叫「Gitee 项目管理」）')
   assert.ok(sectionHtml.includes('保存'), '设置分节里必须有保存按钮')
   assert.ok(sectionHtml.includes('当前企业'), '设置分节必须有企业选择入口（配好 token 之后直接选企业）')
   assert.ok(sectionHtml.includes('读取中'), '企业列表 SSR 首屏应是加载态，不能崩')
@@ -265,8 +265,8 @@ async function main() {
   console.log('  ✓ 设置分节：token 路径 / 企业选择器 / 预设指引 / 保存按钮齐备')
 
   // 🔴 反向守卫：配置入口**不许**再回到「Gitee 项目」标签页里。
-  // 那里不能放 `⚙ 设置` 弹窗：那个标签页只在 Gitee 模式的会话里才有内容，
-  // 把配置放进去等于"先有 token 才能找到配 token 的地方"。
+  // 曾经那里有个 `⚙ 设置` 弹窗：那个标签页只在 Gitee 模式的会话里才有内容，
+  // 把配置放进去等于"先有 token 才能找到配 token 的地方"（DESIGN.md §30）。
   const tabViewSrc = readFileSync(join(root, 'src/client/GiteeProjectView.tsx'), 'utf8')
   assert.ok(!/TokenSettings|TokenForm|粘贴企业版 access token/.test(tabViewSrc),
     '「Gitee 项目」标签页里不得再有 token 配置代码 —— 配置入口只有应用「设置 → Gitee 企业项目」')
@@ -278,19 +278,39 @@ async function main() {
   // ── J 层：仓库面板与知识库面板（SSR 不跑 effect，断言的是"首屏不崩 + 口径写清楚"）──
   const repoHtml = renderToStaticMarkup(h(RepoPanel, { sessionId: 'render-check', programId: 1001, programName: '示例项目' }))
   assert.ok(repoHtml.includes('仓库'), '仓库面板缺少标题')
-  assert.ok(repoHtml.includes('企业内部开源'), '仓库面板必须写明第二种口径（不选项目时只看企业内部开源）')
+  assert.ok(repoHtml.includes('内源仓库'), '仓库面板必须写明第二种口径（内源仓库胶囊）')
+  assert.ok(!repoHtml.includes('刷新'), '仓库列表不要「刷新」按钮（用户 2026-10-27 口径）')
+  assert.ok(!repoHtml.includes('本项目'), '仓库列表不要再出现「本项目」分段（用户 2026-10-27 口径）')
   assert.ok(repoHtml.includes('WIKI'), '仓库面板必须说明 WIKI 挂在仓库下面')
   assert.ok(repoHtml.includes('正在拉取仓库列表'), '首屏应是加载态')
   const repoNoProject = renderToStaticMarkup(h(RepoPanel, { sessionId: 'render-check', programId: null, programName: '' }))
-  assert.ok(repoNoProject.includes('企业内部开源'), '没有选中项目时默认就是企业内部开源口径')
-  console.log('  ✓ J 层仓库面板：首屏不崩 · 两种口径写明 · 没有项目时默认内部开源')
+  assert.ok(repoNoProject.includes('内源仓库'), '没有选中项目时的口径也要写成「内源仓库」')
+  // 仓库详情三页签必须各用一种暖浅色（用户 2026-10-27：工作项/合并请求/WIKI 三种不同暖浅色）
+  const repoPanelSrc = readFileSync(new URL('../src/client/RepoPanel.tsx', import.meta.url), 'utf8')
+  for (const tone of ['sand', 'rose', 'olive']) {
+    assert.ok(repoPanelSrc.includes(`tone: '${tone}'`), `仓库详情三页签缺少暖浅色 ${tone}`)
+  }
+  // 工作项状态药丸四色（用户 2026-10-27：待办浅灰 / 进行中浅绿 / 已完成绿色 / 已取消浅黑）
+  const uiSrc = readFileSync(new URL('../src/client/ui.tsx', import.meta.url), 'utf8')
+  for (const cls of ['gqVStateTodo', 'gqVStateDoing', 'gqVStateDone', 'gqVStateCancelled']) {
+    assert.ok(uiSrc.includes(cls), `状态药丸缺少配色映射 ${cls}`)
+  }
+  assert.ok(uiSrc.includes(`s === '已取消'`), '状态药丸必须认中文「已取消」')
+  const boardCss = readFileSync(new URL('../src/client/board.module.css', import.meta.url), 'utf8')
+  for (const cls of ['.gqVSegSand', '.gqVSegRose', '.gqVSegOlive', '.gqVSegPlain']) {
+    assert.ok(boardCss.includes(cls), `缺少页签暖色样式 ${cls}`)
+  }
+  console.log('  ✓ J 层仓库面板：首屏不崩 · 内源仓库胶囊替代分段/刷新')
 
   const docHtml = renderToStaticMarkup(h(DocPanel, { sessionId: 'render-check', programId: 1001, programName: '示例项目' }))
   assert.ok(docHtml.includes('知识库'), '知识库面板缺少标题')
+  // 用户 2026-10-27：「知识库也按照项目列表方式展示」→ 同一套可拖拽分栏
+  assert.ok(docHtml.includes('role="separator"'), '知识库列表要能拖宽（与项目列表同一套分栏）')
   assert.ok(docHtml.includes('正在拉取知识库结构'), '首屏应是加载态')
-  // 预览分工必须写在界面上（需求：只内联 .md，其余交给侧边栏）
-  assert.ok(/预览分工/.test(docHtml), '必须写明预览分工（本插件只内联 .md）')
-  assert.ok(/侧边栏|dsh-better-sidebar/.test(docHtml), '必须说明侧边栏接管其它类型')
+  // 首屏不得出现"开发提示"（用户 2026-10-27：「这些似乎是开发提示而不是给用户提示的」）
+  for (const devish of ['DocDirectory', 'AttachFile', 'WikiInfo', 'dsh-better-sidebar', '预览分工', '节点树']) {
+    assert.ok(!docHtml.includes(devish), `知识库首屏不得出现开发向文案：${devish}`)
+  }
   // A2：缓存管理入口必须首屏就在（不然 `forget`/`scopePath` 又变成没有出口的死代码）
   assert.ok(docHtml.includes('清本范围缓存'), '知识库面板必须有"清本范围缓存"入口')
   // A3：查找入口，且必须**如实说明只过滤已展开的层**（子层是按需拉的）
@@ -317,7 +337,7 @@ async function main() {
 
   // ── 自包含 HTML 预览：可直接用浏览器打开看真实观感 ───────────────────────
   const cssText = await readFile(join(root, 'src/client/board.module.css'), 'utf8')
-  const previewPath = join(root, 'preview/board-preview.html')
+  const previewPath = join(root, '.tmp/preview/board-preview.html')
   await mkdir(dirname(previewPath), { recursive: true })
   await writeFile(previewPath, `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">

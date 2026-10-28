@@ -1,12 +1,12 @@
 /**
  * dsh-gitee-chat · **公开 gateway**（host 半唯一的 agent 可见出口）。
  *
- * 背景：原先 Gitee 企业 MCP 的 48 个工具只挂在两个 Gitee
+ * 背景（DESIGN.md §37）：原先 Gitee 企业 MCP 的工具（当时 51 个，0.5.4 起 55 个）只挂在两个 Gitee
  * preset 里 —— 其他 agent（分析、PTC、一次性问答）根本看不到，而 MCP 本身
  * 是**工具类后端**、不是 Gitee 人格的私有物。用户 2026-10-10 要求改成公共能力。
  *
- * 但「全量公开」不等于「48 个 schema 每轮进上下文」：实测 48 个工具的
- * name+description+inputSchema ≈ 46.6 KB ≈ 14.6K tokens/请求。所以这里做成
+ * 但「全量公开」不等于「55 个 schema 每轮进上下文」：实测（0.5.3 的 51 个工具）
+ * name+description+inputSchema ≈ 52.4 KB ≈ 16.4K tokens/请求；55 个约 56 KB ≈ 17.6K。所以这里做成
  * **两级暴露**，只把第一级常驻：
  *
  *   1. **目录**（`op: "list"`，约 1.1K tokens，且只在真用到时才进上下文）：
@@ -17,7 +17,7 @@
  * 为什么不用 DSH 原生的 `deferLoading`：`ToolSchema.deferLoading` 只表达
  * 「延迟发送定义」，而**声明延迟并不激活**（`packages/llm/llm/README.zh.md:162`），
  * 且 `dsh-mcp-client` 不接受该选项（`lib/index.js:153` 直接 `register(definition)`）。
- * 也就是说原生机能不能给出「目录 → 按需加载」这条路。
+ * 也就是说原生机能不能给出「目录 → 按需加载」这条路（详见 DESIGN.md §37）。
  *
  * 门禁分工（与 §10/§11 一致）：**档位裁剪留给 Gitee preset**（agent 半用
  * `ctx.tools.restrict` 把这个 gateway 从 Gitee 会话里隐藏，仍用原生 48 工具）；
@@ -30,7 +30,7 @@ import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { WRITE_TOOLS } from '../generated/tierWrites.ts'
 import { PUBLIC_GATEWAY_TOOL_NAME } from '../mcpNaming.ts'
-import type { McpCallResult, McpClient } from './mcpClient.ts'
+import type { McpCallResult, McpClient, McpToolInfo } from './mcpClient.ts'
 
 /** 统一文本输出（与 `host/tools.ts` 同一形状）。 */
 const TEXT_OUTPUT = {
@@ -130,9 +130,141 @@ export function giteeEntGatewayTool(deps: GiteeEntGatewayDeps): ToolDefinition {
   const runtimeWrites = (): ReadonlySet<string> =>
     new Set<string>([...WRITE_TOOLS, ...(deps.runtimeWrites?.() ?? [])])
 
+  // ── 入参归一化 ─────────────────────────────────────────────────────────────
+  //
+  // 2026-10-27 的事故：模型把工作项建到了**另一家企业**（它按 npm 仓库的 Gitee 路径反推了
+  // 一个企业 id，显式传了 `enterprise_id`），且只带了 `project_id`（仓库）、没带
+  // `program_id`（项目）→ 工作项飘在企业里、不进任何项目看板。
+  //
+  // 两条都不该指望模型自觉：企业是**部署级事实**（`enterpriseId.ts` 的解析结果唯一），
+  // 项目能从仓库反查。所以在 gateway 这一层（标准模式下工具是我们自己的）统一纠偏：
+  //   1. schema 声明了 `enterprise_id` 的工具：缺失/为 0/与配置不一致 → 一律改成配置企业；
+  //   2. `create_enterprise_issue`：没带 `program_id` 时按仓库反查，查不到就**拒建**
+  //      （宁可报错，也不产出"没有项目的工作项"）。
+  //
+  // Gitee 预设走的是 MCP 原生工具（不经这里），那条线由 preset 的 `GITEE_ENT_ID` 兜底，
+  // 显式传错的企业 id 仍然会覆盖 —— 这是已知缺口，记在 DESIGN.md §37。
+  const LIST_TTL_MS = 60_000
+  let listedAt = 0
+  let listedTools: readonly McpToolInfo[] = []
+  /** 工具目录（带 60s 缓存：每次 call 都要按 schema 判断要不要补 enterprise_id）。 */
+  const toolsNow = async (): Promise<readonly McpToolInfo[]> => {
+    if (listedAt !== 0 && Date.now() - listedAt < LIST_TTL_MS) return listedTools
+    try {
+      listedTools = await deps.client.list()
+      listedAt = Date.now()
+    } catch {
+      listedAt = 0
+    }
+    return listedTools
+  }
+
+  const PROGRAM_TTL_MS = 600_000
+  const programOfRepo = new Map<number, { at: number; value: number }>()
+  /**
+   * 仓库 → 所属项目（program）的反查。
+   *
+   * MCP 没有「项目的仓库列表」工具，但既有工作项都带 `program_id`，所以拿该仓库的
+   * 一条工作项反查即可（同一仓库的所有工作项必然属于同一项目）。
+   * @param enterpriseId - 企业 id（已归一化）
+   * @param repoId - 仓库 id（`project_id`）
+   * @returns 项目 id；查不到返回 undefined
+   */
+  async function resolveProgram(enterpriseId: number, repoId: number): Promise<number | undefined> {
+    const hit = programOfRepo.get(repoId)
+    if (hit !== undefined && Date.now() - hit.at < PROGRAM_TTL_MS) return hit.value
+    try {
+      const result = await deps.client.call('list_enterprise_issues', {
+        enterprise_id: enterpriseId,
+        project_id: String(repoId),
+        per_page: 10,
+      })
+      if (result.isError) return undefined
+      const parsed = JSON.parse(result.text) as { data?: Array<{ program_id?: unknown }> }
+      const rows = Array.isArray(parsed.data) ? parsed.data : []
+      const found = rows
+        .map((row) => Number(row?.program_id))
+        .find((id) => Number.isFinite(id) && id > 0)
+      if (found === undefined) return undefined
+      programOfRepo.set(repoId, { at: Date.now(), value: found })
+      return found
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 归一化一次调用的入参。
+   *
+   * 企业 id 的规则分读写：**写操作**一律归到本部署配置的企业（配置是唯一真源，
+   * 模型填错/填 0 都不该把数据写到别家）；**只读操作**只在缺失或 ≤0 时补默认值，
+   * 显式指定的其他企业原样放行（同一账号可属多家企业）。
+   * @param name - MCP 工具名
+   * @param args - 模型给的参数（不改原对象）
+   * @returns 纠正后的参数 + 给模型看的说明；拒绝时给 `refused` 文案
+   */
+  async function normalizeCall(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<{ args: Record<string, unknown>; notes: string[] } | { refused: string }> {
+    let next = args
+    const notes: string[] = []
+    const enterprise = deps.enterpriseSelector?.()
+    const tool = (await toolsNow()).find((entry) => entry.name === name)
+    const properties = (tool?.inputSchema as { properties?: Record<string, unknown> } | undefined)?.properties
+    if (enterprise !== undefined && enterprise.id > 0 && properties !== undefined
+      && Object.prototype.hasOwnProperty.call(properties, 'enterprise_id')) {
+      const raw = next.enterprise_id
+      const given = Number(raw)
+      const absent = raw === undefined || raw === null || raw === ''
+        || !Number.isFinite(given) || given <= 0
+      // 写操作**强制**归到本部署配置的企业（2026-10-27 就是把工作项建到了别的企业）；
+      // 只读操作只在"没给 / 给 0"时补配置企业，显式给了别的企业要尊重 —— 一个账号
+      // 可能同时属于多家企业，查别家的仓库/工作项是正当用法，一并改掉会查不到东西。
+      const mustUseConfigured = runtimeWrites().has(name)
+      if (absent || (mustUseConfigured && given !== enterprise.id)) {
+        next = { ...next, enterprise_id: enterprise.id }
+        notes.push(absent
+          ? `已自动补上 enterprise_id=${enterprise.id}（本部署配置的企业${enterprise.describe === '' ? '' : `；来源：${enterprise.describe}`}）`
+          : `已把 enterprise_id 从 ${String(raw)} 纠正为配置企业 ${enterprise.id}（避免建到别的企业）`)
+      }
+    }
+    if (name === 'create_enterprise_issue') {
+      const program = Number(next.program_id)
+      const repo = Number(next.project_id)
+      const enterpriseId = Number(next.enterprise_id)
+      if (!(Number.isFinite(program) && program > 0)) {
+        const resolved = Number.isFinite(repo) && repo > 0 && Number.isFinite(enterpriseId) && enterpriseId > 0
+          ? await resolveProgram(enterpriseId, repo)
+          : undefined
+        if (resolved === undefined) {
+          return {
+            refused: [
+              '## 未关联项目，已拒绝创建',
+              '',
+              `\`${name}\` 必须带 \`program_id\`（关联项目）；只带 \`project_id\`（仓库）建出来的工作项`,
+              '会飘在企业里、不进任何项目看板（2026-10-27 实测踩过）。',
+              '',
+              repo > 0
+                ? `没能从仓库 ${repo} 的既有工作项反查出所属项目：请先确认这个仓库属于哪个项目（工作台 → 仓库），再显式传 program_id。`
+                : '请先确认这个仓库属于哪个项目（工作台 → 仓库），再显式传 program_id 与 project_id。',
+            ].join('\n'),
+          }
+        }
+        next = { ...next, program_id: resolved }
+        notes.push(`已按仓库 ${repo} 自动关联项目 program_id=${resolved}`)
+      }
+    }
+    return { args: next, notes }
+  }
+
   /** 写工具目录（第一级暴露）。 */
   async function catalog(): Promise<string> {
+    // 这里**不用** toolsNow()：目录是"第一眼"，后端不可用时必须把错误抛给 describeFailure
+    // （`toolsNow` 为了归一化会把失败吞成空表，那样就成了"0 个工具"的假目录）。
     const tools = await deps.client.list()
+    listedTools = tools
+    listedAt = Date.now()
     const writes = runtimeWrites()
     const head = [
       `# Gitee 企业工具目录（共 ${tools.length} 个${writes.size === 0 ? '' : '；✎ = 写操作'}）`,
@@ -197,15 +329,22 @@ export function giteeEntGatewayTool(deps: GiteeEntGatewayDeps): ToolDefinition {
         '- 需要写，请让部署者把插件配置的 `allowWrites` 改成 `true`（或从「设置 → Gitee 企业项目」确认部署口径后重载配置）。',
       ].join('\n')
     }
+    const normalized = await normalizeCall(name, args)
+    if ('refused' in normalized) return normalized.refused
+    const preamble = normalized.notes.length === 0
+      ? ''
+      : `${normalized.notes.map((note) => `> ${note}`).join('\n')}\n\n`
     let result: McpCallResult
     try {
-      result = await deps.client.call(name, args)
+      result = await deps.client.call(name, normalized.args)
     } catch (error) {
-      return describeFailure(error)
+      return `${preamble}${describeFailure(error)}`
     }
     const clipped = truncate(result.text, maxResultBytes)
     const suffix = clipped.truncated ? '\n…（结果过长已截断；可缩小范围或改用带分页的读工具）' : ''
-    return result.isError ? `## 工具 \`${name}\` 报错\n\n${clipped.text}${suffix}` : `${clipped.text}${suffix}`
+    return result.isError
+      ? `## 工具 \`${name}\` 报错\n\n${preamble}${clipped.text}${suffix}`
+      : `${preamble}${clipped.text}${suffix}`
   }
 
   return defineTool({

@@ -1,0 +1,246 @@
+/**
+ * 「新建任务 / 需求 / 缺陷」弹窗的样式（对齐 Gitee 网页版「新建任务」弹窗）。
+ *
+ * 只准用 `--gq-*` 令牌（见 tokens.ts），不写裸色值；尺寸按 ui-style 的
+ * 33px 控件高、6px 圆角、两列栅格（Gitee 网页版就是两列）。
+ */
+
+.gqIssueOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 940;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 40px 20px;
+  overflow: auto;
+  background: var(--gq-overlay);
+}
+
+.gqIssueModal {
+  width: 720px;
+  max-width: 96vw;
+  /* 竖直居中：空间够就居中，内容比视口高时自动退回顶部并允许滚动（flex 的 auto margin 语义） */
+  margin: auto 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--gq-surface);
+  border-radius: 8px;
+  box-shadow: var(--gq-shadow-3);
+  color: var(--gq-text);
+  outline: none;
+}
+
+.gqIssueHd {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 20px 12px;
+}
+
+.gqIssueTitle {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.gqIssueClose {
+  margin-left: auto;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--gq-text-3);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.gqIssueClose:hover {
+  background: var(--gq-surface-2);
+  color: var(--gq-text-2);
+}
+
+.gqIssueBd {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px 20px;
+  padding: 4px 20px 20px;
+}
+
+.gqIssueFull {
+  grid-column: 1 / -1;
+}
+
+.gqIssueField {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.gqIssueLabel {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--gq-text);
+}
+
+.gqIssueReq {
+  margin-left: 3px;
+  color: #f5483b;
+}
+
+.gqIssueInput,
+.gqIssueSelect {
+  height: 33px;
+  padding: 0 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--gq-text);
+  background: var(--gq-surface);
+  border: 1px solid var(--gq-border-2);
+  border-radius: 4px;
+  outline: none;
+}
+
+.gqIssueInput::placeholder {
+  color: var(--gq-text-3);
+}
+
+.gqIssueInput:focus,
+.gqIssueSelect:focus {
+  border-color: var(--gq-brand);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--gq-brand) 16%, transparent);
+}
+
+.gqIssueReadonly {
+  display: flex;
+  align-items: center;
+  height: 33px;
+  padding: 0 10px;
+  font-size: 13px;
+  color: var(--gq-text-2);
+  background: var(--gq-surface-2);
+  border: 1px solid var(--gq-border);
+  border-radius: 4px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 计划时间：开始 → 结束（两个日期同一行，窄列时自动换行） */
+.gqIssueRange {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.gqIssueDate {
+  flex: 1 1 128px;
+  min-width: 118px;
+}
+
+.gqIssueRangeSep {
+  color: var(--gq-text-3);
+  font-size: 12px;
+}
+
+/* 描述输入区（纯文本框，不带工具条 —— 用户 m03569 明确否掉了工具条） */
+.gqIssueArea {
+  min-height: 132px;
+  padding: 9px 11px;
+  font-size: 13px;
+  line-height: 1.7;
+  font-family: inherit;
+  color: var(--gq-text);
+  background: var(--gq-surface);
+  border: 1px solid var(--gq-border-2);
+  border-radius: 4px;
+  outline: none;
+  resize: vertical;
+}
+
+.gqIssueArea::placeholder {
+  color: var(--gq-text-3);
+}
+
+.gqIssueArea:focus {
+  border-color: var(--gq-brand);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--gq-brand) 16%, transparent);
+}
+
+.gqIssueErr {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--gq-danger);
+}
+
+.gqIssueHint {
+  grid-column: 1 / -1;
+  padding: 9px 11px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--gq-info);
+  border: 1px solid color-mix(in srgb, var(--gq-info) 26%, transparent);
+  background: color-mix(in srgb, var(--gq-info) 7%, transparent);
+}
+
+.gqIssueHintErr {
+  color: var(--gq-danger);
+  border-color: color-mix(in srgb, var(--gq-danger) 26%, transparent);
+  background: color-mix(in srgb, var(--gq-danger) 7%, transparent);
+}
+
+.gqIssueFt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--gq-border);
+}
+
+.gqIssueFtTip {
+  margin-right: auto;
+  font-size: 12px;
+  color: var(--gq-text-3);
+}
+
+.gqIssueBtn {
+  height: 32px;
+  padding: 0 16px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--gq-text);
+  background: var(--gq-surface);
+  border: 1px solid var(--gq-border-2);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.gqIssueBtn:hover:not(:disabled) {
+  border-color: var(--gq-brand);
+  color: var(--gq-brand);
+}
+
+.gqIssueBtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.gqIssueBtnPrimary {
+  color: var(--gq-brand-fg);
+  background: var(--gq-brand);
+  border-color: var(--gq-brand);
+}
+
+.gqIssueBtnPrimary:hover:not(:disabled) {
+  color: var(--gq-brand-fg);
+  background: color-mix(in srgb, var(--gq-brand) 88%, #000);
+}

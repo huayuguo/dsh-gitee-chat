@@ -16,7 +16,7 @@
 import { createElement as h, useCallback, useEffect, useMemo, useState } from 'react'
 import css from './board.module.css'
 import { BoardApiError, fetchIssue, fetchMembers, fetchStates, postWrite } from './api.ts'
-import { Bar, Card, CardTitle, Empty, ErrorState, Field, Markdown, Note, Pill, Segmented, day, levelColor, stamp, stateColor } from './ui.tsx'
+import { Bar, Card, CardTitle, Empty, ErrorState, Field, Markdown, Note, Pill, Segmented, StatePill, day, levelColor, stamp, stateColor } from './ui.tsx'
 import type { IssueDetailPayload, IssueStateRow, ProgramMemberRow } from '../types.ts'
 
 /** 状态 → 中文名。 */
@@ -183,9 +183,8 @@ export function IssueDetail(props: IssueDetailProps) {
           // 依赖写法有两种（编号 / WBS 编码），口径必须写在界面上，
           // 否则「没反查到」会被误读成「这个依赖不存在」。
           h(Note, null,
-            '口径：引用既可能是 Gitee 工作项编号，也可能是描述里写的 WBS 编码'
-            + '（如 `ME-02` 对应标题里的 `【DEMO900-ME-02】`）。'
-            + '两种都会尝试反查；「没反查到」只说明对不上任何工作项，不代表这个前置条件不存在。'),
+            '引用可以是工作项编号，也可以是描述里的 WBS 编码（如 `ME-02`）；'
+            + '「没反查到」只说明对不上任何工作项，不代表这个前置条件不存在。'),
         ),
     data.blockers.length > 0
       ? h(Note, null, h('span', { className: css.gqVErr },
@@ -217,7 +216,8 @@ export function IssueDetail(props: IssueDetailProps) {
         // 状态
         h('div', { style: { marginBottom: 10 } },
           h('div', { className: css.gqVFieldLabel, style: { marginBottom: 4 } },
-            `状态：${STATE_TEXT[detail.state] ?? detail.stateTitle ?? detail.state}`),
+            '状态 ',
+            h(StatePill, { state: detail.state, label: STATE_TEXT[detail.state] ?? detail.stateTitle ?? detail.state })),
           stateOptions.length === 0
             ? h(Note, null, h('span', { className: css.gqVWarn },
                 `读不到这个工作项类型（id ${detail.typeId}）的可选状态，因此不提供改状态按钮——`
@@ -233,7 +233,7 @@ export function IssueDetail(props: IssueDetailProps) {
                 },
               }),
           stateOptions.length > 0 && stateKey === ''
-            ? h(Note, null, `当前状态 id ${detail.stateId} 不在该类型的可选状态里（可能状态刚被企业改过），按最新列表选择即可。`)
+            ? h(Note, null, '当前状态已不在可选列表里，按最新列表选一个即可。')
             : null,
         ),
 
@@ -342,7 +342,7 @@ export function IssueDetail(props: IssueDetailProps) {
           detail.priorityHuman === '' ? null : h(Pill, {
             tone: detail.priority >= 3 ? 'err' : undefined,
           }, detail.priorityHuman),
-          h(Pill, null, STATE_TEXT[detail.state] ?? detail.stateTitle ?? detail.state),
+          h(StatePill, { state: detail.state, label: STATE_TEXT[detail.state] ?? detail.stateTitle ?? detail.state }),
           props.onClose === undefined ? null : h('button', { type: 'button', className: css.gqVSegBtn, onClick: props.onClose }, '关闭'),
         ),
       }),
@@ -368,7 +368,7 @@ export function IssueDetail(props: IssueDetailProps) {
       detail.labels.length > 0
         ? h('div', { style: { marginTop: 8, display: 'flex', gap: 4, flexWrap: 'wrap' } },
             detail.labels.map((l) => h(Pill, { key: l.name }, l.name)))
-        : h(Note, null, '没有任何标签（本团队规范要求「职能域 × 优先级 × 阶段」三个）。'),
+        : h(Note, null, '没有任何标签。'),
       detail.parentIdent !== ''
         ? h(Note, null, `父工作项：${detail.parentIdent} ${detail.parentTitle}`)
         : null,

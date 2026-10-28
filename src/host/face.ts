@@ -46,5 +46,18 @@ export interface GiteeChatFace {
      * 会拿 Gitee 的档位表去审别家的工具（2026-09-17 实测误伤，见 `./agent`）。
      */
     readonly mcpToolPrefix: string
+    /**
+     * 看板快照缓存的口径（agent 半用它决定「快照工具能不能读、读到的东西旧不旧」）。
+     *
+     * 三者与设置页表单一一对应：`cache.agentReadable` / `cache.persist` / `cache.ttlSeconds`。
+     */
+    readonly cache: {
+      /** 会话里的 AI 是否能读快照（false = 只给界面用）。 */
+      readonly agentReadable: boolean
+      /** 是否落盘（false = 只有进程内缓存）。 */
+      readonly persist: boolean
+      /** 新鲜期秒数（0 = 不做缓存）。 */
+      readonly ttlSeconds: number
+    }
   }
 }

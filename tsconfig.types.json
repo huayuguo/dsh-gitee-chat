@@ -1,5 +1,5 @@
 {
-  // 只用于生成对外类型声明：tsc --emitDeclarationOnly，产物落在 types/。
+  // 只用于生成对外类型声明：tsc --emitDeclarationOnly，产物落在 lib/types/（随 lib 发布）。
   // 由 scripts/check-types.mjs 调用（types:gen 生成 / types:check 生成后校验 git 干净）。
   "compilerOptions": {
     "target": "ES2022",
@@ -11,7 +11,7 @@
     "emitDeclarationOnly": true,
     "allowImportingTsExtensions": true,
     "rewriteRelativeImportExtensions": true,
-    "outDir": "types",
+    "outDir": "lib/types",
     "rootDir": "src",
     "skipLibCheck": true,
     "strict": false,

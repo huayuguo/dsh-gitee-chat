@@ -2,22 +2,24 @@
   "name": "mcp-gitee-ent",
   "purpose": "Gitee 企业版 MCP 后端（随插件分发，用户无需 Go 环境）",
   "fork": "dsh-mcp-gitee-ent",
-  "upstreamBase": "0.2.1",
-  "forkCommit": "6da2b2f5296173cd2f886dbb2f4c488d519edc6b",
-  "sourceFingerprint": "4cf025ba984549ea2acdec870dd9ddcab2d6ab091c3364f7c4dc6e54f8c6366c",
-  "sourceFileCount": 84,
-  "forkDirty": true,
-  "goVersion": "go version go1.26.0 linux/amd64",
+  "upstreamBase": "0.2.5",
+  "forkCommit": "e6b5eaea2be0ed5114110886f7b2e4edd3b587e8",
+  "sourceFingerprint": "2458ea4a0462e54a08f8eee2a14e48eb9d7ba1d8c0f72ed779997368e4c33357",
+  "sourceFileCount": 91,
+  "forkDirty": false,
+  "goVersion": "go version go1.26.8 linux/amd64",
   "buildFlags": "CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\"",
-  "generatedAt": "2026-09-15T05:41:24.829Z",
-  "binaryVersion": "0.2.1-dsh.4",
-  "reportedVersion": "0.2.1-dsh.4",
-  "toolCount": 48,
+  "generatedAt": "2026-10-27T00:38:11.903Z",
+  "binaryVersion": "0.2.5-dsh.7",
+  "reportedVersion": "0.2.5-dsh.7",
+  "toolCount": 55,
   "tools": [
     "attach_doc_file",
     "comment_enterprise_issue",
     "comment_enterprise_pull",
     "create_doc_node",
+    "create_enterprise_document",
+    "create_enterprise_document_node",
     "create_enterprise_issue",
     "create_enterprise_repo_pull",
     "create_enterprise_repo_release",
@@ -30,6 +32,7 @@
     "download_enterprise_document",
     "get_enterprise_document_page",
     "get_enterprise_issue_detail",
+    "get_enterprise_pull_auth",
     "get_enterprise_pull_detail",
     "get_enterprise_pull_diff",
     "get_enterprise_repo_tree",
@@ -44,6 +47,7 @@
     "list_enterprise_labels",
     "list_enterprise_members",
     "list_enterprise_pull_comments",
+    "list_enterprise_pull_files",
     "list_enterprise_pulls",
     "list_enterprise_repo_releases",
     "list_enterprise_repositories",
@@ -57,7 +61,10 @@
     "merge_enterprise_pull",
     "move_doc_node",
     "recycle_doc_node",
+    "rename_enterprise_document_folder",
+    "review_enterprise_pull",
     "set_doc_node_auth",
+    "test_enterprise_pull",
     "update_enterprise_document_page",
     "update_enterprise_issue",
     "update_enterprise_pull",
@@ -74,7 +81,11 @@
     "recycle_doc_node",
     "delete_doc_node",
     "attach_doc_file",
-    "download_attach_file"
+    "download_attach_file",
+    "review_enterprise_pull",
+    "test_enterprise_pull",
+    "get_enterprise_pull_auth",
+    "list_enterprise_pull_files"
   ],
   "mergedUpstreamTools": [
     "list_enterprise_documents",
@@ -82,22 +93,25 @@
     "update_enterprise_document_page",
     "list_enterprise_document_pages",
     "upload_enterprise_document_files",
-    "download_enterprise_document"
+    "download_enterprise_document",
+    "create_enterprise_document",
+    "create_enterprise_document_node",
+    "rename_enterprise_document_folder"
   ],
   "platforms": {
     "linux-x64": {
       "file": "mcp-gitee-ent-linux-amd64",
       "os": "linux",
       "arch": "amd64",
-      "size": 8294562,
-      "sha256": "78b5402ef75eb1d85283ea5e88e22dd161170c812ffacf3362b2646ca8d93253"
+      "size": 8446114,
+      "sha256": "7251df9ca2228152be3677a58a08362cb4adcdee528509d4e5b6feeca735c82b"
     },
     "win32-x64": {
       "file": "mcp-gitee-ent-windows-amd64.exe",
       "os": "windows",
       "arch": "amd64",
-      "size": 8510464,
-      "sha256": "5c8e0782965ae00c14a82e6c8d11691b1603652121ca0f0537b324ef34b62c28"
+      "size": 8662016,
+      "sha256": "d0a1959d70d0f2cb5a494ed2e4e7c7eb06334d12b1576fb11d63d2ee24a4ed21"
     }
   }
 }

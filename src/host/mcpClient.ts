@@ -4,7 +4,7 @@
  * 为什么不用 `@deepseek-ai/dsh-mcp-client`：它把 MCP 工具注册进**调用方的作用域**，
  * 而公开 gateway 要的是**进程级一个入口**；而且我们要的是
  * 「先目录（list）→ 再参数表（schema）→ 再执行（call）」的两级暴露，
- * 这与「把 48 个工具 schema 每轮塞进上下文」正好相反。
+ * 这与「把 51 个工具 schema 每轮塞进上下文」正好相反（DESIGN.md §37）。
  *
  * 协议：MCP `2024-11-05`，stdio，一行一个 JSON-RPC 2.0 帧。
  * 只实现 gateway 需要的三帧：`initialize` / `tools/list` / `tools/call`。
@@ -58,7 +58,7 @@ export interface McpClient {
   dispose(): void
 }
 
-/** 协议版本：与 `~/.local/bin/mcp-gitee-ent` 实测握手通过的版本。 */
+/** 协议版本：与 `~/.local/bin/mcp-gitee-ent`（0.5.0 时在 `$DSH_HOME/.gitee-chat/bin/`）实测握手通过的版本。 */
 const PROTOCOL_VERSION = '2024-11-05'
 const DEFAULT_TIMEOUT_MS = 60_000
 /** stdio 尾部诊断信息最多留这么多字符（进日志用，不进上下文）。 */

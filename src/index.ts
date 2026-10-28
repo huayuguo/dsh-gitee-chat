@@ -13,16 +13,18 @@
  * （人格上下文、门禁、其他工具都不行）。host 半挂在 profile 里，注册即对
  * **所有 preset** 生效——早先版本把工具与人格注入写在这里，导致 PTC 等无关
  * preset 的新会话也被注入 Gitee 人格、也能看到 Gitee 工具。那些东西属于
- * agent 平面，见 `./agent`；第 5 条是**故意的例外**。
+ * agent 平面，见 `./agent`；第 5 条是**故意的例外**，理由与代价见 DESIGN.md §37。
  *
  * @module dsh-gitee-chat
  */
 
-import { readFileSync } from 'node:fs'
+import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import z from 'schemastery'
 import { createGqRunner, defaultScriptPath, packageRoot } from './host/gq.ts'
+import { createSnapshotStore } from './host/snapshotStore.ts'
+import { createLocalSettings, type ResolvedSettings } from './host/localSettings.ts'
 import { dshHome, ensureMaterialized, inspectMcpBinary, readManifest } from './host/mcpBinary.ts'
 import { createRoleResolver } from './host/role.ts'
 import { createEnterpriseIdResolver } from './host/enterpriseId.ts'
@@ -33,7 +35,11 @@ import { createDocService, defaultDocsRoot } from './host/docService.ts'
 import { TEXT_PREVIEW_EXT, extOf, readTextFile } from './host/docCache.ts'
 import { createWikiCache, toWorkspacePath } from './host/wikiCache.ts'
 import { resolveToken } from './host/token.ts'
+import { trustedHostsOf } from './host/trustedHosts.ts'
 import { createRepoService } from './host/repoService.ts'
+import { createPrService } from './host/prService.ts'
+import { createPrSubagentRunner } from './host/prSubagent.ts'
+import { createPrTemplates } from './host/prTemplates.ts'
 import { createMcpClient } from './host/mcpClient.ts'
 import { giteeEntGatewayTool } from './host/gateway.ts'
 import { DEFAULT_MCP_TOOL_PREFIX, PUBLIC_GATEWAY_TOOL_NAME } from './mcpNaming.ts'
@@ -42,7 +48,7 @@ import type { GiteeChatFace } from './host/face.ts'
 /** 插件身份。 */
 export const name = 'dsh-gitee-chat'
 
-/** host 半只需要 HTTP 路由载体；`webRuntime` 用可选获取（读可信 authority 列表）。 */
+/** host 半只需要 HTTP 路由载体；可信 authority 列表用可选获取（`webStartup`，见 host/trustedHosts.ts）。 */
 export const inject = ['webServer']
 
 /** 包版本（被 /ping 回显）。
@@ -85,7 +91,7 @@ export { DEFAULT_MCP_TOOL_PREFIX }
 /**
  * 我们用到的那几个 `agentPresets` 服务方法（**只声明用到的**，避免跟着上游全量签名走）。
  *
- * ⚠️ 版本坑（2026-09-28 实测）：0.1.6 及以前读一个 preset 的组合文本是
+ * ⚠️ 版本坑（2026-09-28 实测，DESIGN.md §30）：0.1.6 及以前读一个 preset 的组合文本是
  * `read(id) → string`；**0.1.7 起这个方法没了**，改成：
  *   - `readDocument(id) → { content }` —— 声明文本（entry-list YAML）
  *   - `compositionInventory() → AgentPresetComposition[]` —— 结构化插件行（带求值后的 enabled）
@@ -139,7 +145,7 @@ export interface Config {
   /** 组合里代表本插件的行名（默认 `dsh-gitee-chat/agent`）。 */
   agentRowName?: string
   /**
-   * 知识库文档。
+   * 知识库文档（见 `DOCS.md`）。
    *
    * 这里**没有任何端点配置** —— 文档能力的唯一实现是 MCP，
    * 插件只配置"缓存在哪、工具叫什么名字"。
@@ -166,6 +172,35 @@ export interface Config {
     weeklyCapacity?: number
     trendWeeks?: number
     milestoneRiskDays?: number
+  }
+  /**
+   * 看板快照缓存（用户口径 m02223）。
+   *
+   * 三层：进程内 → 落盘 → 现拉。命中即省一次「4 页工作项 + 成员 + PR」往返；
+   * **所有命中都会带上 `fetchedAt / ageSeconds / stale`**，让界面和 AI 都知道
+   * 自己看到的是不是旧数据（提醒义务，见 `SKILL.md` 的「数据时效」）。
+   */
+  cache?: {
+    /** 会话里的 AI 是否可读快照（默认 true；关掉 = 只给界面用）。 */
+    agentReadable?: boolean
+    /** 是否落盘（默认 true；关掉 = 只有进程内缓存，重启即冷启）。 */
+    persist?: boolean
+    /** 新鲜期秒数（默认 60，最小 10；小于 10 按 10 算，0 视为关闭缓存）。 */
+    ttlSeconds?: number
+  }
+  /**
+   * 后台定期刷新（默认**关**）。
+   *
+   * 开着时每 `intervalSeconds` 秒把看板快照拉一遍，让人打开面板就是热的；
+   * 代价是持续的 Gitee 限流额度，所以默认关、默认 60 s、最小 10 s，
+   * 且 `idleMinutes` 内没人用过面板就**不刷**（没人看时别翻页）。
+   */
+  autoRefresh?: {
+    enabled?: boolean
+    /** 刷新间隔秒数（默认 60，最小 10）。 */
+    intervalSeconds?: number
+    /** 多久没人用面板就暂停刷新（默认 30 分钟）。 */
+    idleMinutes?: number
   }
 }
 
@@ -197,6 +232,49 @@ export const Config: z<Config> = z.object({
     weeklyCapacity: z.number(),
     trendWeeks: z.number(),
     milestoneRiskDays: z.number(),
+  }),
+  // ── 设置页表单（设置 → 插件 → Gitee 项目）────────────────────────────────
+  //
+  // 只有标了 `.volatile()` 的字段会被 `@deepseek-ai/dsh-settings` 投影成表单：
+  // 它按 entry 的 Config schema 走 `volatileForm()`，没有 volatile 的字段一律不渲染
+  // （0.5.4 之前这两组字段都没标，所以设置页是空的 —— 用户 2026-10-27 报的就是这个）。
+  //
+  // volatile 的含义还包括「改完不重挂插件」：所以下面 apply() 里对这些值的读取
+  // **必须每次现取**（`live()` 辅助函数 + `setInterval(1000)` 的节拍检查），
+  // 不能在装配期拍成快照，否则表单改了也不生效。
+  cache: z.object({
+    agentReadable: z.boolean()
+      .default(true)
+      .description('会话里的 AI 可以读看板快照（关掉 = 只能现拉，更慢但绝不读到旧数据）')
+      .extra('volatile', true),
+    persist: z.boolean()
+      .default(true)
+      .description('把快照落盘，重启后首屏不用再冷启一次')
+      .extra('volatile', true),
+    ttlSeconds: z.number()
+      .default(60)
+      .min(0)
+      .max(3600)
+      .description('新鲜期（秒）：60 内直接命中；改 0 关闭缓存；最小 10 秒')
+      .extra('volatile', true),
+  }),
+  autoRefresh: z.object({
+    enabled: z.boolean()
+      .default(false)
+      .description('后台定期刷新看板（只在最近有人看面板时才真去拉）')
+      .extra('volatile', true),
+    intervalSeconds: z.number()
+      .default(60)
+      .min(10)
+      .max(3600)
+      .description('刷新间隔（秒，最小 10）：越小越新鲜，但要吃 Gitee 限流额度')
+      .extra('volatile', true),
+    idleMinutes: z.number()
+      .default(30)
+      .min(1)
+      .max(1440)
+      .description('闲置多少分钟后暂停后台刷新（分钟）')
+      .extra('volatile', true),
   }),
 })
 
@@ -234,11 +312,41 @@ function expandHome(value: string): string {
   return value
 }
 
+/**
+ * 读一个「可能是 volatile ref」的配置值。
+ *
+ * 为什么需要它：设置页的字段标了 `.volatile()` 之后，cordis 传给插件的不再是
+ * 普通值，而是带 `.get()` 的响应式引用（见 `@deepseek-ai/schemastery` 的
+ * `Schema.prototype.volatile`）。同一份代码还要能被 `resolveConfig()` 之类
+ * 直接调用 —— 那时拿到的就是普通值。两者用这一个函数统一。
+ * @param value - 配置里的原始值（普通值或 ref）。
+ * @param fallback - 缺失/取不到时的默认值。
+ */
+function liveRead<T>(value: unknown, fallback: T): T {
+  if (value === undefined || value === null) return fallback
+  const ref = value as { get?: () => unknown }
+  if (typeof ref.get === 'function') {
+    try {
+      const next = ref.get()
+      return next === undefined || next === null ? fallback : (next as T)
+    } catch {
+      return fallback
+    }
+  }
+  return value as T
+}
+
 /** 补齐默认值（直接调用绕过 Loader 时同样成立）。 */
 export function resolveConfig(config?: Config) {
+  // 新鲜期：默认 60 s、最小 10 s；显式 0 表示关闭缓存（每次现拉）。
+  const rawTtl = config?.cache?.ttlSeconds ?? 60
+  const ttlSeconds = rawTtl === 0 ? 0 : Math.max(10, Math.floor(rawTtl))
+  const refreshInterval = Math.max(10, Math.floor(config?.autoRefresh?.intervalSeconds ?? 60))
+  const idleMinutes = Math.max(1, Math.floor(config?.autoRefresh?.idleMinutes ?? 30))
   return {
     apiBase: nonBlank(config?.apiBase) ?? 'https://api.gitee.com/enterprises',
-    cacheTtlSeconds: config?.cacheTtlSeconds ?? 0,
+    // 0.5.5+：老键继续认（显式给了就以它为准），否则用 cache.ttlSeconds。
+    cacheTtlSeconds: config?.cacheTtlSeconds ?? ttlSeconds,
     scriptTimeoutMs: config?.scriptTimeoutMs ?? 60_000,
     allowFixtureFallback: config?.allowFixtureFallback ?? false,
     scriptPath: nonBlank(config?.scriptPath) ?? defaultScriptPath(),
@@ -259,6 +367,16 @@ export function resolveConfig(config?: Config) {
       maxPageBytes: config?.docs?.maxPageBytes ?? 200_000,
     },
     thresholds: config?.thresholds ?? {},
+    cache: {
+      agentReadable: config?.cache?.agentReadable ?? true,
+      persist: config?.cache?.persist ?? true,
+      ttlSeconds,
+    },
+    autoRefresh: {
+      enabled: config?.autoRefresh?.enabled ?? false,
+      intervalSeconds: refreshInterval,
+      idleMinutes,
+    },
   }
 }
 
@@ -346,6 +464,42 @@ export function apply(ctx: any, config?: Config): void {
    */
   const enterprise = createEnterpriseIdResolver({ pinned: resolved.enterpriseId })
 
+  /**
+   * 缓存三件套的**实时**取值（设置页 volatile 字段）。
+   *
+   * 每次现取而不是装配期快照：用户在「设置 → 插件 → Gitee 项目」改完就生效，
+   * 不需要重启桌面（用户 2026-10-27 口径：可配置 + 秒级 + 要有提醒）。
+   */
+  /** 补丁里的静态配置（本地没覆盖时用它）。 */
+  const staticSettings = (): ResolvedSettings => {
+    const legacy = config?.cacheTtlSeconds
+    const rawTtl = typeof legacy === 'number' ? legacy : liveRead<number>(config?.cache?.ttlSeconds, 60)
+    const ttlSeconds = !Number.isFinite(rawTtl) || rawTtl <= 0 ? 0 : Math.max(10, Math.floor(rawTtl))
+    return {
+      cache: {
+        agentReadable: liveRead<boolean>(config?.cache?.agentReadable, true) !== false,
+        persist: liveRead<boolean>(config?.cache?.persist, true) !== false,
+        ttlSeconds,
+      },
+      autoRefresh: {
+        enabled: liveRead<boolean>(config?.autoRefresh?.enabled, false) === true,
+        intervalSeconds: Math.max(10, Math.floor(liveRead<number>(config?.autoRefresh?.intervalSeconds, 60))),
+        idleMinutes: Math.max(1, Math.floor(liveRead<number>(config?.autoRefresh?.idleMinutes, 30))),
+      },
+    }
+  }
+
+  /**
+   * 缓存开关的生效值：**本地覆盖（设置页那几个开关）优先**，否则用补丁里的静态配置。
+   *
+   * 每次现取：设置页点保存 → 写 `$DSH_HOME/.gitee-chat/config.json` → 下一次取数就按新值，
+   * 不用重启桌面（用户 2026-10-27 口径）。
+   */
+  const localSettings = createLocalSettings(join(dshHome(), '.gitee-chat'))
+  const liveSettings = (): ResolvedSettings => localSettings.resolve(staticSettings())
+  const liveCache = () => liveSettings().cache
+  const liveAutoRefresh = () => liveSettings().autoRefresh
+
   const runner = createGqRunner({
     scriptPath: resolved.scriptPath,
     timeoutMs: resolved.scriptTimeoutMs,
@@ -353,7 +507,35 @@ export function apply(ctx: any, config?: Config): void {
     allowFixtureFallback: resolved.allowFixtureFallback,
     enterpriseId: resolved.enterpriseId,
     env: childEnvOverrides(resolved),
+    // 新鲜期现取（`cache.ttlSeconds`：默认 60 s、最小 10 s，0 = 关闭缓存）
+    memoTtlMs: () => liveCache().ttlSeconds * 1000,
+    // 落盘快照：重启后首屏不必再冷启一次（`cache.persist` 关掉就只有进程内缓存）
+    persist: createSnapshotStore(join(dshHome(), '.gitee-chat', 'cache', 'board'), ctx.logger),
+    persistEnabled: () => liveCache().persist,
   })
+
+  // 后台定期刷新（默认关）。
+  //
+  // 用 1 秒的节拍器 + 「到点才拉」而不是 setInterval(intervalSeconds)：间隔是设置页
+  // 里的 volatile 字段，用户随时改；setInterval 的周期一旦建立就固定了。
+  // 闸门仍然保留：没人看面板（闲置超过 idleMinutes）就一次也不拉，
+  // 否则每 60 秒打 4 页 Gitee 纯烧限流额度。
+  {
+    let lastRunAt = 0
+    const ticker = setInterval(() => {
+      const { enabled, intervalSeconds, idleMinutes } = liveAutoRefresh()
+      if (!enabled) return
+      const now = Date.now()
+      if (now - lastRunAt < intervalSeconds * 1000) return
+      if (runner.idleMs() > idleMinutes * 60_000) return
+      lastRunAt = now
+      void runner.run({ scope: 'portfolio', refresh: true }).catch((error: unknown) => {
+        ctx.logger?.warn?.(`[${name}] 自动刷新失败：${String(error)}`)
+      })
+    }, 1000)
+    ticker.unref?.()
+    ctx.effect(() => () => clearInterval(ticker))
+  }
 
   if (!runner.scriptExists()) {
     ctx.logger?.warn?.(`[${name}] gq 脚本不存在：${runner.scriptPath}（取数会失败，可检查安装是否完整）`)
@@ -363,7 +545,8 @@ export function apply(ctx: any, config?: Config): void {
   //
   // 放在装配期做（而不是只在安装期做）是为了**自愈**：手工拷过来的包、
   // 被清过用户级 bin（Linux `~/.local/bin`、Windows `%USERPROFILE%\.local\bin`）的机器、
-  // 换了新版本的二进制，下一次启动就自动补上。
+  // 换了新版本的二进制，下一次启动就自动补上；0.5.0 的私有副本
+  // （`$DSH_HOME/.gitee-chat/bin/`）也在这一步被迁移清掉。
   // 幂等，且内容一致时直接复用不重复拷。
   //
   // 注意这里**不比对工具清单**：清单是构建期校验过的（scripts/build-mcp.mjs
@@ -385,11 +568,11 @@ export function apply(ctx: any, config?: Config): void {
   // ── 公开 gateway（本文件唯一的 agent 可见出口）───────────────────────────
   //
   // 背景：Gitee 企业 MCP 是工具类后端，不该只属于 Gitee 人格（用户 2026-10-10 口径）。
-  // 但全量 48 个工具 ≈ 46.6 KB ≈ 14.6K tokens/请求，而 DSH 的 `deferLoading` 只能
+  // 但全量 51 个工具 ≈ 52.4 KB ≈ 16.4K tokens/请求，而 DSH 的 `deferLoading` 只能
   // 「延迟发送定义」、不能「按需加载」，所以这里只常驻**一个**两级入口：
   //   op=list（目录 ~1.1K tokens，用到才进上下文）→ op=schema → op=call。
   // Gitee preset 里由 agent 半 `ctx.tools.restrict` 把它隐藏，改回原生工具。
-  // 完整取舍见 `host/gateway.ts` 顶部的设计说明。
+  // 完整取舍见 DESIGN.md §37。
   const gatewayEnv = (): NodeJS.ProcessEnv => {
     const env: NodeJS.ProcessEnv = { ...process.env, ...childEnvOverrides(resolved) }
     const token = resolveToken()
@@ -466,7 +649,7 @@ export function apply(ctx: any, config?: Config): void {
   // 早先按命名前缀判定（`preset.startsWith('gitee-')`）。那是**硬编码的命名约定**：
   // 同事把 preset 命名成「我的项目助手」就失效了。现在按**事实**判定——
   // 问 `agentPresets` 服务：这个 preset 的插件行里有没有本插件的 agent 行
-  // （结构化清单优先，声明文本退路；见 `presetMountsAgentRow` 与）。
+  // （结构化清单优先，声明文本退路；见 `presetMountsAgentRow` 与 DESIGN.md §30）。
   //
   // 判定结果带短 TTL 缓存：组合是可编辑的，改完不该等到重启才生效，
   // 但也不该每渲染一次标签页就读一次盘。
@@ -549,12 +732,12 @@ export function apply(ctx: any, config?: Config): void {
 
   // ── 知识库文档（host 平面：只编排，不实现端点）──────────────────────────
   //
-  // 纪律：**MCP 是文档能力的唯一实现**。这个委派层只做一件事——
+  // 纪律见 DOCS.md §7：**MCP 是文档能力的唯一实现**。这个委派层只做一件事——
   // 按 sessionId 解析出 agent 作用域，然后调 `mcp__gitee_ent__*`。
   //
   // 为什么要 agent 作用域：MCP 行挂在 preset 里，工具**不在全局视角**可见；
   // 不带 agent 调 `tools.execute` 会得到 UNKNOWN_TOOL。这与「客户端拿不到会话的
-  // preset」是同一类事实，同样由 host 按 sessionId 解析。
+  // preset」是同一类事实（DESIGN.md §12），同样由 host 按 sessionId 解析。
   const agentOf = (sessionId: string): unknown | undefined => {
     try {
       const agents = ctx.get('agents') as { get?: (id: string) => unknown } | undefined
@@ -591,7 +774,7 @@ export function apply(ctx: any, config?: Config): void {
   /**
    * WIKI 缓存（git 形态）。**这是唯一不走 MCP 的取数口** ——
    * Gitee 没有任何 HTTP 接口能列仓库 WIKI（实测企业 API 全 404、开放 API 405），
-   * 详见 `host/wikiCache.ts`。
+   * 详见 `host/wikiCache.ts` 与 `DOCS.md` §14.1。
    */
   const wikiCache = createWikiCache({
     cacheRoot: resolved.docs.root,
@@ -601,17 +784,55 @@ export function apply(ctx: any, config?: Config): void {
     token: () => resolveToken(),
     log: (message) => ctx.logger?.info?.(message),
   })
+  /**
+   * 直连 MCP 的环境：与公开 gateway 同一套规则（token 解析顺序、生效企业）。
+   *
+   * 为什么要这份：PR / 文档面板的数据**不该**依赖「当前会话挂了 Gitee preset」——
+   * 用户 2026-10-26 明确「任何模式都可以，而不是必须 agent 预设选 gitee 项目会话模式」。
+   */
+  const hostMcpEnv = (): NodeJS.ProcessEnv => {
+    const env: NodeJS.ProcessEnv = { ...process.env, ...childEnvOverrides(resolved) }
+    const token = resolveToken()
+    if (token !== '') env.GITEE_ENT_MCP_ACCESS_TOKEN = token
+    const id = enterprise.now().id
+    if (id > 0) env.GITEE_ENT_ID = String(id)
+    return env
+  }
+  /**
+   * 进程级 MCP 客户端（host 自己用）：懒启动、可重启，退出时释放。
+   *
+   * 它与 `ctx.inject(['tools'])` 里那个 gateway 客户端**各用一个子进程**：
+   * 一个是给模型的两级入口（受 `allowWrites` 与档位约束），
+   * 一个是给面板取数（只读数据 + 由路由自己判写），混用会让权限语义糊掉。
+   */
+  //
+  // 冒烟/单测用一个假 ctx 跑 apply（没有真 MCP 进程可用）：那时直连通道会把每个文档请求
+  // 都变成一次真子进程调用（还会去连网），测试既慢又不稳。因此留一个显式开关
+  // `GITEE_CHAT_NO_DIRECT=1` 关掉它 —— 只给测试用，正常运行不设。
+  const directEnabled = process.env.GITEE_CHAT_NO_DIRECT !== '1'
+  const dataClient = directEnabled
+    ? createMcpClient({
+      command: mcp.command ?? '',
+      env: hostMcpEnv(),
+      timeoutMs: resolved.scriptTimeoutMs,
+      clientVersion: VERSION,
+      logger: ctx.logger,
+    })
+    : undefined
+  if (dataClient !== undefined) ctx.on?.('dispose', () => dataClient.dispose())
+
   const mcpDocs = createMcpDocs({
     agentOf,
     tools: toolsService,
     toolPrefix: resolved.docs.mcpToolPrefix,
     enterprise,
+    ...(dataClient === undefined ? {} : { direct: dataClient }),
     timeoutMs: resolved.scriptTimeoutMs,
   })
   /**
    * 附件内容读取：**委派 MCP 的 `download_attach_file`**（本 fork 独有）。
    *
-   * 插件**不自己取** `/{eid}/attach_files/{file_id}` —— 那是 MCP 的事。
+   * 插件**不自己取** `/{eid}/attach_files/{file_id}` —— 那是 MCP 的事（DOCS.md §7）。
    * 插件只做三件本地事：算缓存目录、把 `workspace` 指到缓存根（沙箱上限）、
    * 把落盘的文件读回文本。
    *
@@ -664,6 +885,28 @@ export function apply(ctx: any, config?: Config): void {
     wiki: wikiCache,
     cwdOf,
   })
+
+  // 合并请求（0.5.4）：模板走文件（随包内置 + 用户副本 + 仓库绑定），PR 数据走 MCP。
+  const prService = createPrService({
+    docs: mcpDocs,
+    templates: createPrTemplates(),
+    // 分支比对（AI 起草 PR 内容）默认走取数脚本：MCP 没有 compare 工具。
+    runner,
+    // 会话工作目录：起草时先看本地有没有这个仓库的克隆，有就走本地 git（毫秒级）。
+    cwdOf,
+  })
+  /**
+   * AI 审核的执行体：在所选主会话下起子智能体（用户 2026-10-26 口径）。
+   *
+   * 服务是懒取的：`ctx.get('subagents')` 在装配期可能还没注册完，
+   * 且老宿主根本没有这两个服务（那时 start() 会报 no-subagents）。
+   */
+  const prSubagent = createPrSubagentRunner({
+    subagents: () => ctx.get('subagents') as never,
+    agents: () => ctx.get('agents') as never,
+    logger: ctx.logger as never,
+  })
+  ctx.effect(() => () => prSubagent.dispose())
   ctx.logger?.info?.(
     `[${name}] 文档委派就绪 · 工具前缀 ${resolved.docs.mcpToolPrefix} · 缓存 ${resolved.docs.root}`
     + ` · 附件内容读取 ${attachmentReader === undefined ? '未启用（随包清单没有 download_attach_file）' : '已启用'}`,
@@ -675,25 +918,326 @@ export function apply(ctx: any, config?: Config): void {
     ctx.logger?.warn?.(`[${name}] 写通道已关闭（allowWrites=false）：界面上的改状态/评论/改派按钮会明确报错。`)
   }
 
+  /**
+   * 可选投递目标的会话清单（供 PR 面板「AI 审核投递到哪个会话」）。
+   *
+   * ⚠️ `ctx.sessions.list()` 的语义是「**活着的**会话」（SessionStore.list = all live
+   * sessions），桌面端同时只活一个会话，所以只读它永远只能拿到 1 条 —— 用户问
+   * 「是不是 DSH 不让读工作区和会话名」就是撞上这个坑。
+   *
+   * 真正的全量清单在 `$DSH_HOME/storages/session_projcache/sessions/<id>.json`
+   * （桌面端会话列表用的同一份投影缓存：identity.cwd、rows.title.val、
+   * rows.sessionListMetadata.val.{blank,lastPromptAt}；子智能体会话的
+   * rows.subagent.val.identity 非空，要排除）。只读每个文件头部，不整读。
+   *
+   * 排序：最近使用过的排前面；从没用过的空会话（meta.blank）不进列表。
+   */
+  const listSessions = (): Array<{
+    id: string
+    title: string
+    cwd: string
+    preset: string | null
+    workspaceId: string | null
+    workspaceTitle: string
+  }> => {
+    try {
+      interface Row {
+        id: string
+        title: string
+        cwd: string
+        lastAt: number
+        live: boolean
+      }
+      const rows = new Map<string, Row>()
+
+      // ① 历史会话：逐个读会话投影缓存（桌面端会话列表的同一份数据）
+      try {
+        const cacheDir = join(dshHome(), 'storages', 'session_projcache', 'sessions')
+        const head = 512 * 1024 // 每份缓存最多读 512 KiB，标题总在里面
+        const entries = readdirSync(cacheDir)
+          .filter((name) => name.endsWith('.json'))
+          .map((name) => {
+            const file = join(cacheDir, name)
+            let at = 0
+            try {
+              at = statSync(file).mtimeMs
+            } catch {
+              at = 0
+            }
+            return { file, name, at }
+          })
+          .sort((a, b) => b.at - a.at)
+          .slice(0, 400)
+        for (const entry of entries) {
+          let text = ''
+          try {
+            const fd = openSync(entry.file, 'r')
+            try {
+              const buffer = Buffer.alloc(head)
+              const read = readSync(fd, buffer, 0, head, 0)
+              text = buffer.subarray(0, read).toString('utf8')
+            } finally {
+              closeSync(fd)
+            }
+          } catch {
+            continue
+          }
+          // 子智能体（subagent）不是投递目标，排除
+          if (/"subagent":\s*\{[\s\S]{0,200}?"val":\s*\{\s*"identity"/.test(text)) continue
+          if (/"blank":\s*true/.test(text)) continue
+          const id = entry.name.replace(/\.json$/, '')
+          const cwd = /"cwd":\s*"((?:[^"\\]|\\.)*)"/.exec(text)?.[1] ?? ''
+          const titleRaw = /"title":\s*\{\s*"ver":\s*\d+,\s*"seq":\s*\d+,\s*"val":\s*("(?:[^"\\]|\\.)*"|null)/.exec(text)?.[1]
+          let title = ''
+          if (titleRaw !== undefined && titleRaw !== 'null') {
+            try {
+              title = JSON.parse(titleRaw) as string
+            } catch {
+              title = titleRaw.slice(1, -1)
+            }
+          }
+          rows.set(id, {
+            id,
+            title,
+            cwd: cwd.replace(/\\"/g, '"').replace(/\/\\/g, '\\'),
+            lastAt: entry.at,
+            live: false,
+          })
+        }
+      } catch {
+        // 读不到缓存目录（老版本 / 权限）就只靠活会话
+      }
+
+      // ② 活会话覆盖（内存里的标题/预设最新）
+      try {
+        const service = ctx.get('sessions') as { list?: () => unknown[] } | undefined
+        for (const raw of service?.list?.() ?? []) {
+          const session = raw as { id?: string; header?: { title?: string; cwd?: string } }
+          const id = typeof session.id === 'string' ? session.id : ''
+          if (id === '') continue
+          const known = rows.get(id)
+          rows.set(id, {
+            id,
+            title: typeof session.header?.title === 'string' && session.header.title !== ''
+              ? session.header.title
+              : (known?.title ?? ''),
+            cwd: typeof session.header?.cwd === 'string' && session.header.cwd !== ''
+              ? session.header.cwd
+              : (known?.cwd ?? ''),
+            lastAt: Math.max(known?.lastAt ?? 0, Date.now()),
+            live: true,
+          })
+        }
+      } catch {
+        // 没有 sessions 服务：只给历史清单
+      }
+
+      // ③ cwd / 归属 → 工作区名
+      const byPath = new Map<string, { id: string; title: string }>()
+      const bySession = new Map<string, { id: string; title: string }>()
+      try {
+        const registry = ctx.get('workspaceRegistry') as
+          | { list?: () => Array<{ id?: string; path?: string; title?: string; sessionIds?: readonly string[] }> }
+          | undefined
+        for (const workspace of registry?.list?.() ?? []) {
+          const id = typeof workspace.id === 'string' ? workspace.id : ''
+          const title = typeof workspace.title === 'string' ? workspace.title : ''
+          const path = typeof workspace.path === 'string' ? workspace.path : ''
+          if (path !== '') byPath.set(path, { id, title })
+          for (const sessionId of workspace.sessionIds ?? []) {
+            if (typeof sessionId === 'string' && sessionId !== '') bySession.set(sessionId, { id, title })
+          }
+        }
+      } catch {
+        // 没有 workspaceRegistry（老版本 DSH）：工作区字段留空，弹窗退化成单层会话列表
+      }
+
+      return [...rows.values()]
+        .sort((a, b) => (a.live === b.live ? b.lastAt - a.lastAt : (a.live ? -1 : 1)))
+        .slice(0, 300)
+        .map((row) => {
+          const owner = byPath.get(row.cwd) ?? bySession.get(row.id)
+          return {
+            id: row.id,
+            title: row.title,
+            cwd: row.cwd,
+            preset: presetOf(row.id),
+            workspaceId: owner?.id ?? null,
+            workspaceTitle: owner?.title ?? (row.cwd === '' ? '' : (row.cwd.split('/').filter(Boolean).pop() ?? '')),
+          }
+        })
+    } catch {
+      return []
+    }
+  }
+
+
   // 卡片数据通道
+  /**
+   * 临时诊断：把宿主里 agent preset 服务的真实返回打出来。
+   * 用户报「新会话的预设下拉里看不到 Gitee 项目管理」，靠它区分
+   * ① 组合树里没有 preset-gitee（补丁没生效）② 有但列表没返回（服务缓存/时机）。
+   */
+  /**
+   * 临时诊断：宿主上到底有哪些能力服务。
+   * 「AI 审核投递到子智能体」要 `subagents`（seam）+ `agents`（父 agent 句柄），
+   * 这两个是 host 平面服务，得先确认它们在这个进程里真的挂上了。
+   */
+  const debugServices = (): unknown => {
+    const raw = ctx as unknown as { get: (name: string) => unknown }
+    const names = [
+      'subagents', 'agents', 'sessions', 'agentPresets', 'workspaceRegistry',
+      'tools', 'conversation', 'attachments',
+    ]
+    const out: Record<string, unknown> = {}
+    for (const name of names) {
+      try {
+        const value = raw.get(name)
+        if (value === undefined) { out[name] = 'undefined'; continue }
+        if (value === null) { out[name] = null; continue }
+        const proto = typeof value === 'object' ? Object.getOwnPropertyNames(Object.getPrototypeOf(value as object)) : []
+        out[name] = { type: typeof value, methods: proto.filter((k) => k !== 'constructor').slice(0, 40) }
+      } catch (error) {
+        out[name] = `ERR ${(error as Error).message}`
+      }
+    }
+    try {
+      const subagents = raw.get('subagents') as Record<string, unknown> | undefined
+      if (subagents !== undefined) {
+        const list = subagents.list as (() => unknown) | undefined
+        const providers = typeof list === 'function' ? (() => { try { return list.call(subagents) } catch (error) { return `ERR ${(error as Error).message}` } })() : 'no list()'
+        const spawn = (() => {
+          try {
+            const getProvider = subagents.getProvider as ((name: string) => unknown) | undefined
+            const found = typeof getProvider === 'function' ? getProvider.call(subagents, 'spawn') : undefined
+            return found === undefined ? 'undefined' : { keys: Object.keys(found as object) }
+          } catch (error) { return `ERR ${(error as Error).message}` }
+        })()
+        out['subagents.list()'] = providers
+        out['subagents.provider(spawn)'] = spawn
+      }
+      const agents = raw.get('agents') as Record<string, unknown> | undefined
+      const listAgents = agents?.list as (() => unknown) | undefined
+      if (typeof listAgents === 'function' && agents !== undefined) {
+        const live = listAgents.call(agents) as Array<{ id?: string }>
+        out['agents.list()'] = Array.isArray(live) ? live.map((a) => a.id ?? '?') : String(live)
+      }
+    } catch (error) {
+      out['probe'] = `ERR ${(error as Error).message}`
+    }
+    return out
+  }
+
+  const debugPresets = async (): Promise<unknown> => {
+    const raw = ctx as unknown as { get: (name: string) => unknown }
+    const svc = raw.get('agentPresets') as Record<string, unknown> | undefined
+    if (svc === undefined) return { error: 'agentPresets undefined' }
+    const brief = (value: unknown): unknown => {
+      if (value === undefined) return 'undefined'
+      if (value === null) return null
+      if (Array.isArray(value)) {
+        return value.map((item) => (item !== null && typeof item === 'object' ? { id: (item as { id?: string }).id, name: (item as { name?: string }).name } : item))
+      }
+      if (typeof value === 'object') return { keys: Object.keys(value as Record<string, unknown>) }
+      return value
+    }
+    const call = async (method: string, arg?: unknown): Promise<unknown> => {
+      const fn = (svc as Record<string, unknown>)[method]
+      if (typeof fn !== 'function') return `no ${method}()`
+      try {
+        return brief(await (fn as (...args: unknown[]) => unknown).call(svc, arg))
+      } catch (err) {
+        return `ERR ${String(err)}`
+      }
+    }
+    const dump = (value: unknown): unknown => {
+      if (value === undefined) return 'undefined'
+      const seen = new WeakSet<object>()
+      try {
+        const text = JSON.stringify(value, (key, val: unknown) => {
+          if (typeof val === 'function') return `[fn ${String((val as { name?: string }).name ?? '')}]`
+          if (val !== null && typeof val === 'object') {
+            if (seen.has(val as object)) return '[circular]'
+            seen.add(val as object)
+          }
+          return val
+        })
+        if (text === undefined) return String(value)
+        return text.length > 24000 ? `${text.slice(0, 24000)}…（截断）` : JSON.parse(text) as unknown
+      } catch (err) {
+        return `ERR ${String(err)}`
+      }
+    }
+    const callRaw = async (method: string, arg?: unknown): Promise<unknown> => {
+      const fn = (svc as Record<string, unknown>)[method]
+      if (typeof fn !== 'function') return `no ${method}()`
+      try {
+        return dump(await (fn as (...args: unknown[]) => unknown).call(svc, arg))
+      } catch (err) {
+        return `ERR ${String(err)}`
+      }
+    }
+    // 宿主 registry 的公开 API 与这里的老写法有两处对不上（缺陷 IKQYDD）：
+    //   ① `defaultId` 是 getter（`this.defaultId`），不是方法 —— 当方法调永远拿到 `no defaultId()`；
+    //   ② `diagnostic(record)` 要内部 record 对象，对外只有 `list()` 的展示行，**每行自带的 `broken`
+    //      就是 diagnostic(record) 的结果**，单独调一次既拿不到 record 也没有意义。
+    const defaultId = ((): string | null => {
+      try {
+        const value = (svc as { defaultId?: unknown }).defaultId
+        return typeof value === 'string' && value !== '' ? value : null
+      } catch {
+        return null
+      }
+    })()
+    return {
+      // 用 dump 原样返回，别用 brief 抹掉每行的 `broken`
+      list: await callRaw('list'),
+      defaultId,
+      inspectCompositions: await call('inspectCompositions'),
+      compositionInventory: await call('compositionInventory'),
+      composedGitee: await callRaw('composedPreset', 'gitee'),
+      resolveGitee: await callRaw('resolve', 'gitee'),
+      resolveStandard: await callRaw('resolve', 'standard'),
+    }
+  }
+
   const handler = createRouteHandler({
     runner,
     role,
     writer,
+    // 只读部署开关：面板写路由（/write、/issue-create、/pr/create、/pr/action）也受它约束
+    allowWrites: () => resolved.allowWrites,
+    // 「设置 → Gitee 企业项目」里的缓存 / 后台刷新开关（本地覆盖，改完即生效）
+    settings: {
+      resolve: () => liveSettings(),
+      write: (patch) => localSettings.write(patch, staticSettings()),
+      path: localSettings.path,
+      getDraftTarget: (repoKey) => localSettings.getDraftTarget(repoKey),
+      setDraftTarget: (repoKey, target) => localSettings.setDraftTarget(repoKey, target),
+    },
     presetOf,
+    listSessions,
+    debugPresets,
+    debugServices,
     isGiteeSession: async (sessionId: string) => {
       const preset = presetOf(sessionId)
       if (preset === null) return undefined
       return await isGiteePreset(preset)
     },
-    trustedHosts: () => {
-      const runtime = ctx.get('webRuntime') as { trustedHosts?: readonly string[] } | undefined
-      return runtime?.trustedHosts ?? []
-    },
+    trustedHosts: () => trustedHostsOf(ctx),
     version: VERSION,
     mcp: () => inspectMcpBinary(),
     docs: docService,
     repos: repoService,
+    pr: prService,
+    subagentReview: async (input: { sessionId: string; prompt: string; label: string; delivery?: 'caller' | 'parent' }) => {
+      // delivery='parent' 时，DSH 会往所选主会话追加一条结算消息（人看得见），
+      // 结果同时回到这里给面板回填 —— 这就是「投递到主会话」那一档。
+      const run = await prSubagent.start(input)
+      return { runId: run.runId, childId: run.childId }
+    },
+    subagentRun: (runId: string) => prSubagent.get(runId),
+    subagentCancel: (runId: string) => prSubagent.cancel(runId),
   })
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: ROUTE_PREFIX, handler }))
 
@@ -711,6 +1255,10 @@ export function apply(ctx: any, config?: Config): void {
       allowWrites: resolved.allowWrites,
       userAgent: resolved.userAgent,
       mcpToolPrefix: resolved.docs.mcpToolPrefix,
+      // 用 getter：agent 平面每次调用现取，设置页改完（volatile）即使生效
+      get cache() {
+        return liveCache()
+      },
     },
   }
   ctx.provide('giteeChat', face)
@@ -723,7 +1271,7 @@ export function apply(ctx: any, config?: Config): void {
 
 export { createGqRunner, defaultScriptPath } from './host/gq.ts'
 export {
-  binaryName, dshHome, ensureMaterialized, inspectMcpBinary, isOnPath,
+  binaryName, dshHome, ensureMaterialized, inspectMcpBinary, isOnPath, legacyMaterializedPath,
   materializedPath, platformKey, readManifest, toolGapOf, userBinDir,
 } from './host/mcpBinary.ts'
 export { createIssueWriter, WriteError } from './host/write.ts'
@@ -741,6 +1289,12 @@ export {
 } from './host/mcpDocs.ts'
 export { createDocService, defaultDocsRoot } from './host/docService.ts'
 export { createRepoService, visibilityOf } from './host/repoService.ts'
+export { createPrService, PrError } from './host/prService.ts'
+export { createPrTemplates } from './host/prTemplates.ts'
+export {
+  createLocalSettings, normalizeTtlSeconds, normalizeIntervalSeconds, normalizeIdleMinutes,
+} from './host/localSettings.ts'
+export type { CacheSettings, AutoRefreshSettings, DraftTarget, LocalSettings, ResolvedSettings, SettingsPatch } from './host/localSettings.ts'
 export {
   createWikiCache, toWorkspacePath, safeRepoSegment, WORKSPACE_LINK_DIR, WORKSPACE_LINK_NAME,
 } from './host/wikiCache.ts'
@@ -748,11 +1302,13 @@ export {
   classifyPageState, enterpriseLayer, pageRelPath, planPull, readIndex, rollupDocState, safeSlug, stripExtension, documentDir, MANIFEST_NAME,
   TEXT_PREVIEW_EXT, extOf, readTextFile,
   ATTACH_MANIFEST_NAME, classifyAttachState, readAttachManifest, writeAttachManifest, attachFileExists,
-  cacheStats, humanBytes,
+  cacheStats, humanBytes, nowStamp, stampOf, parseStamp,
 } from './host/docCache.ts'
 export type { McpDocs, ToolsService } from './host/mcpDocs.ts'
 export type { DocService } from './host/docService.ts'
 export type { RepoService } from './host/repoService.ts'
+export type { PrService } from './host/prService.ts'
+export type { PrTemplates } from './host/prTemplates.ts'
 export type { WikiCache } from './host/wikiCache.ts'
 export type { DocManifest, DocPageState } from './host/docCache.ts'
 export type { IssueWriter, IssueWriterOptions } from './host/write.ts'

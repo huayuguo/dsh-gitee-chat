@@ -690,6 +690,64 @@
   color: var(--dsw-alias-label-primary-foreground);
 }
 
+/* 仓库详情三页签：三种暖浅色（未选中浅、选中深一档） */
+.gqVSegPlain {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  gap: 6px;
+}
+
+.gqVSegPlain .gqVSegBtn {
+  border-width: 1px;
+  border-style: solid;
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+}
+
+.gqVSegSand {
+  background: #f7efe2;
+  border-color: #ecdfc9;
+  color: #8a5a2b;
+}
+
+.gqVSegSandOn,
+.gqVSegSandOn:hover {
+  background: #e9d3b2;
+  border-color: #dcbf94;
+  color: #6d4520;
+  font-weight: 600;
+}
+
+.gqVSegRose {
+  background: #f8e8e2;
+  border-color: #edd6cd;
+  color: #9a4a33;
+}
+
+.gqVSegRoseOn,
+.gqVSegRoseOn:hover {
+  background: #f0ccbf;
+  border-color: #e0b1a1;
+  color: #7d3624;
+  font-weight: 600;
+}
+
+.gqVSegOlive {
+  background: #eff0e2;
+  border-color: #e0e2c9;
+  color: #5f6a2e;
+}
+
+.gqVSegOliveOn,
+.gqVSegOliveOn:hover {
+  background: #dcdfc2;
+  border-color: #c9cfa6;
+  color: #49521f;
+  font-weight: 600;
+}
+
 /* 两列卡片带 */
 .gqVCols {
   display: flex;
@@ -700,6 +758,68 @@
 
 .gqVCols > .gqVCard {
   margin-bottom: 0;
+}
+
+/* 可拖拽分栏的容器：**不能换行**。
+   原来借用 `.gqVCols`（flex-wrap: wrap + 子项 min-width: 340）时，一拖宽就把
+   右侧详情列挤到下一行，表现成"能拉的范围非常非常小"。 */
+.gqVSplit {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 8px;
+}
+
+.gqVSplitMain {
+  flex: 1 1 auto;
+  /* 240px 是详情列的下限：拖到容器放不下时自然会停住，不会把详情挤成一条线。 */
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 「内源仓库」胶囊：默认灰、选中浅蓝（用户 2026-10-27 口径）。 */
+.gqVScopeChip {
+  appearance: none;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid #e3e6eb;
+  background: #f4f5f7;
+  color: #5b6472;
+  font-size: 12px;
+  line-height: 18px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.gqVScopeChip:hover {
+  background: #eceef2;
+}
+
+.gqVScopeChipOn,
+.gqVScopeChipOn:hover {
+  background: #e6f0ff;
+  border-color: #c9dcff;
+  color: #2f6fed;
+}
+
+/* 可拖拽的栏宽把手（项目列表 / 仓库列表）。6px 视觉窄，但左右各带 2px 透明热区。 */
+.gqVResizer {
+  flex: 0 0 6px;
+  align-self: stretch;
+  min-height: 120px;
+  cursor: col-resize;
+  border-radius: 3px;
+  background: transparent;
+  transition: background 0.12s ease;
+  touch-action: none;
+}
+
+.gqVResizer:hover {
+  background: #d8dde5;
 }
 
 .gqVCol {
@@ -1234,4 +1354,150 @@
 */
 [data-conversation-scroll]:has([data-gq-root]) ~ [data-width-handle] {
   display: none;
+}
+
+/* ── 项目详情里的仓库卡片（用户口径：参考「记忆空间」那种卡片） ─────────────── */
+
+.gqVSectionHd {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--gq-text-2);
+}
+
+.gqVRepoGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(216px, 1fr));
+  gap: 10px;
+}
+
+.gqVRepoCard {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 13px;
+  background: var(--gq-surface);
+  /* 暖色细线：低饱和米棕，避免一排卡片出现冷暖混杂的边缘 */
+  border: 1px solid var(--gq-warm-line);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.gqVRepoCard:hover,
+.gqVRepoCard:focus-visible {
+  border-color: var(--gq-warm-line-2);
+  background: var(--gq-warm-soft);
+  box-shadow: var(--gq-warm-shadow);
+  transform: translateY(-1px);
+  outline: none;
+}
+
+.gqVRepoHd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.gqVRepoName {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--gq-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gqVRepoDesc {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--gq-text-3);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.gqVRepoStats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: auto;
+  padding-top: 4px;
+  font-size: 11px;
+  color: var(--gq-text-3);
+}
+
+/*
+ * 卡头左起按钮组（用户口径 m02229 ②：「新建工作项 / 新建 PR 按钮排版可以按照从左到右」）。
+ *
+ * 之前这两个按钮塞在 `right` 槽里，被推到卡头最右、还和分段开关抢空间；
+ * 现在放在说明文字之后、从左往右排，主操作（新建）在视觉上先出现。
+ * 用 `margin-left` 让「最后一个右槽控件」仍然靠右，而本组保持左对齐。
+ */
+.gqVTitleActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.gqVTitleActions + * {
+  margin-left: auto;
+}
+
+/*
+ * 暖色卡片（用户口径 m02229 ③：「知识库的卡片外框还是一样的灰色，你按照卡片颜色来」）。
+ *
+ * 与仓库卡片（`.gqVRepoCard`）用同一组暖色令牌，避免同一页里冷暖边框混杂。
+ */
+.gqVCardWarm {
+  border-color: var(--gq-warm-line);
+}
+
+.gqVCardWarm:hover {
+  border-color: var(--gq-warm-line-2);
+}
+
+/* 工作项状态药丸：待办浅灰 / 进行中浅绿 / 已完成绿色 / 已取消浅黑（用户 2026-10-27） */
+.gqVStatePill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.gqVStateTodo {
+  background: #f2f3f5;
+  border-color: #e3e5e9;
+  color: #5b6472;
+}
+
+.gqVStateDoing {
+  background: #eaf7ee;
+  border-color: #cfe9d6;
+  color: #2f7a44;
+}
+
+.gqVStateDone {
+  background: #bfe3c9;
+  border-color: #9bcfab;
+  color: #14532a;
+  font-weight: 600;
+}
+
+.gqVStateCancelled {
+  background: #e6e7ea;
+  border-color: #d3d6dc;
+  color: #3a3f47;
 }

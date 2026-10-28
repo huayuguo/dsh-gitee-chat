@@ -3,9 +3,18 @@ node_modules/
 lib/
 *.tsbuildinfo
 
-# 生成物
-preview/
+# 生成物（自包含预览落在 .tmp/preview/）
 *.log
 
 # 编辑器/系统
 .DS_Store
+
+# 临时设计稿/截图（不入库）
+.tmp/
+types/
+
+# 内部文档（设计/能力/功能说明）与 npm 锁文件：只在本机维护，不入库。
+# 对外发布物里没有它们，入库只会让两条发布线越拉越远。
+# 需要重建文档时跑 `node scripts/gen-capabilities.mjs`；锁文件由 `npm install` 维护。
+docs/
+package-lock.json

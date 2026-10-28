@@ -16,6 +16,7 @@
 //  3. CSS Modules 内联为「类名映射 + 样式文本」，类名加前缀隔离；
 //     样式文本由 client 代码注入 <style>。
 import { build } from 'esbuild'
+import { spawnSync } from 'node:child_process'
 import { readFile, writeFile, unlink } from 'node:fs/promises'
 
 const PKG_ID = 'dsh-gitee-chat'
@@ -84,4 +85,9 @@ ${body}
 `
 await writeFile('lib/client.js', wrapped)
 await unlink('lib/client.tmp.js')
-console.log(`[${PKG_ID}] built: lib/index.js + lib/client.js`)
+
+// 对外类型声明：按 DSH 官方包约定落在 lib/types/，随 lib 一起发布（files 只发 lib）。
+const types = spawnSync(process.execPath, ['scripts/check-types.mjs'], { stdio: 'inherit' })
+if (types.status !== 0) process.exit(types.status ?? 1)
+
+console.log(`[${PKG_ID}] built: lib/index.js + lib/client.js + lib/types/`)

@@ -18,12 +18,15 @@ import type {
   DocTreeResponse,
   ErrorResponse,
   HealthResponse,
+  IssueCreateRequest,
   IssueDetailPayload,
   IssueStateRow,
+  IssueTypeRow,
   IssueWriteRequest,
   IssueWriteResult,
   PayloadResponse,
   ProgramMemberRow,
+  RepoBranchesResponse,
   RepoListResponse,
   WikiPageResponse,
   WikiTreeResponse,
@@ -150,6 +153,70 @@ export async function fetchIssues(programId: number, state?: string, signal?: Ab
   return body
 }
 
+/** 仓库维度工作项响应。 */
+export interface RepoIssues {
+  ok: boolean
+  repoId: number
+  total: number
+  truncated: boolean
+  issues: WorkItemRow[]
+  distribution: { state: string; count: number }[]
+}
+
+/**
+ * 取某个**仓库**下的工作项（仓库详情页「工作项」页签）。
+ *
+ * 与 `fetchIssues(programId)` 的区别只是过滤维度：Gitee 企业版里工作项可以挂在
+ * 仓库（`project_id`）上，仓库详情页要看到的是这一层。
+ * @param repoId - 仓库 id。
+ * @param state - 可选状态过滤。
+ */
+export async function fetchRepoIssues(repoId: number, state?: string, signal?: AbortSignal): Promise<RepoIssues> {
+  const q = new URLSearchParams({ repoId: String(repoId) })
+  if (state !== undefined && state !== '') q.set('state', state)
+  const res = await fetch(`/api/gitee-chat/repo/issues?${q.toString()}`, { signal })
+  if (!res.ok) throw await readError(res)
+  const body = (await res.json()) as RepoIssues
+  if (body?.ok !== true) throw new BoardApiError('script-failed', '宿主返回了无法解析的仓库工作项响应')
+  return body
+}
+
+/** 取一个项目的工作项类型（任务 / 需求 / 缺陷），新建工作项时选。 */
+export async function fetchIssueTypes(programId: number, signal?: AbortSignal): Promise<IssueTypeRow[]> {
+  const res = await fetch(`/api/gitee-chat/issue-types?program=${programId}`, { signal })
+  if (!res.ok) throw await readError(res)
+  const body = (await res.json()) as { ok: boolean; items?: IssueTypeRow[] }
+  if (body?.ok !== true) throw new BoardApiError('script-failed', '取工作项类型失败')
+  return body.items ?? []
+}
+
+/** 新建工作项的返回。 */
+export interface CreatedIssue {
+  id: number
+  ident: string
+  title: string
+  state: string
+}
+
+/**
+ * 新建工作项。
+ *
+ * 只依赖企业 token（不需要会话处于 Gitee 模式）；归属同时给
+ * `programId` 与 `repoId` 时，工作项就挂在仓库下面。
+ */
+export async function createIssue(request: IssueCreateRequest, signal?: AbortSignal): Promise<CreatedIssue> {
+  const res = await fetch('/api/gitee-chat/issue-create', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+    signal,
+  })
+  if (!res.ok) throw await readError(res)
+  const body = (await res.json()) as { ok: boolean } & Partial<CreatedIssue> & { error?: string; message?: string }
+  if (body?.ok !== true) throw new BoardApiError('script-failed', body.message ?? body.error ?? '新建工作项失败')
+  return { id: body.id ?? 0, ident: body.ident ?? '', title: body.title ?? request.title, state: body.state ?? 'open' }
+}
+
 /** 环境自检（供健康卡片使用）。 */
 export async function fetchHealth(signal?: AbortSignal): Promise<HealthResponse> {
   const res = await fetch('/api/gitee-chat/health', { signal })
@@ -172,6 +239,40 @@ export async function fetchTokenStatus(signal?: AbortSignal): Promise<TokenStatu
   const res = await fetch('/api/gitee-chat/token', { signal })
   if (!res.ok) throw await readError(res)
   return (await res.json()) as TokenStatusResponse
+}
+
+/** 设置页里的缓存 / 后台刷新开关（宿主侧 `GET /settings` 的返回）。 */
+export interface GiteeSettings {
+  cache: { agentReadable: boolean; persist: boolean; ttlSeconds: number }
+  autoRefresh: { enabled: boolean; intervalSeconds: number; idleMinutes: number }
+}
+
+/** 读当前生效的缓存 / 刷新开关 + 它们落在哪个文件。 */
+export async function fetchSettings(signal?: AbortSignal): Promise<{ values: GiteeSettings; path: string }> {
+  const res = await fetch('/api/gitee-chat/settings', { signal })
+  if (!res.ok) throw await readError(res)
+  return (await res.json()) as { values: GiteeSettings; path: string }
+}
+
+/** 保存缓存 / 刷新开关（写本地覆盖文件，宿主每次现读 → 点保存即生效）。 */
+export async function postSettings(
+  patch: { cache?: Partial<GiteeSettings['cache']>; autoRefresh?: Partial<GiteeSettings['autoRefresh']> },
+  signal?: AbortSignal,
+): Promise<{ values: GiteeSettings; path: string }> {
+  let res: Response
+  try {
+    res = await fetch('/api/gitee-chat/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch),
+      signal,
+    })
+  } catch (error) {
+    if ((error as Error)?.name === 'AbortError') throw error
+    throw new BoardApiError('network', error instanceof Error ? error.message : String(error))
+  }
+  if (!res.ok) throw await readError(res)
+  return (await res.json()) as { values: GiteeSettings; path: string }
 }
 
 /** 保存企业版 token（写入 ~/.dsh/.gitee-chat/token，取数即时生效、无需重启）。 */
@@ -262,6 +363,16 @@ export async function postEnterprise(id: number, signal?: AbortSignal): Promise<
  * 取工作项详情：描述 / 前置依赖 / 评论讨论。
  * @param ident - 工作项编号（如 DM0001）。
  */
+/**
+ * 悬停预取：鼠标移到一行工作项上就先把详情拉进宿主缓存（30s TTL），
+ * 点下去时直接命中缓存 —— 省掉那一趟「详情 + 评论 + 依赖」的往返。
+ * 失败静默：只是预热，不承担错误提示。
+ */
+export function prefetchIssue(ident: string): void {
+  if (ident === '') return
+  void fetchIssue(ident).catch(() => { /* 预热失败无所谓，点击时会再拉一次 */ })
+}
+
 export async function fetchIssue(ident: string, signal?: AbortSignal): Promise<IssueDetailPayload> {
   const res = await fetch(`/api/gitee-chat/issue?ident=${encodeURIComponent(ident)}`, { signal })
   if (!res.ok) throw await readError(res)
@@ -318,7 +429,7 @@ export async function postWrite(request: IssueWriteRequest, signal?: AbortSignal
   return body
 }
 
-// ── 知识库文档（I 层）──────────────────────────────────────
+// ── 知识库文档（I 层；见 DOCS.md §8）──────────────────────────────────────
 //
 // 🔒 `fetchDocs` / `searchDocs` / `fetchDoc` / `fetchDocPage` / `postDocSync`
 // 这 5 个**当前没有组件调用**，是有意冻结的（A7 决策见 `host/routes.ts` 里
@@ -401,7 +512,7 @@ export async function fetchDocAttachment(
 /**
  * 列仓库（**J 层**）。
  *
- * 两种口径（host 侧决定）：
+ * 两种口径（host 侧决定，见 DOCS.md §14）：
  *   - `programId` 给了 → 该项目下的仓库；
  *   - 没给 → 只列**企业内部开源**的仓库。
  * @param sessionId - 会话 id（host 用它解析 agent 作用域）。
@@ -420,10 +531,25 @@ export async function fetchRepos(sessionId: string, programId: number | null, pr
 }
 
 /**
+ * 列一个仓库的分支（新建 PR 时选源/目标分支）。
+ *
+ * 走宿主 `GET /repo/branches` → `gq branches` → 企业版 `/{eid}/projects/{repoId}/branches`。
+ * MCP 没有「列分支」工具，所以这条是宿主自己的通道；失败时调用方回退成手填输入框。
+ */
+export async function fetchRepoBranches(sessionId: string, repoId: number, signal?: AbortSignal): Promise<RepoBranchesResponse> {
+  const q = new URLSearchParams({ sessionId, repoId: String(repoId) })
+  const res = await fetch(`/api/gitee-chat/repo/branches?${q.toString()}`, { signal })
+  if (!res.ok) throw await readError(res)
+  const body = (await res.json()) as RepoBranchesResponse
+  if (body?.ok !== true) throw new BoardApiError('script-failed', '宿主返回了无法解析的分支列表')
+  return body
+}
+
+/**
  * 取一个仓库的 WIKI 文件树。
  *
  * ⚠️ 这一条**不是** MCP 提供的：Gitee 没有列仓库 WIKI 的 HTTP 接口，
- * host 走的是 git 克隆 `{path_with_namespace}.wiki.git`。
+ * host 走的是 git 克隆 `{path_with_namespace}.wiki.git`（DOCS.md §14.1）。
  * @param repoId - 仓库 id。
  * @param repoPath - `path_with_namespace`（**不是 name**，两者经常不同）。
  * @param refresh - true = 强制 fetch 远端。

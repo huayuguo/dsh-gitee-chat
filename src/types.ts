@@ -399,7 +399,7 @@ export interface ProgramMemberRow {
   username: string
 }
 
-// ── 知识库文档（I 层）──────────────────────────────────────────
+// ── 知识库文档（I 层；见 DOCS.md）──────────────────────────────────────────
 
 /**
  * 附件在本地缓存里的状态。
@@ -427,7 +427,7 @@ export interface DocRow {
   cached: boolean
 }
 
-// ── 知识库节点树（本企业知识库的真实形态）──────────────────────
+// ── 知识库节点树（本企业知识库的真实形态；见 DOCS.md）──────────────────────
 
 /**
  * 知识库树里的一个节点。
@@ -622,7 +622,7 @@ export interface DocSyncResponse {
   generatedAt: string
 }
 
-/** 搜索命中（企业级；**不能按项目过滤**）。 */
+/** 搜索命中（企业级；**不能按项目过滤**，见 DOCS.md §1.2）。 */
 export interface DocSearchRow {
   documentId: number
   documentNodeId: number
@@ -644,7 +644,7 @@ export interface DocSearchResponse {
   generatedAt: string
 }
 
-// ── 仓库与其 WIKI（J 层）────────────────────────────────────
+// ── 仓库与其 WIKI（J 层；见 DOCS.md §14）────────────────────────────────────
 
 /**
  * 仓库在界面上的形状（由 MCP `list_enterprise_repositories` 裁剪而来）。
@@ -674,12 +674,32 @@ export interface RepoRow {
    * 该仓库的 WIKI **有内容**（Gitee 的 `wiki_enabled_with_content`）。
    *
    * 这是"要不要去克隆 WIKI"的唯一判据：仓库 WIKI 没有 HTTP 列表接口，
-   * 只有 `{path_with_namespace}.wiki.git` 这个 git 仓库。
+   * 只有 `{path_with_namespace}.wiki.git` 这个 git 仓库（DOCS.md §14.1）。
    */
   wiki: boolean
 }
 
 /** 仓库列表响应。 */
+/** 仓库的一条分支（`GET /repo/branches` 的 `items[]`）。 */
+export interface RepoBranch {
+  name: string
+  /** 仓库默认分支（建 PR 时目标分支的默认值）。 */
+  isDefault: boolean
+  protected: boolean
+  commit: { id: string; shortId: string; title: string }
+}
+
+/** `GET /repo/branches` 的响应（新建 PR 的源/目标分支下拉靠它）。 */
+export interface RepoBranchesResponse {
+  ok: true
+  generatedAt: string
+  repoId: number
+  total: number
+  /** 没有分支时为空串。 */
+  defaultBranch: string
+  items: RepoBranch[]
+}
+
 export interface RepoListResponse {
   ok: true
   enterpriseId: number
@@ -760,7 +780,7 @@ export interface WikiPageResponse {
  *
  * UI 只允许这四种；`doc-page-update` 同样走这一条路（**唯一写入口**），
  * 由 host 委派 MCP 的 `update_enterprise_document_page`，
- * 而不是让插件自己去拼文档端点。
+ * 而不是让插件自己去拼文档端点（见 DOCS.md §7）。
  */
 export interface IssueWriteRequest {
   op: 'set-state' | 'comment' | 'assign' | 'doc-page-update'
@@ -769,7 +789,12 @@ export interface IssueWriteRequest {
   stateId?: number
   body?: string
   assigneeId?: number
-  /** 发起写的会话（host 用它确认这是 Gitee 模式的会话，并解析 agent 作用域）。 */
+  /**
+   * 发起写的会话。
+   *
+   * 0.5.4 起**不再用它做模式判定**（曾经要求「必须是 Gitee 会话」才放行，
+   * 让「任何模式都能用」卡死过）；现在只留作审计与文档写的作用域。
+   */
   sessionId?: string
   /** doc-page-update：文档 id。 */
   documentId?: number
@@ -783,6 +808,72 @@ export interface IssueWriteRequest {
   commitMessage?: string
   /** doc-page-update：可选改名。 */
   pageName?: string
+}
+
+/**
+ * 新建工作项。
+ *
+ * 归属：`programId`（项目）与 `repoId`（仓库）至少给一个 —— 仓库详情页的
+ * 「新建工作项」会带上 repoId，这样工作项就挂在仓库下面。
+ * `typeId` 选任务/需求/缺陷（来自 `/issue-types`），不传由服务端给默认类型。
+ */
+export interface IssueCreateRequest {
+  title: string
+  programId?: number
+  repoId?: number
+  typeId?: number
+  description?: string
+  assigneeId?: number
+  priority?: number
+  /**
+   * 任务时间（截止日），`YYYY-MM-DD`。
+   * 用户口径（2026-10-26）：「关键属性 任务时间、优先级、负责人这三个必须填写」，
+   * 面板侧三个都必填，host 只做透传（`gq create-issue --deadline`）。
+   */
+  /** 计划开始日（YYYY-MM-DD，可选）。 */
+  planStartedAt?: string
+  /** 计划结束日 / 截止日（YYYY-MM-DD）。 */
+  deadline?: string
+}
+
+/** `/issue-types` 的一项：任务 / 需求 / 缺陷。 */
+export interface IssueTypeRow {
+  id: number
+  ident: string
+  title: string
+  category: string
+  color: string
+  system: boolean
+}
+
+/** 仓库维度的一行工作项（与 `/issues` 的行同形，供仓库详情页「工作项」页签用）。 */
+export interface RepoIssueRow {
+  id: number
+  ident: string
+  title: string
+  state: string
+  priority: number
+  priorityHuman: string
+  programId: number
+  assignee: string
+  assigneeId: number
+  deadline: string
+  createdAt: string
+  updatedAt: string
+  typeTitle: string
+  typeId: number
+  commentsCount: number
+  overdue: boolean
+  overdueDays: number
+}
+
+/** `/repo/issues` 的返回：仓库维度工作项清单。 */
+export interface RepoIssueResponse {
+  repoId: number
+  total: number
+  truncated: boolean
+  issues: RepoIssueRow[]
+  distribution: Array<{ state: string; count: number }>
 }
 
 /** 写操作结果。 */
@@ -803,6 +894,21 @@ export interface IssueWriteResult {
   lastEditTime?: string
 }
 
+/** 「我的工作项」一行：负责人或协作者是我。 */
+export interface MyIssueRow {
+  id: number
+  ident: string
+  title: string
+  programId: number
+  programName: string
+  state: string
+  priorityHuman: string
+  deadline: string
+  overdue: boolean
+  /** owner=我是负责人；collaborator=我是协作者。 */
+  role: 'owner' | 'collaborator'
+}
+
 /** 一次取数的完整结果（卡片渲染用；**不进入模型上下文**）。 */
 export interface BoardPayload {
   ok: true
@@ -821,6 +927,13 @@ export interface BoardPayload {
   risks: RiskRow[]
   /** 固定分析（脚本计算，无需 AI）。 */
   analysis?: BoardAnalysis
+  /**
+   * 「我的工作项」页签：负责人或协作者是我的工作项。
+   *
+   * 由脚本在**已经取到的那批工作项**上过滤得出，不打额外接口（见
+   * `scripts/gitee/gq.mjs` 的 `finalize`）。老版本脚本没有这个字段 → 客户端要判空。
+   */
+  myIssues?: MyIssueRow[]
   /** 给模型看的紧凑摘要——唯一进入上下文的部分。 */
   summary: string
 }
@@ -833,6 +946,27 @@ export interface PayloadResponse {
   cached: boolean
   /** 降级为样例数据（未配置 token 且允许降级）。 */
   degraded: boolean
+  /**
+   * 数据时效（提醒义务，用户口径 m02223）。
+   *
+   * 界面据此显示「数据 N 秒前」并在超过 `ttlSeconds` 时标黄；
+   * AI 侧由 `gitee_board` / `gitee_board_snapshot` 输出同一组数字。
+   */
+  freshness?: Freshness
+}
+
+/** 一份数据的时效元信息（界面与 AI 共用同一组数字）。 */
+export interface Freshness {
+  /** 抓取时刻（epoch ms）。 */
+  fetchedAt: number
+  /** 距今多少秒。 */
+  ageSeconds: number
+  /** 是否已超过新鲜期（`true` = 可能不是最新，需要刷新）。 */
+  stale: boolean
+  /** 当前生效的新鲜期（秒；0 = 不做缓存）。 */
+  ttlSeconds: number
+  /** 数据来自哪一层。 */
+  source: 'remote' | 'memory' | 'disk'
 }
 
 /** 路由失败响应。 */
@@ -901,4 +1035,204 @@ export interface RolePayload {
   contextText: string
   /** 给人看的 Markdown 摘要。 */
   summary: string
+}
+
+/* ───────────────────────────── 0.5.4 · 合并请求（PR） ───────────────────────────── */
+
+/** PR 生命周期状态（Gitee v8 `state`）。 */
+export type PrState = 'opened' | 'merged' | 'closed'
+
+/** 审查状态：0 无需审查 · 1 待审查 · 2 审查已通过。 */
+export type PrCheckState = 0 | 1 | 2
+/** 测试状态：0 无需测试 · 1 待测试 · 2 测试已通过。 */
+export type PrTestState = 0 | 1 | 2
+
+/** 列表里的一个人（审查人 / 测试人）：0 待处理 · 1 已通过 · 2 已驳回。 */
+export interface PrPerson {
+  id: number
+  name: string
+  username: string
+  state: 0 | 1 | 2
+}
+
+/** 当前 token 对某个 PR 的真实权限（来自 `get_enterprise_pull_auth`，**不猜**）。 */
+export interface PrAuth {
+  read: boolean
+  createNote: boolean
+  update: boolean
+  canCheck: boolean
+  canTest: boolean
+  canMerge: boolean
+  forceChecked: boolean
+  forceTested: boolean
+  canClose: boolean
+  canReopen: boolean
+  canDeleteSource: boolean
+}
+
+/** 变更文件（`list_enterprise_pull_files` 的形状，已把 `patch.diff` 摊平）。 */
+export interface PrFile {
+  filename: string
+  oldPath: string
+  newPath: string
+  status: 'added' | 'renamed' | 'deleted' | 'modified'
+  additions: number
+  deletions: number
+  diff: string
+}
+
+/** PR 评论。 */
+export interface PrComment {
+  id: number
+  body: string
+  author: PrPerson
+  createdAt: string
+}
+
+/** 列表行。 */
+export interface PrSummary {
+  /** 全局 id（`18905991`）。 */
+  id: number
+  /** 仓库内序号（`!12` 的那个 12）。 */
+  iid: number
+  title: string
+  state: PrState
+  draft: boolean
+  repoId: number
+  repoPath: string
+  sourceBranch: string
+  targetBranch: string
+  author: PrPerson
+  checkState: PrCheckState
+  testState: PrTestState
+  prAssignNum: number
+  prTestNum: number
+  /** 已通过审查人数（前端画「待审查 1/2」用）。 */
+  checkPassed: number
+  /** 已通过测试人数。 */
+  testPassed: number
+  /** `canMerge && checkState===2 && testState===2` —— 界面上「可合并」的唯一口径。 */
+  mergeable: boolean
+  updatedAt: string
+  url: string
+}
+
+/** 详情：列表行 + 正文 + 人 + 权限 + 文件 + 评论。 */
+export interface PrDetail extends PrSummary {
+  body: string
+  bodyHtml: string
+  assignees: PrPerson[]
+  testers: PrPerson[]
+  /** 取不到（403 / 非审查人）时为 null —— 界面显示「权限未知」，**不许**用角色推断。 */
+  auth: PrAuth | null
+  /** 权限取失败时的白话原因。 */
+  authHint: string
+  files: PrFile[]
+  comments: PrComment[]
+  commitsCount: number
+  canChangeAssigner: boolean
+  canChangeTester: boolean
+}
+
+/** 列表响应的分类计数（4 张卡的数字，全局口径）。 */
+export interface PrCounts {
+  review: number
+  test: number
+  mine: number
+  mergeable: number
+}
+
+/** `GET /pr/list` 响应。 */
+export interface PrListResponse {
+  items: PrSummary[]
+  total: number
+  page: number
+  counts: PrCounts
+  /** 本次实际用的视角（回显筛选条）。 */
+  scope: 'assign' | 'test' | 'create' | 'all'
+  state: 'opened' | 'merged' | 'closed' | 'all'
+}
+
+/** 模板元信息。 */
+export interface PrTemplateMeta {
+  name: string
+  path: string
+  source: 'builtin' | 'user'
+  repoPath?: string | null
+  /** 保存/绑定时只作用于哪一种模板（不是「两个都管」）。 */
+  kind?: 'review' | 'test' | 'pr' | 'prGuide'
+  updatedAt?: string
+}
+
+/** `GET /pr/templates` 响应。 */
+export interface PrTemplatesResponse {
+  items: PrTemplateMeta[]
+  /**
+   * 当前生效的模板正文。
+   * `pr` = 干净骨架（套用模板用）；`prGuide` = 带每节说明的版本（「写什么？」与 AI 起草用）。
+   */
+  active: { review: string; test: string; pr?: string; prGuide?: string }
+  /** 当前生效模板的名字（仓库级覆盖时不是内置名）。 */
+  activeName: { review: string; test: string; pr?: string; prGuide?: string }
+}
+
+/**
+ * 新建 PR 的请求体（`POST /pr/create`）。
+ *
+ * 两条建 PR 路径共用宿主这层：UI 对话框填这个，agent 也可以直接调
+ * `create_enterprise_repo_pull`（等价）。**分支名只能手输** —— MCP 没有
+ * 列分支的工具，`targetBranch` 默认值取仓库当前默认分支。
+ */
+export interface PrCreateRequest {
+  repoId: number
+  /** 仓库 path_with_namespace，仅用于拼 PR 链接与回显。 */
+  repoPath?: string
+  sourceBranch: string
+  targetBranch: string
+  title: string
+  body?: string
+  /** 最小审查人数（Gitee 侧 `pr_assign_num`）。 */
+  prAssignNum?: number
+  /** 最小测试人数（Gitee 侧 `pr_test_num`）。 */
+  prTestNum?: number
+  draft?: boolean
+}
+
+/** `POST /pr/create` 的结果。 */
+export interface PrCreateResult {
+  iid: number
+  url: string
+  title: string
+}
+
+/** 写动作的请求体（`POST /pr/action`）。 */
+export type PrActionRequest =
+  | { action: 'check'; repoId: number; iid: number; mode: 'accept' | 'reject' | 'reset'; comment?: string }
+  | { action: 'test'; repoId: number; iid: number; comment?: string }
+  | { action: 'merge'; repoId: number; iid: number; method: 'merge' | 'squash' | 'rebase' }
+  | { action: 'comment'; repoId: number; iid: number; body: string }
+  | { action: 'state'; repoId: number; iid: number; event: 'close' | 'reopen' }
+  | { action: 'openCheck'; repoId: number; iid: number }
+  | { action: 'openTest'; repoId: number; iid: number }
+
+/** `POST /pr/action` 响应。 */
+export interface PrActionResponse {
+  detail: PrDetail
+}
+
+/** `POST /pr/ai-review` 请求体。 */
+export interface PrAiReviewRequest {
+  repoId: number
+  iid: number
+  template: 'review' | 'test'
+  scope: 'full' | 'code-only' | 'files'
+  files?: string[]
+  autoApprove: boolean
+}
+
+/** `POST /pr/ai-review` 响应：只表示「已投递给会话」，结论由子智能体自己写回 PR。 */
+export interface PrAiReviewResponse {
+  dispatched: boolean
+  promptPreview: string
+  autoApprove: boolean
 }

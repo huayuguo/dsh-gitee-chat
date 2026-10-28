@@ -6,7 +6,7 @@
  * ⚠️ **不要再把配置入口做进「Gitee 项目」标签页**（曾经有一个 `⚙ 设置` 弹窗，已删除）：
  * 那个标签页只在 Gitee 模式的会话里才有内容，而"能不能进 Gitee 模式"和"有没有 token"
  * 本来就可能互为前提 —— 把配置放进标签页，等于让使用者先有 token 才能找到配 token 的地方。
- * 机器级配置就该待在机器级的设置页里。
+ * 机器级配置就该待在机器级的设置页里。见 `DESIGN.md` §30。
  *
  * `TokenForm` 干实际的事：状态行 + 输入 + 保存 →
  * `POST /api/gitee-chat/token` → 宿主写 `~/.dsh/.gitee-chat/token` → gq 脚本下次调用即读到。
@@ -18,9 +18,15 @@ import { createElement as h, useCallback, useEffect, useState } from 'react'
 import {
   BoardApiError,
   fetchEnterprises,
+  fetchSettings,
   fetchTokenStatus,
   postEnterprise,
+  postSettings,
   postToken,
+  fetchSettings,
+  postSettings,
+  type GiteeSettings,
+  type GiteeSettings,
   type EnterpriseEntry,
   type EnterpriseListResponse,
 } from './api.ts'
@@ -215,6 +221,132 @@ export function EnterprisePicker(props: { reloadKey?: number }) {
 }
 
 /**
+ * 缓存 / 后台刷新开关（写本地覆盖，宿主每次现读 → **点保存即生效**）。
+ *
+ * 为什么放在这一页而不是「设置 → 插件 → 插件管理」：使用者的心智是
+ * 「Gitee 的事都在 Gitee 那一页配」（token、企业、缓存放一起）。
+ * 宿主那两个 volatile 字段仍然存在（插件管理里的表单也能改），
+ * 本地覆盖优先，两边不冲突。
+ *
+ * @param props.onSaved - 保存成功后的回调。
+ */
+export function CacheSettingsForm(props: { onSaved?: () => void }) {
+  const [values, setValues] = useState<GiteeSettings | null>(null)
+  const [path, setPath] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState<Msg>(null)
+
+  useEffect(() => {
+    const ctrl = new AbortController()
+    void fetchSettings(ctrl.signal)
+      .then((res) => {
+        setValues(res.values)
+        setPath(res.path)
+      })
+      .catch(() => { /* 静默：整块不出现而已，不打断 token 配置 */ })
+    return () => ctrl.abort()
+  }, [])
+
+  const patch = useCallback((next: Partial<GiteeSettings>) => {
+    setValues((prev) => (prev === null ? prev : { ...prev, ...next, cache: { ...prev.cache, ...next.cache }, autoRefresh: { ...prev.autoRefresh, ...next.autoRefresh } }))
+  }, [])
+
+  const save = useCallback(async () => {
+    if (values === null) return
+    setBusy(true)
+    setMsg(null)
+    try {
+      const res = await postSettings({ cache: values.cache, autoRefresh: values.autoRefresh })
+      setValues(res.values)
+      setMsg({ kind: 'ok', text: '已保存，下一次取数就按新值走（不用重启）。' })
+      props.onSaved?.()
+    } catch (error) {
+      setMsg({ kind: 'err', text: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }, [values, props])
+
+  if (values === null) return null
+
+  const check = (
+    checked: boolean,
+    label: string,
+    onChange: (next: boolean) => void,
+  ) => h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, cursor: 'pointer' } },
+    h('input', { type: 'checkbox', checked, onChange: (e: { target: { checked: boolean } }) => onChange(e.target.checked) }),
+    h('span', null, label),
+  )
+
+  const num = (
+    value: number,
+    label: string,
+    min: number,
+    onChange: (next: number) => void,
+  ) => h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 } },
+    h('span', null, label),
+    h('input', {
+      type: 'number',
+      min,
+      value,
+      onChange: (e: { target: { value: string } }) => {
+        const next = Number.parseInt(e.target.value, 10)
+        if (Number.isFinite(next)) onChange(next)
+      },
+      style: { ...inputStyle, width: 96, fontFamily: 'inherit' },
+    }),
+  )
+
+  return h('div', null,
+    h('div', { style: { fontSize: 15, fontWeight: 600, marginBottom: 8 } }, '缓存与后台刷新'),
+    h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', marginBottom: 10 } },
+      '看板数据默认缓存 60 秒：命中就秒开，过期才回源。',
+      h('br'),
+      '本地覆盖写在 ', h('code', null, path || '~/.dsh/.gitee-chat/config.json'), '，保存后即时生效。',
+    ),
+    h('div', {
+      style: {
+        border: '1px solid var(--dsw-alias-border-l1)',
+        borderRadius: 6,
+        padding: '10px 12px',
+        fontSize: 13,
+        marginBottom: 10,
+      },
+    },
+      h('div', { style: { fontWeight: 600, marginBottom: 6 } }, '缓存'),
+      check(values.cache.agentReadable, '会话里的 AI 可以读看板快照（关掉 = 只能现拉，更慢但绝不读旧数据）', (v) => patch({ cache: { agentReadable: v } })),
+      check(values.cache.persist, '快照落盘（重启后首屏不用再冷启一次）', (v) => patch({ cache: { persist: v } })),
+      num(values.cache.ttlSeconds, '新鲜期（秒，0 = 关闭缓存，最小 10）', 0, (v) => patch({ cache: { ttlSeconds: v } })),
+    ),
+    h('div', {
+      style: {
+        border: '1px solid var(--dsw-alias-border-l1)',
+        borderRadius: 6,
+        padding: '10px 12px',
+        fontSize: 13,
+        marginBottom: 10,
+      },
+    },
+      h('div', { style: { fontWeight: 600, marginBottom: 6 } }, '后台刷新'),
+      check(values.autoRefresh.enabled, '启用定期刷新（只在最近有人看面板时才真去拉）', (v) => patch({ autoRefresh: { enabled: v } })),
+      num(values.autoRefresh.intervalSeconds, '刷新间隔（秒，最小 10）', 10, (v) => patch({ autoRefresh: { intervalSeconds: v } })),
+      num(values.autoRefresh.idleMinutes, '闲置多少分钟后暂停（分钟）', 1, (v) => patch({ autoRefresh: { idleMinutes: v } })),
+    ),
+    h('button', { onClick: () => void save(), disabled: busy, style: btnStyle(true) }, busy ? '保存中…' : '保存'),
+    msg === null
+      ? null
+      : h('div', {
+          style: {
+            fontSize: 12,
+            marginTop: 8,
+            lineHeight: 1.6,
+            color: msg.kind === 'ok' ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)',
+          },
+        }, msg.text),
+  )
+}
+
+/**
  * 「设置 → Gitee 企业项目」分节（正式入口）。
  *
  * 槽位 `settings.section` 传给分节的 owner props 只有 `close`，这里用不上 ——
@@ -238,13 +370,20 @@ export function GiteeSettingsSection(_props: { close?: () => void }) {
         marginTop: 20,
         paddingTop: 14,
         borderTop: '1px solid var(--dsw-alias-border-l1)',
+      },
+    }, h(CacheSettingsForm, {})),
+    h('div', {
+      style: {
+        marginTop: 20,
+        paddingTop: 14,
+        borderTop: '1px solid var(--dsw-alias-border-l1)',
         fontSize: 12,
         color: 'var(--dsw-alias-label-secondary)',
       },
     },
       h('div', { style: { fontWeight: 600, marginBottom: 6, color: 'var(--dsw-alias-label-primary)' } }, '配好之后怎么用'),
       h('div', null,
-        '新建会话时在预设里选「Gitee 企业项目管理」或「Gitee 项目执行」；',
+        '新建会话时在预设里选「Gitee 项目管理」；',
         '会话里会多出「Gitee 项目」标签页 —— 项目看板、仓库 WIKI、知识库文档、固定分析都在那里。',
       ),
       h('div', { style: { marginTop: 6 } },

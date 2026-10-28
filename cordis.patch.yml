@@ -18,7 +18,7 @@
 #   `- id: gitee-chat` + `disabled: true`，于是 Gitee preset 还在列表里、
 #   但 `giteeChat` 服务不存在 → `dsh-gitee-chat/agent` 永远 pending →
 #   预设红标「加载失败」。拆成【本文件纯 insert + 配置走 profile 补丁】
-#   之后，市场的热挂载能成功，这条路就断了。
+#   之后，市场的热挂载能成功，这条路就断了（见 DESIGN.md §35）。
 #   同理：skill 行因为**必须带 config** 而单独放在 `cordis.skills.patch.yml`。
 #
 # 配置从哪来（不写在这里，是因为它与默认值逐项相同，写在这里会破坏纯 insert）：
@@ -37,7 +37,7 @@
 #   1. 作为 bundle 安装：dsh plugin --profile <profile> add "file:<本目录>"
 #      （桌面版用应用自带的 dsh 命令，profile 固定 desktop；dsh web 默认 web）。
 #      必须是 `file:` 而不是裸路径：裸路径会被记成 `link:`，模块 realpath 落在
-#      profiles/** 之外，agent 半的裸导入解析不到。
+#      profiles/** 之外，agent 半的裸导入解析不到（见 DESIGN.md §23）。
 #   2. 手工挂载：把下面 insert 段合并进 profile 的 cordis.patch.yml
 #
 # agent 半（在 preset 的组合里）：

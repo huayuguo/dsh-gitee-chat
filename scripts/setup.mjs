@@ -5,6 +5,8 @@
  * 设计前提：使用者不该被要求打开任何文件。所以这个脚本把「安装」拆成
  * AI 能一步一步驱动的四个动词：
  *
+ *   env         协作环境体检：git / Obsidian(+skill) / Gitee 企业 MCP / 企业 token /
+ *               Apifox（软件开发成员）/ 测试协作工具（预留）；`--install <id>` 装单项
  *   detect      探测环境事实（JSON）——token 在哪、有几个企业、MCP 在不在、装到哪
  *   questions   输出**该问用户的问题**（JSON，带推荐默认值与「不问也能跑」的兜底）
  *   apply       按 answers 写配置：profile 的 cordis.patch.yml + 本地配置 + preset + skill
@@ -444,11 +446,15 @@ function parseConfigBlock(lines) {
 /**
  * MCP 后端能不能用 —— 必须按 preset 真正的三级回落判，**不能只看 PATH**。
  *
- * ⚠️ 随包二进制落在**用户级 bin**（`~/.local/bin`；Windows
+ * ⚠️ 0.5.1 起随包二进制落在**用户级 bin**（`~/.local/bin`；Windows
  * `%USERPROFILE%\.local\bin`）—— Linux 上通常已在 PATH 里，Windows 上默认不在。
- * 不能只看 `which('mcp-gitee-ent')`：落地位置本来就不在 Windows 的 PATH 上，
- * 那样会误报"未找到"，生成的补丁里留下与事实矛盾的注释，还劝人去 `go install`
- * —— 与 SKILL 里「随包分发、别让使用者装 Go」那条硬规则正面冲突。
+ * 旧代码（0.5.0）把 `which('mcp-gitee-ent')` 的结果当成"可用与否"，
+ * 而那时的落地位置 `$DSH_HOME/.gitee-chat/bin/` **本来就不在 PATH 上**，
+ * 后果比误报更糟：
+ *   · 生成的补丁里留下一条自相矛盾的注释「MCP 可执行 : 未找到（MCP 工具会挂不上）」，
+ *     而**同一轮 `apply` 刚刚把 51 个工具的随包二进制落地了**；
+ *   · `problems` 直接劝人去 `go install` —— 与 SKILL 里「随包分发、别让使用者装 Go」
+ *     那条硬规则正面冲突。
  * 优先级与 `src/host/mcpBinary.ts` 的 `ensureMaterialized()` 保持一致。
  */
 function resolveMcpBinary() {
@@ -465,7 +471,9 @@ function resolveMcpBinary() {
       detail: `随包分发（${vendored.key} · ${vendored.toolCount ?? '?'} 个工具）`
         + (vendored.installed
           ? (vendored.onPath ? '' : `，落地在 ${vendored.target}（不在 PATH 上）`)
-          : '，尚未落地 —— 跑一次 apply 或重启宿主会自动补上'),
+          : (vendored.legacyPresent
+            ? `，尚未迁到 ${vendored.target} —— 暂用 0.5.0 的旧副本，跑一次 apply 或重启宿主会迁移`
+            : '，尚未落地 —— 跑一次 apply 或重启宿主会自动补上')),
     }
   }
   const onPath = which('mcp-gitee-ent')
@@ -506,7 +514,7 @@ async function detect() {
   // preset 的交付方式在 DSH 0.1.7 变了：不再是"拷到 `$DSH_HOME/.agent-presets/` 的文件"，
   // 而是本包 bundle patch 列表里的 `presets/*.patch.yml`（照 `dsh-web-app/presets/*` 的做法）。
   // 所以"就位"= 补丁文件在仓库里 **且**列进了 package.json 的 `dsh.bundle.patch` ——
-  // 没列进去的文件装到别人机器上根本不会被组合。
+  // 没列进去的文件装到别人机器上根本不会被组合。见 DESIGN.md §29。
   const installedPresets = deliveredPresets()
 
   // 企业列表：只在有 token 时试一次；失败不影响其它结论
@@ -528,7 +536,7 @@ async function detect() {
   const problems = []
   if (!token.found) {
     problems.push('没有找到 Gitee token：取数会报「未配置 token」。'
-      + '**推荐在界面里填**：应用「设置 → Gitee 企业项目」（存完即时生效，不用重启）；'
+      + '**推荐在界面里填**：应用「设置 → Gitee 企业项目」（0.4.1 起；存完即时生效，不用重启）；'
       + `也可以自己放：环境变量 ${TOKEN_ENVS[0]}，或文件 ${tokenFileCandidates()[0]}`)
   }
   if (!mcp.found) {
@@ -629,28 +637,159 @@ function tokenEnv() {
   return env
 }
 
+// ── 协作环境体检（env）─────────────────────────────────────────────────────
+//
+// 这一节回答的是"**基本项目协作环境**齐不齐"，不只是本插件自己能不能跑：
+//   git / Obsidian（含 CLI 与它的 skill 集）/ Gitee 企业版 MCP / 企业 token /
+//   Apifox 协作工具（**仅当使用者在软件开发项目里**）/ 测试协作工具（预留）
+//
+// 两条设计原则：
+//   1. **声明式注册表**：要加一个工具，只在 ENV_TOOLS 里加一条，不改检测逻辑。
+//      这就是"后期加入测试协作工具的预留"——预留的是一个**位置**，不是一个 TODO。
+//   2. **不误报**：检测不到 ≠ 没装。比如 Obsidian 的 CLI 在 App 没运行时也会
+//      「找不到 Obsidian」，那必须记为"装了但 App 没开"，而不是"没装"。
+
+/**
+ * 协作工具注册表。
+ *
+ * `scope` 决定"要不要强求"：
+ *   all          —— 任何使用者都要（缺了就是环境不齐）
+ *   software-dev —— 只在「软件开发项目的下属成员」身上强求（Apifox）
+ *   future       —— 预留位：登记了但当前不判失败，接进来时把 scope 改成 all/software-dev
+ */
 /**
  * 随包 MCP 后端的三个入口 —— 导出是给测试与运维用的。
  *
  * 之所以要导出：`materializeMcp()` 也需要能被单独调用（比如"只把二进制补上，
  * 别动 profile 补丁"），而走 `apply` 会顺带重写补丁里的探测快照。
  */
-export { inspectVendoredMcp, materializeMcp, mcpInstallDir, mcpTargetPath, readMcpManifest }
+export { inspectVendoredMcp, materializeMcp, mcpInstallDir, mcpLegacyPath, mcpTargetPath, readMcpManifest }
 
 // agent 半可解析性的三件套：冒烟里用**临时 fixture** 复现「link: 装法解析不到
 // 依赖闭包」并验证自愈（真跑子进程，不 mock 解析行为）。
 export { dependencySpec, probeAgentImport, repairAgentResolution, ensureAgentHalf }
 
 // Windows 上的两个真机 bug 的回归面：
-//  · which()：PATH 分隔符/PATHEXT 写死 → `detect` 在 Windows 上永远误报缺失。
+//  · which()：PATH 分隔符/PATHEXT 写死 → `env`/`detect` 在 Windows 上永远误报缺失。
 //    env/platform 可注入，Windows 用例因此能在 Linux 上跑。
 //  · inspectSkill()：把"解析结果 == 源码目录"当成效判据，只对 `link:` 成立；
 //    `file:`（官方推荐）加载的是副本，于是稳定误报「未生效」。
 export { which, inspectSkill, evalSkillExpr }
 
+export const ENV_TOOLS = [
+  {
+    id: 'git',
+    label: 'Git',
+    scope: 'all',
+    why: '一切协作的底座：拉代码、看 diff、提交、开 PR 都靠它。',
+    binary: 'git',
+    probe: ['--version'],
+    install: {
+      linux: 'sudo apt install -y git  # 或 dnf/pacman 对应包',
+      macos: 'brew install git',
+      doc: 'https://git-scm.com/downloads',
+    },
+  },
+  {
+    id: 'obsidian',
+    label: 'Obsidian（桌面端 + CLI）',
+    scope: 'all',
+    why: '团队知识库的载体：文档、图谱、Canvas 都在这儿；它的 skill 集让 AI 能直接读写知识库。',
+    binary: 'obsidian',
+    probe: ['--version'],
+    // CLI 在 Obsidian 没运行时也会失败 —— 那是"没在运行"，不是"没装"
+    probeOptional: true,
+    // 三个平台的数据目录都列上：这是"装了但不在 PATH"唯一的兜底证据
+    alsoDirs: ['~/.config/obsidian', '%APPDATA%/obsidian', '~/Library/Application Support/obsidian'],
+    skills: ['obsidian-cli', 'obsidian-markdown', 'json-canvas', 'obsidian-bases', 'obsidian-canvas-creator'],
+    install: {
+      doc: 'https://obsidian.md/download  （CLI 随桌面端提供；用它之前先把 Obsidian 打开。'
+        + '装完如果 `obsidian` 命令用不了，把安装目录加进 PATH —— Windows 的安装器有 "Add to PATH" 勾选项）',
+    },
+  },
+  {
+    id: 'gitee-mcp',
+    label: 'Gitee 企业版 MCP',
+    scope: 'all',
+    why: '项目管理的数据面：项目/工作项/PR/迭代都通过它读写。缺了它，标签页与固定分析仍可用，但 AI 不能建工作项、改状态。',
+    binary: 'mcp-gitee-ent',
+    probe: ['--version'],
+    probeOptional: true,
+    /**
+     * 随包分发：linux/windows 的 amd64 二进制就在包里（vendor/mcp-gitee-ent/），
+     * 安装时自动落地到**用户级 bin**（0.5.1 起：POSIX `~/.local/bin`，
+     * Windows `%USERPROFILE%\.local\bin`）—— 公开 MCP 的标准位置，
+     * 别的 MCP 客户端也能直接调；**同事不需要 Go 环境**。
+     * 之所以不直接用上游 npm 包 `@gitee/mcp-gitee-ent`（它有平台包，
+     * 也是 esbuild/sharp 那套做法）：**它没有 `create_program`（建项目）**，
+     * 文档工具也换成了另一族。我们的能力矩阵依赖那 10 个工具。
+     */
+    vendored: true,
+    install: {
+      // 正常情况下什么都不用做 —— 随包二进制会自动落地
+      bundled: '无需操作：随包二进制在安装时自动落地（linux / windows amd64）',
+      local: '自己编（需要 Go）：cd <本插件同级的 dsh-mcp-gitee-ent> && go install .',
+      remote: 'go install gitee.com/oschina/mcp-gitee-ent@latest  ← 注意上游版没有 create_program（建项目）',
+      doc: '本平台未随包（如 arm64 / macOS）时走上面两条，或用 MCP_GITEE_ENT_BIN 指到已有二进制',
+    },
+  },
+  {
+    id: 'gitee-token',
+    label: 'Gitee 企业版 token',
+    scope: 'all',
+    why: '企业版端点要求「MCP 应用 token」，与个人访问令牌不是一回事。缺了取数会明确报"未配置 token"。',
+    token: true,
+    install: {
+      doc: '在 Gitee 企业版后台申请 MCP 应用 token，然后**在界面里填**：应用「设置 → Gitee 企业项目」'
+        + '（0.4.1 起，推荐 —— 存完即时生效）。也可以二选一：'
+        + `导出环境变量 ${TOKEN_ENVS[0]}（重启 dsh 生效），或写入 $DSH_HOME/.gitee-chat/token（内容为纯 token）`,
+      note: '**绝不要**把 token 贴进对话或提交进仓库。',
+    },
+  },
+  {
+    id: 'apifox',
+    label: 'Apifox 协作工具（CLI + 技能集）',
+    scope: 'software-dev',
+    why: '接口协作：接口文档、Mock、自动化测试、迭代分支。软件开发项目的下属成员需要它才能和研发对齐接口。',
+    binary: 'apifox',
+    probe: ['--version'],
+    skills: [
+      'apifox-cli', 'apifox-cli-checkup', 'apifox-import-export', 'apifox-branch',
+      'apifox-workflow-api-lifecycle', 'apifox-test-case', 'apifox-test-scenario', 'apifox-test-automation',
+    ],
+    install: {
+      auto: ['npm', ['i', '-g', 'apifox-cli@latest', '--registry=https://registry.npmmirror.com/']],
+      after: 'apifox login --with-token <TOKEN>   # 令牌在 Apifox「账号设置 → API 访问令牌」创建',
+      doc: 'https://apifox.com/help/  （CLI 文档）',
+    },
+  },
+  {
+    // 预留位：接测试协作工具时改这一条即可（把 scope 改成 all 或 software-dev）
+    id: 'test-collab',
+    label: '测试协作工具（预留）',
+    scope: 'future',
+    why: '后续接入测试协作（用例库 / 缺陷跟踪 / 测试报告）时在这里登记：二进制名、期望可见的 skill 名、安装方式。'
+      + '检测逻辑不用改 —— 注册表就是给这件事留的位置。',
+    binary: null,
+    skills: [],
+    install: { note: '尚未接入。接入时：① 在上面加 binary/skills；② 把 scope 改成 all 或 software-dev。' },
+  },
+]
+
+/**
+ * 发现 skill 根目录。
+ *
+ * 顺序与 `@deepseek-ai/dsh-skill-filesystem` 的 `roots()` 一致（抄自其源码）：
+ *   project .dsh/skills → project .agents/skills → customSkillDirs
+ *   → $DSH_HOME/skills → $DSH_AGENTS_HOME|~/.agents/skills → $DSH_BUNDLED_SKILL_DIR
+ *
+ * `customSkillDirs` 从「profile 补丁 + 已装 preset + 已装 bundle」里尽力抽取：
+ * 支持纯字符串路径，也支持 `new URL('skills/', baseUrl)` 这种相对写法
+ * （baseUrl 对该文件所在目录求值 —— 与 DSH 的语义一致）。
+ */
 // ── 本包 bundle 补丁的读取 + 插件市场半状态修复 ──────────────────────────────
 //
-// 本包的 bundle 补丁不止一个文件（host 行在 cordis.patch.yml、skill 行
+// 本包的 bundle 补丁不止一个文件（0.4.5 起 host 行在 cordis.patch.yml、skill 行
 // 在 cordis.skills.patch.yml、preset 在 presets/*.patch.yml），所以"某一行在不在
 // 补丁里"一律看 package.json 的 dsh.bundle.patch 声明的**全部**文件。
 
@@ -742,7 +881,7 @@ function preservedRowsInBlock(regionLines) {
 }
 
 /**
- * 修复插件市场（dshmarket）留下的半状态（2026-09-30 定位）。
+ * 修复插件市场（dshmarket）留下的半状态（2026-09-30 定位，见 DESIGN.md §35）。
  *
  * 成因：市场只认字符串形式的 `dsh.bundle.patch`，本包是数组 → 它把本包当成
  * "没有补丁"，关插件时既把包移出 `dsh.profile.bundles`、又把 `disabled: true`
@@ -774,6 +913,130 @@ function repairMarketHalfState(profile, opts = {}) {
   }
 }
 
+function discoverSkillRoots(cwd = process.cwd()) {
+  const roots = []
+  const push = (path, source) => {
+    if (typeof path !== 'string' || path === '') return
+    const abs = path.startsWith('~') ? join(homedir(), path.slice(1)) : path
+    if (!roots.some((r) => r.path === abs)) roots.push({ path: abs, source })
+  }
+
+  push(join(cwd, '.dsh/skills'), 'project-dsh')
+  push(join(cwd, '.agents/skills'), 'project-agents')
+
+  // customSkillDirs：从各处组合文件里抽
+  const comboFiles = []
+  const profiles = listProfiles()
+  for (const p of profiles) comboFiles.push({ path: p.patchPath, base: p.dir })
+  // preset 也是组合文件（本包的 preset 随 bundle patch 交付，不再是 $DSH_HOME/.agent-presets/）
+  for (const f of listPresetPatchFiles()) {
+    comboFiles.push({ path: join(root, 'presets', f), base: join(root, 'presets') })
+  }
+  // 本包自己的 bundle 补丁（host 行 + skill 行 + preset 行）。
+  // ⚠️ base 必须是**装了本插件的 profile 目录**，不能是本包目录：补丁里的 !!js
+  //    表达式按 profile 目录求值（DESIGN.md §17），拿仓库目录当锚点会算出一个
+  //    不存在的兜底路径，scanSkills 就看不到本包的 skill。
+  const bundleProfile = profiles.find((p) => p.hasBundle) ?? profiles[0]
+  for (const path of bundlePatchFiles()) {
+    comboFiles.push({ path, base: bundleProfile === undefined ? root : bundleProfile.dir })
+  }
+  for (const { path, base } of comboFiles) {
+    if (!existsSync(path)) continue
+    let text = ''
+    try {
+      // 先把行尾归一成 LF：补丁在 Windows 结账（core.autocrlf）里是 CRLF，
+      // 下面那两个按 `\n` 写的正则就一条都匹配不上 —— custom skill 根会在
+      // Windows 开发机上凭空消失（Linux/CI 上碰巧是对的）。
+      text = readFileSync(path, 'utf8').replace(/\r\n/g, '\n')
+    } catch { continue }
+    for (const m of text.matchAll(/customSkillDirs:\s*\n((?:\s*-.*\n)+)/g)) {
+      for (const line of m[1].split('\n')) {
+        if (!line.trim().startsWith('-')) continue
+        let value = line.replace(/^\s*-\s*/, '').trim()
+        if (value.startsWith('!!js')) {
+          const expr = /^!!js\s*"([\s\S]*)"$/.exec(value)
+          if (expr === null) continue
+          value = evalSkillExprIn(expr[1], `${pathToFileURL(base).href}/`) ?? ''
+        } else {
+          value = value.replace(/^['"]|['"]$/g, '')
+        }
+        push(value, 'custom')
+      }
+    }
+  }
+
+  push(join(dshHome, 'skills'), 'user-dsh')
+  push(join(process.env.DSH_AGENTS_HOME ?? join(homedir(), '.agents'), 'skills'), 'user-agents')
+  if (process.env.DSH_BUNDLED_SKILL_DIR !== undefined) push(process.env.DSH_BUNDLED_SKILL_DIR, 'bundled')
+
+  return roots
+}
+
+/** 按 `!!js` 语义在指定 baseUrl 下求值（与 DSL 的 `with (ctx)` 一致）。 */
+function evalSkillExprIn(expr, baseUrl) {
+  try {
+    // eslint-disable-next-line no-new-func
+    return new Function('baseUrl', `with ({ baseUrl }) { return eval(${JSON.stringify(expr)}) }`)(baseUrl)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 扫出所有根里可见的 skill（名字 → 路径 + 来源根）。
+ * @param {{path:string,source:string}[]} roots
+ */
+function scanSkills(roots) {
+  const found = new Map()
+  const scanned = []
+  for (const r of roots) {
+    const exists = existsSync(r.path)
+    let names = []
+    if (exists) {
+      try {
+        names = readdirSync(r.path, { withFileTypes: true })
+          .filter((e) => (e.isDirectory() ? existsSync(join(r.path, e.name, 'SKILL.md')) : e.name.endsWith('.md')))
+          .map((e) => (e.isDirectory() ? e.name : e.name.replace(/\.md$/, '')))
+      } catch { /* 读不到就当空 */ }
+    }
+    scanned.push({ ...r, exists, count: names.length })
+    for (const n of names) if (!found.has(n)) found.set(n, { name: n, root: r.path, source: r.source })
+  }
+  return { skills: found, roots: scanned }
+}
+
+/** 跑一个探测命令，返回 stdout 首行（失败返回 null）。 */
+async function probeBinary(binary, args) {
+  const full = which(binary)
+  if (full === null) return { found: false, path: null, output: null, error: null }
+  try {
+    const { stdout, stderr } = await run(full, args ?? [], { timeout: 20_000, maxBuffer: 1024 * 1024 })
+    const line = String(stdout || stderr).trim().split('\n')[0]
+    return { found: true, path: full, output: line, error: null }
+  } catch (error) {
+    // 命令存在但退出非零（如 Obsidian 没在运行）—— 那也是"装了"
+    const detail = String(error?.stdout || error?.stderr || error?.message || '').trim().split('\n')[0]
+    return { found: true, path: full, output: null, error: detail.slice(0, 200) }
+  }
+}
+
+/** 展开 `~`。 */
+function expandHome(p) {
+  return p.startsWith('~') ? join(homedir(), p.slice(1)) : p
+}
+
+/**
+ * 展开 `~` 与环境变量模板（如 `%APPDATA%`）。
+ *
+ * 为什么需要它：同一个应用在三个平台上的数据目录完全不同，而 `alsoDirs` 是
+ * 「装了但不在 PATH」**唯一**的兜底证据。只写 Linux 的 `~/.config/...`，
+ * Windows 上就永远匹配不上 —— 于是"装了却没装"照样误报（真机实测）。
+ * 变量没定义时保留原样，这样不匹配的模板会因为目录不存在而被自然过滤掉。
+ */
+function expandToolDir(p) {
+  return expandHome(p).replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (m, name) => process.env[name] ?? m)
+}
+
 // ── 随包 MCP 后端（同事不需要 Go 环境）──────────────────────────────────────
 //
 // ⚠️ 下面这三个值与另外两处**必须一致**，改一处就要改三处：
@@ -795,7 +1058,7 @@ function mcpPlatformKey(platform = process.platform, arch = process.arch) {
 }
 
 /**
- * 二进制落地的**安装目录**（= 跨平台用户级 bin）。
+ * 二进制落地的**安装目录**（0.5.1 起 = 跨平台用户级 bin）。
  *
  * 与 `src/host/mcpBinary.ts` 的 `userBinDir()`、两个 preset 的 `!!js` 三处必须一致：
  *   · Windows：`%USERPROFILE%\.local\bin`（pipx / uv 在 Windows 的默认 bin 目录）
@@ -814,6 +1077,11 @@ function mcpTargetPath(platform = process.platform) {
   return join(mcpInstallDir(platform), `mcp-gitee-ent${ext}`)
 }
 
+/** 0.5.0 及之前的私有位置（只用于迁移清理，见 `materializeMcp()`）。 */
+function mcpLegacyPath(platform = process.platform) {
+  const ext = platform === 'windows' || platform === 'win32' ? '.exe' : ''
+  return join(dshHome, '.gitee-chat', 'bin', `mcp-gitee-ent${ext}`)
+}
 
 /** 目录是否在 PATH 上（Windows 不区分大小写）。 */
 function isDirOnPath(dir) {
@@ -857,6 +1125,7 @@ function inspectVendoredMcp() {
   const key = mcpPlatformKey()
   const entry = manifest?.platforms?.[key]
   const target = mcpTargetPath()
+  const legacy = mcpLegacyPath()
   const installed = existsSync(target)
   return {
     manifest,
@@ -872,15 +1141,18 @@ function inspectVendoredMcp() {
     vendoredFileExists: entry === undefined ? false : existsSync(join(MCP_VENDOR_DIR, entry.file)),
     /** 安装目录是否在 PATH 上（Windows 默认不在，要给提示）。 */
     onPath: isDirOnPath(dirname(target)),
+    /** 0.5.0 的私有残留（迁移是否完成看它）。 */
+    legacy,
+    legacyPresent: existsSync(legacy),
   }
 }
 
 /**
- * 清理落地过程的临时文件（`<target>.tmp-<pid>`）。
+ * 清理落地过程的临时文件（`<target>.tmp-<pid>`）与 0.5.0 的私有副本。
  * 绝不抛：Windows 上旧会话可能占着 `.exe`，删不掉就留着下次再清。
- * @returns {{tmp: number}}
+ * @returns {{tmp: number, legacyRemoved: boolean}}
  */
-function sweepMcpArtifacts(target) {
+function sweepMcpArtifacts(target, legacy) {
   let tmp = 0
   const prefix = `${basename(target)}.tmp-`
   try {
@@ -889,7 +1161,16 @@ function sweepMcpArtifacts(target) {
       try { rmSync(join(dirname(target), name), { force: true }); tmp += 1 } catch { /* 占用中 */ }
     }
   } catch { /* 目录不在 */ }
-  return { tmp }
+  let legacyRemoved = false
+  try {
+    if (existsSync(legacy)) {
+      rmSync(legacy, { force: true })
+      legacyRemoved = true
+    }
+    const dir = dirname(legacy)
+    if (readdirSync(dir).length === 0) rmSync(dir, { recursive: true, force: true })
+  } catch { /* 占用/权限：留着 */ }
+  return { tmp, legacyRemoved }
 }
 
 /**
@@ -899,6 +1180,7 @@ function sweepMcpArtifacts(target) {
  * 与 `src/host/mcpBinary.ts` 的 `ensureMaterialized()` 是同一件事的两个入口 ——
  * 安装期先落一份，让**新会话立刻可用**，不必等到宿主重启。
  *
+ * 迁移（0.5.1）：落好之后清掉 0.5.0 的私有副本 `$DSH_HOME/.gitee-chat/bin/…`；
  * 目标位置若已有**别的**二进制（自己 go install 的、上游 npm 版），先让到 `<name>.bak`。
  *
  * @returns {{ok: boolean, source: string, path: string, copied: boolean, detail: string}}
@@ -924,16 +1206,17 @@ function materializeMcp() {
     : `；注意 ${dirname(info.target)} 不在 PATH 上，其它 MCP 客户端要直接调 \`${basename(info.target)}\` 需把它加进 PATH`
 
   if (info.matches === true) {
-    sweepMcpArtifacts(info.target)
+    const swept = sweepMcpArtifacts(info.target, info.legacy)
     return {
       ok: true, source: 'vendored', path: info.target, copied: false,
-      detail: `随包 MCP 二进制已就位：${info.target}（${info.toolCount} 个工具）` + pathHint,
+      detail: `随包 MCP 二进制已就位：${info.target}（${info.toolCount} 个工具）`
+        + (swept.legacyRemoved ? '；已清掉 0.5.0 的私有副本' : '') + pathHint,
     }
   }
 
   try {
     mkdirSync(dirname(info.target), { recursive: true })
-    sweepMcpArtifacts(info.target)
+    sweepMcpArtifacts(info.target, info.legacy)
     // 目标已有**别的**二进制 → 让到 `.bak` 再落（只保留最近一份）。
     let backedUp = false
     if (existsSync(info.target)) {
@@ -952,11 +1235,12 @@ function materializeMcp() {
       try { rmSync(tmp, { force: true }) } catch { /* 占用中 */ }
       throw error
     }
-    sweepMcpArtifacts(info.target)
+    const swept = sweepMcpArtifacts(info.target, info.legacy)
     return {
       ok: true, source: 'vendored', path: info.target, copied: true,
       detail: `已落地随包 MCP 二进制：${info.target}（${info.toolCount} 个工具）`
-        + (backedUp ? `；原文件不是随包版本，已备份为 ${info.target}.bak` : '') + pathHint,
+        + (backedUp ? `；原文件不是随包版本，已备份为 ${info.target}.bak` : '')
+        + (swept.legacyRemoved ? '；已清掉 0.5.0 的私有副本' : '') + pathHint,
     }
   } catch (error) {
     return {
@@ -964,6 +1248,206 @@ function materializeMcp() {
       detail: `落地失败：${error.message}`,
     }
   }
+}
+
+/**
+ * 判定「使用者是不是软件开发项目的下属成员」。
+ *
+ * 判据（可解释，且只用一次 `gq mywork`）：
+ *   我参与的项目里，**有仓库**（`reposCount > 0`）→ 是；
+ *   否则我的工作项类型里出现「需求 / 缺陷 / bug」→ 是；
+ *   否则 → 否。没有 token 时返回"未知"，交给 AI 问使用者，不猜。
+ */
+async function softwareDevSignal() {
+  const token = locateToken()
+  if (!token.found) {
+    return { known: false, softwareDev: null, why: '没有 token，无法从 Gitee 判定；需要问使用者' }
+  }
+  try {
+    const { stdout } = await run(process.execPath, [join(root, 'scripts/gitee/gq.mjs'), 'mywork', '--json'], {
+      env: tokenEnv(), cwd: root, timeout: 60_000, maxBuffer: 16 * 1024 * 1024,
+    })
+    const payload = JSON.parse(String(stdout).trim().split('\n').pop())
+    if (payload.ok !== true) return { known: false, softwareDev: null, why: `取数失败：${payload.error ?? '未知'}` }
+
+    const withRepos = (payload.programs ?? []).filter((p) => p.reposCount > 0)
+    if (withRepos.length > 0) {
+      return {
+        known: true, softwareDev: true,
+        why: `我参与的 ${payload.programs.length} 个项目里有 ${withRepos.length} 个带仓库`
+          + `（${withRepos.slice(0, 3).map((p) => p.name).join('、')}）→ 软件开发项目`,
+      }
+    }
+    return {
+      known: true,
+      softwareDev: false,
+      why: `我参与的 ${(payload.programs ?? []).length} 个项目都没有仓库 → 不按软件开发项目对待`
+        + '（若判断有误，直接回答"是"即可覆盖）',
+    }
+  } catch (error) {
+    return { known: false, softwareDev: null, why: `判定异常：${String(error?.stderr || error?.message || error).slice(0, 200)}` }
+  }
+}
+
+/**
+ * 协作环境体检。
+ * @param {{ cwd?: string, withSignal?: boolean }} [opts]
+ */
+async function envCheck(opts = {}) {
+  const roots = discoverSkillRoots(opts.cwd ?? process.cwd())
+  const { skills, roots: scannedRoots } = scanSkills(roots)
+  const token = locateToken()
+  const signal = opts.withSignal === false
+    ? { known: false, softwareDev: null, why: '（本次未判定）' }
+    : await softwareDevSignal()
+
+  const tools = []
+  for (const def of ENV_TOOLS) {
+    const item = {
+      id: def.id,
+      label: def.label,
+      scope: def.scope,
+      why: def.why,
+      /** 这一项对本使用者是否"必须"。future 一律不判失败。 */
+      required: def.scope === 'all' || (def.scope === 'software-dev' && signal.softwareDev === true),
+      /** 是否因为适用范围不符而跳过。 */
+      skipped: def.scope === 'software-dev' && signal.softwareDev !== true,
+      ok: false,
+      binary: null,
+      note: null,
+      missingSkills: [],
+      install: def.install ?? null,
+    }
+
+    if (def.token === true) {
+      item.ok = token.found
+      item.binary = token.source
+      if (!token.found) {
+        item.note = `未找到 token。可选位置：环境变量 ${TOKEN_ENVS.join(' / ')}，或 ${tokenFileCandidates().join(' / ')}`
+      }
+    } else if (def.id === 'gitee-mcp') {
+      // 随包二进制优先 —— 同事不需要 Go 环境。
+      //
+      // 「ok」判的是**使用者还需不需要动手**，不是"本地是否已落地"：
+      // 包里有这份二进制，落地是我们（apply / 宿主启动）的事，不该让使用者在
+      // 装之前就看到一个红叉。所以只有"包里本身就缺"才算失败。
+      const mcp = inspectVendoredMcp()
+      const probe = await probeBinary(def.binary, def.probe)
+      if (mcp.manifest === null) {
+        item.ok = false
+        item.note = `缺少随包清单 ${MCP_MANIFEST}；这个包不完整，跑 node scripts/build-mcp.mjs 重新生成`
+      } else if (!mcp.bundled) {
+        // 本平台未随包（如 arm64 / macOS）：回到"自己装"的老路
+        item.binary = probe.path
+        item.ok = probe.found
+        item.note = probe.found
+          ? `随包未覆盖本平台（${mcp.key}），用 PATH 上已有的：${probe.path}`
+          : `随包未覆盖本平台（${mcp.key}），PATH 里也没有 \`${def.binary}\`；`
+            + '自己 go install，或用 MCP_GITEE_ENT_BIN 指到已有二进制'
+      } else if (!mcp.vendoredFileExists) {
+        item.ok = false
+        item.binary = mcp.target
+        item.note = `清单声明了 ${mcp.entry.file}，但包里没有这个文件；跑 node scripts/build-mcp.mjs 重新生成`
+      } else {
+        // 包里有 = 就绪；下面只补充"当前落地状态"，不影响 ok。
+        item.ok = true
+        item.binary = mcp.target
+        item.toolCount = mcp.toolCount
+        if (mcp.matches === true) {
+          item.note = `随包分发（无需 Go）：${mcp.target} · ${mcp.toolCount} 个工具 · sha256 与清单一致`
+            + (mcp.onPath ? '' : `（${dirname(mcp.target)} 不在 PATH 上，其它 MCP 客户端要用需加 PATH）`)
+        } else if (!mcp.installed) {
+          item.note = `随包分发（无需 Go）：${mcp.toolCount} 个工具，尚未落地；`
+            + (mcp.legacyPresent
+              ? `暂用 0.5.0 的旧副本 ${mcp.legacy}，` + '`apply` 或重启 `dsh web` 会迁到用户级 bin'
+              : '`apply` 或重启 `dsh web` 会自动补上')
+        } else {
+          item.note = `已落地的文件与随包清单 sha256 不一致（多半是上游 npm 版——它没有 create_program）；`
+            + '宿主下次启动会自动覆盖回随包版本'
+        }
+        if (probe.found) item.note += `。PATH 上另有一份 ${probe.path}，preset 优先用随包的那份`
+      }
+    } else if (typeof def.binary === 'string' && def.binary !== '') {
+      const probe = await probeBinary(def.binary, def.probe)
+      const dirs = (def.alsoDirs ?? []).map(expandToolDir).filter((d) => existsSync(d))
+      item.binary = probe.path
+      item.ok = probe.found || dirs.length > 0
+      if (probe.found && probe.output !== null) item.note = probe.output
+      else if (probe.found && probe.error !== null && def.probeOptional === true) {
+        item.note = `已安装（PATH: ${probe.path}），但当前不可用：${probe.error}`
+      }
+      // "装了但命令用不了"要说清楚，别只丢一个目录了事
+      if (!probe.found && dirs.length > 0) {
+        item.note = `装了，但 \`${def.binary}\` 不在 PATH（发现应用目录：${dirs.join('、')}）—— 命令行用不了，见上面的安装说明`
+      }
+      if (!item.ok) item.note = `PATH 里没有 \`${def.binary}\``
+    } else {
+      item.ok = def.scope === 'future' // 预留位：登记即"就绪（未接入）"
+      item.note = def.install?.note ?? null
+    }
+
+    // 期望可见的 skill
+    for (const name of def.skills ?? []) {
+      if (!skills.has(name)) item.missingSkills.push(name)
+    }
+    if (item.missingSkills.length > 0 && item.ok) {
+      item.note = `${item.note ?? ''} 但 skill 集缺 ${item.missingSkills.length} 个：${item.missingSkills.slice(0, 4).join('、')}${item.missingSkills.length > 4 ? '…' : ''}`
+      item.ok = false
+    }
+
+    if (item.scope === 'future') item.required = false
+    tools.push(item)
+  }
+
+  const requiredTools = tools.filter((t) => t.required)
+  const missing = tools.filter((t) => !t.ok && !t.skipped && t.scope !== 'future').map((t) => t.id)
+
+  return {
+    ok: missing.length === 0,
+    cwd: opts.cwd ?? process.cwd(),
+    scope: signal,
+    /** 扫过的 skill 根（换机器时先看这里：根没了，skill 自然全缺）。 */
+    skillRoots: scannedRoots,
+    skillCount: skills.size,
+    tools,
+    summary: {
+      required: requiredTools.map((t) => t.id),
+      ok: tools.filter((t) => t.ok).map((t) => t.id),
+      missing,
+      skipped: tools.filter((t) => t.skipped).map((t) => t.id),
+      reserved: tools.filter((t) => t.scope === 'future').map((t) => t.id),
+    },
+  }
+}
+
+/** 人话版的 env 报告。 */
+function renderEnv(r) {
+  const L = ['▶ 协作环境体检', '']
+  L.push(`  skill 根 ${r.skillRoots.length} 个（可见 skill ${r.skillCount} 个）：`)
+  for (const root of r.skillRoots) {
+    L.push(`    · ${root.exists ? '✓' : '·'} ${root.path}  [${root.source}, ${root.count} 个]${root.exists ? '' : ' （不存在）'}`)
+  }
+  L.push('')
+  L.push(`  使用场景：${r.scope.known ? (r.scope.softwareDev ? '软件开发项目下属成员' : '非软件开发项目') : '未判定'} —— ${r.scope.why}`)
+  L.push('')
+  for (const t of r.tools) {
+    const tag = t.scope === 'future' ? '[预留]' : t.skipped ? '[跳过]' : t.required ? '[必需]' : '[可选]'
+    L.push(`  ${t.ok ? '✓' : t.skipped || t.scope === 'future' ? '·' : '✗'} ${t.label} ${tag}`)
+    if (t.binary !== null) L.push(`      探测：${t.binary}`)
+    if (t.note !== null && t.note !== '') L.push(`      说明：${t.note}`)
+    if (!t.ok && !t.skipped && t.install !== null) {
+      for (const [k, v] of Object.entries(t.install)) {
+        if (k === 'note') continue
+        L.push(`      ${k}: ${v}`)
+      }
+    }
+  }
+  L.push('')
+  L.push(r.ok
+    ? '协作环境齐备 ✅'
+    : `缺 ${r.summary.missing.length} 项：${r.summary.missing.join('、')}（见上方每项的安装方式）`)
+  L.push('  装单项：node scripts/setup.mjs env --install <id>')
+  return L.join('\n')
 }
 
 // ── questions ───────────────────────────────────────────────────────────────
@@ -974,7 +1458,7 @@ function materializeMcp() {
  * 每个问题都带 `default`（推荐值）与 `ifUnanswered`（用户说"你决定"就用它），
  * 所以 AI 可以**一个都不问**直接 apply —— 这是"无操作化"的兜底。
  */
-function questions(facts) {
+function questions(facts, env) {
   const list = facts.enterprise.list ?? []
   const multiple = list.length > 1
 
@@ -1055,6 +1539,26 @@ function questions(facts) {
     required: false,
   })
 
+  // 协作环境：只有"不确定是不是软件开发成员"时才问 —— 能自己判定的就不问
+  const envMissing = (env?.summary?.missing ?? []).filter((id) => id === 'apifox')
+  if (env !== undefined && (env.scope.softwareDev !== true || envMissing.length > 0)) {
+    q.push({
+      id: 'apifox',
+      question: '你是「软件开发项目」的下属成员吗？（决定要不要装 Apifox 协作工具）',
+      why: env.scope.known
+        ? `我从 Gitee 判定为「${env.scope.softwareDev ? '是' : '否'}」：${env.scope.why}`
+          + `${envMissing.length > 0 ? '，而且本机还没装好' : ''}。判断有误请直接纠正。`
+        : `${env.scope.why}。软件开发成员需要 Apifox CLI + 接口协作技能集（接口文档/Mock/自动化测试）。`,
+      options: [
+        { value: true, label: '是，装 Apifox（推荐）', detail: 'npm i -g apifox-cli + 8 个 apifox-* skill' },
+        { value: false, label: '不是，跳过', detail: '只做 Gitee 侧的项目协作' },
+      ],
+      default: env.scope.softwareDev === true,
+      ifUnanswered: env.scope.softwareDev === true,
+      required: false,
+    })
+  }
+
   q.push({
     id: 'mode',
     question: '人格（管理者 / 项目执行）怎么定？',
@@ -1107,7 +1611,7 @@ function buildConfig(a) {
     presetIds: [],
     agentRowName: 'dsh-gitee-chat/agent',
     /**
-     * 知识库文档。
+     * 知识库文档（见 DOCS.md）。
      *
      * 这里**没有任何端点配置** —— 文档能力的唯一实现是 MCP 工具，
      * 插件只决定"缓存在哪、工具叫什么名字"。
@@ -1149,9 +1653,10 @@ function renderBlock(config, facts) {
   L.push('# 本次安装探测到的事实（写入时快照）：')
   L.push(`#   token      : ${facts.token.found ? facts.token.source : '未找到（取数会提示未配置）'}`)
   // ⚠️ 这里必须报**三级回落解析出来的那份**，不能报"PATH 上有没有"：
-  //    随包二进制落在用户级 bin（Linux 通常在 PATH 上，Windows 默认不在），
-  //    只看 PATH 会写出「MCP 可执行 : 未找到（MCP 工具会挂不上）」——
-  //    而同一轮 apply 刚把 48 个工具的二进制落地，注释自相矛盾。
+  //    0.5.1 起随包二进制落在用户级 bin（Linux 通常在 PATH 上，Windows 默认不在），
+  //    而 0.5.0 的旧位置 `$DSH_HOME/.gitee-chat/bin/` 本来就不在 PATH 上。
+  //    旧写法会写出「MCP 可执行 : 未找到（MCP 工具会挂不上）」——
+  //    而同一轮 apply 刚把 51 个工具的二进制落地，注释自相矛盾。
   L.push(`#   MCP 可执行 : ${facts.mcpBinary.found
     ? `${facts.mcpBinary.path}（${facts.mcpBinary.source === 'bundled' ? '随包分发，无需 Go' : facts.mcpBinary.source === 'env' ? 'MCP_GITEE_ENT_BIN 指定' : 'PATH 上'}）`
     : `未找到（MCP 工具会挂不上）—— ${facts.mcpBinary.detail}`}`)
@@ -1168,7 +1673,7 @@ function renderBlock(config, facts) {
   L.push(`    # 无 token 时是否降级成样例数据渲染。false = 宁可明确报错，也不让人误以为是真数据。`)
   L.push(`    allowFixtureFallback: ${yamlScalar(config.allowFixtureFallback)}`)
   // scriptPath **故意不写**：省略 = 用包内 scripts/gitee/gq.mjs。
-  // 写成 `scriptPath: ''` 会让整个看板「取数失败」——补丁里的 config 是整体替换，
+  // 写成 `scriptPath: ''` 曾经导致整个看板「取数失败」——补丁里的 config 是整体替换，
   // 空串会覆盖掉包内默认值，宿主于是执行 `node '' <子命令>`，而 Node 把空脚本名
   // 当成「从 stdin 读」，stdin 立即 EOF → 退出码 0、零输出 → 只能报「输出不是 JSON」。
   // 现在宿主已把空串当「未设置」处理，但注释掉仍然是更准确的表达。
@@ -1188,8 +1693,8 @@ function renderBlock(config, facts) {
   L.push(`    presetIds: ${yamlScalar(config.presetIds)}`)
   L.push(`    # 组合里代表本插件的行名。`)
   L.push(`    agentRowName: ${yamlScalar(config.agentRowName)}`)
-  // 知识库文档：只配"缓存在哪、MCP 工具叫什么"，**没有任何端点**。
-  L.push('    # 知识库文档。文档能力的唯一实现是 MCP 工具，这里不配任何端点。')
+  // 知识库文档：只配"缓存在哪、MCP 工具叫什么"，**没有任何端点**（DOCS.md §7）。
+  L.push('    # 知识库文档（见 DOCS.md）。文档能力的唯一实现是 MCP 工具，这里不配任何端点。')
   L.push('    docs:')
   L.push(`      root: ${yamlScalar(config.docs.root)}            # 按需缓存的本地根（不是镜像，只存读过的页）`)
   L.push(`      mcpToolPrefix: ${yamlScalar(config.docs.mcpToolPrefix)}  # 必须与 preset 里 mcp-gitee 行的 serverName 一致`)
@@ -1257,7 +1762,7 @@ function diffLines(before, after) {
  * 检查 skill 的挂载状况。
  *
  * skill **不往别处拷贝**：真源是 `<包>/skills/<name>/SKILL.md`，由本包 bundle
- * 补丁（`cordis.skills.patch.yml`）里的 `gitee-chat-skills` 行挂一个
+ * 补丁（0.4.5 起是 `cordis.skills.patch.yml`）里的 `gitee-chat-skills` 行挂一个
  * skill provider 指向它。
  * 所以这里只回答三件事：文件在不在、补丁里声明的行在不在、那行的解析结果是不是本包目录。
  */
@@ -1268,8 +1773,8 @@ function inspectSkill(packageRoot = root, anchor = null) {
   const file = join(dir, SKILL_NAME, 'SKILL.md')
   const fileExists = existsSync(file)
 
-  // ⚠️ 这一行在 cordis.skills.patch.yml（host 行那个文件必须留成纯
-  //    insert 供插件市场热挂载），所以读 dsh.bundle.patch
+  // ⚠️ 0.4.5 起这一行在 cordis.skills.patch.yml（host 行那个文件必须留成纯
+  //    insert 供插件市场热挂载，见 DESIGN.md §35），所以读 dsh.bundle.patch
   //    声明的**全部**补丁文件，不写死文件名。
   const patchFiles = bundlePatchFiles(packageRoot)
   const patchPath = patchFiles.length > 0 ? patchFiles.join(' + ') : join(packageRoot, 'cordis.patch.yml')
@@ -1331,7 +1836,7 @@ function defaultSkillAnchor() {
 
 /**
  * 按 `!!js` 的语义求值一行 skill 表达式。
- * `baseUrl` = profile 目录（实测结论）；这里用一个能解析到本包的锚点。
+ * `baseUrl` = profile 目录（实测结论，见 DESIGN.md §17）；这里用一个能解析到本包的锚点。
  */
 function evalSkillExpr(expr, anchor = null) {
   const profileAnchor = anchor ?? defaultSkillAnchor()
@@ -1362,7 +1867,7 @@ async function apply(answers, opts = {}) {
 
   // ① profile 补丁。
   //    先去掉插件市场（dshmarket）可能留下的半状态残留（本插件的行被写成
-  //    disabled: true 且不在托管段里），再写自己的托管段。
+  //    disabled: true 且不在托管段里），再写自己的托管段（见 DESIGN.md §35）。
   const original = existsSync(profile.patchPath) ? readFileSync(profile.patchPath, 'utf8') : ''
   const halfStateRemoved = foreignDisabledRows(original)
   const spliced = splicePatch(stripForeignDisabledRows(original).text, block)
@@ -1371,7 +1876,7 @@ async function apply(answers, opts = {}) {
   // ② 本地企业配置（不需要重启就能切换的那种）
   //
   // 答案里**没给**企业 id（=0）时保留本地已选的那家：设置页也能选企业，
-  // 重跑一次安装不该把使用者在界面上选好的公司静默清掉。
+  // 重跑一次安装不该把使用者在界面上选好的公司静默清掉（见 DESIGN.md §36）。
   const configPath = join(dshHome, '.gitee-chat', 'config.json')
   const beforeLocal = readJson(configPath) ?? {}
   const answeredEnterprise = Number(answers.enterpriseId ?? 0)
@@ -1460,16 +1965,31 @@ async function apply(answers, opts = {}) {
   const after = await detect()
   result.problems = after.problems
 
+  // 协作环境缺口：本插件装好了 ≠ 能协作
+  const env = await envCheck()
+  result.env = {
+    ok: env.ok,
+    missing: env.summary.missing,
+    softwareDev: env.scope.softwareDev,
+    why: env.scope.why,
+    /** 缺的每一项怎么装（直接转述给使用者/自己执行）。 */
+    howTo: env.tools.filter((t) => !t.ok && !t.skipped).map((t) => ({ id: t.id, label: t.label, install: t.install })),
+  }
+
   const warnings = []
   if (!after.token.found) {
     warnings.push('还没有 Gitee token —— 取数会提示「未配置 token」，界面不会显示空数据。'
-      + '在应用「设置 → Gitee 企业项目」里粘贴保存即可（即时生效）。')
+      + '在应用「设置 → Gitee 企业项目」里粘贴保存即可（0.4.1 起，即时生效）。')
   }
   if (!result.mcp.ok && !after.mcpBinary.found) {
     warnings.push(`MCP 后端不可用（${after.mcpBinary.detail}）—— MCP 工具用不了（标签页与固定分析不受影响）。`
       + '本平台随包时不缺 Go：跑一次 apply 会落地那份二进制。')
   }
-  if (!after.presets.installed.includes('gitee-manager')) warnings.push('preset 未就位 —— 会话里选不到 Gitee 模式。')
+  if (!after.presets.installed.includes('gitee')) warnings.push('preset 未就位 —— 会话里选不到「Gitee 项目管理」。')
+  // 0.5.4 把两个模式合成一个；老 profile 里残留的 exec preset 要提示手动删掉。
+  if (after.presets.installed.includes('gitee-exec')) {
+    warnings.push('检测到旧的 `gitee-exec` preset（0.5.4 起已合并为 `gitee`）—— 在 Agent 预设里删掉那条，避免出现重复入口。')
+  }
   if (result.agentHalf !== undefined && result.agentHalf.present && !result.agentHalf.ok) {
     const probe = result.agentHalf.probeAfter ?? result.agentHalf.probe
     if (result.agentHalf.hostSuppliesClosure === true) {
@@ -1478,7 +1998,7 @@ async function apply(answers, opts = {}) {
         + `本机报 ${probe.error}，`
         + '因为桌面版把 @deepseek-ai/* 依赖闭包放在 app.asar 里、由**宿主**提供解析；'
         + 'profile 里装的 dsh-context / dsh-cost-meter 同样裸导入 @deepseek-ai/* ，也用同样方式加载。'
-        + 'preset 里那行能否起来以界面实测为准：新建会话能选到「Gitee 企业项目管理 / 项目执行」并正常建起，就说明没问题。')
+        + 'preset 里那行能否起来以界面实测为准：新建会话能选到「Gitee 项目管理」并正常建起，就说明没问题。')
     } else {
       warnings.push(`agent 半 import 不了：${probe.error}`
         + ' —— preset 里那行 `dsh-gitee-chat/agent` 起不来，会话建不起来，'
@@ -1494,9 +2014,13 @@ async function apply(answers, opts = {}) {
   result.nextSteps = [
     '**刷新浏览器页面**即可（配置改动会热重载，几秒内生效）。',
     '只有当本次安装改了插件**代码**（`lib/`）时才需要重启 `dsh web`。',
-    '新建会话时选择「Gitee 企业项目管理」或「Gitee 项目执行」预设。',
+    '新建会话时选择「Gitee 项目管理」预设。',
     '打开会话里的「Gitee 项目」标签页，点右上角「刷新」。',
   ]
+  if (result.env.missing.length > 0) {
+    result.nextSteps.unshift(`协作环境还缺 ${result.env.missing.join('、')}：`
+      + '`node scripts/setup.mjs env --install <id>` 装单项，或按上面的 install 说明手工装。')
+  }
   if (warnings.length > 0) result.nextSteps.unshift('先解决上面的 warning。')
   if (result.agentHalf?.repair?.action === 'linked') {
     result.nextSteps.unshift(`已给 \`link:\` 安装补一跳（${result.agentHalf.link}）：agent 半的裸导入现在解析得到，`
@@ -1526,7 +2050,7 @@ async function verify() {
   lines.push('')
 
   mark(facts.token.found, `token：${facts.token.found ? facts.token.source : '未找到'}`,
-    '在应用「设置 → Gitee 企业项目」里粘贴保存（推荐、即时生效）；'
+    '在应用「设置 → Gitee 企业项目」里粘贴保存（0.4.1 起，推荐、即时生效）；'
     + `或设环境变量 ${TOKEN_ENVS[0]} / 写入 ${facts.tokenFileCandidates[0]}`)
 
   // MCP 后端：随包二进制优先，PATH 只是备用。
@@ -1538,15 +2062,14 @@ async function verify() {
     // 本平台未随包：老实说清楚，并给出替代路径
     mark(facts.mcpBinary.found,
       `MCP 后端：本平台（${mcpState.key}）未随包 · ${facts.mcpBinary.detail}`,
-      '用 MCP_GITEE_ENT_BIN 指到已有二进制，或自己编译与插件同级的 dsh-mcp-gitee-ent'
-      + '（见 vendor/mcp-gitee-ent/manifest.json 的 fork 字段）')
+      '用 MCP_GITEE_ENT_BIN 指到已有二进制，或自己 go install gitee.com/oschina/dsh-mcp-gitee-ent')
   } else if (!mcpState.vendoredFileExists) {
     mark(false, `MCP 后端：清单声明了 ${mcpState.entry.file}，但包里没有这个文件`,
       'node scripts/build-mcp.mjs   # 重新生成随包二进制')
   } else if (mcpState.matches === true) {
     mark(true, `MCP 后端：随包分发（无需 Go）· ${mcpState.toolCount} 个工具 · sha256 与清单一致`,
       mcpState.onPath
-        ? undefined
+        ? (mcpState.legacyPresent ? `rm -f ${mcpState.legacy}   # 清掉 0.5.0 的私有副本` : undefined)
         : `把 ${dirname(mcpState.target)} 加进 PATH，其它 MCP 客户端也能直接用 mcp-gitee-ent`)
   } else {
     // 包里有、但本地落地的不对 → 不是失败（宿主下次启动会自愈），但必须说出来
@@ -1563,7 +2086,7 @@ async function verify() {
       ? `${facts.skill.resolvedSkillFile}${facts.skill.installedAs === 'file' ? '（file: 装法，加载的是副本）' : ''}`
       : '未生效'}`,
     facts.skill.fileExists
-      ? `本包 bundle 补丁（cordis.skills.patch.yml）里的 gitee-chat-skills 行缺失，或它解析到 ${facts.skill.resolvesTo} 而那里没有 SKILL.md`
+      ? `本包 bundle 补丁（cordis.skills.patch.yml）里的 gitee-chat-skills 行缺失，或它解析到 ${facts.skill.resolvesTo} 而那里没有 SKILL.md（见 DESIGN.md §17）`
       : `仓库里缺少 ${facts.skill.path}`)
 
   const expected = facts.presets.expected
@@ -1578,7 +2101,7 @@ async function verify() {
     'dsh plugin --profile <name> add <本包目录>')
 
   // 插件市场半状态：包在 dsh.profile.bundles 里、行却被写成 disabled: true。
-  // 界面表现是 Gitee preset 还在列表里却红标「加载失败」。
+  // 界面表现是 Gitee preset 还在列表里却红标「加载失败」（见 DESIGN.md §35）。
   const halfState = facts.profiles.filter((p) => (p.disabledRows?.length ?? 0) > 0 && p.hasBundle)
   mark(halfState.length === 0,
     halfState.length === 0
@@ -1603,6 +2126,17 @@ async function verify() {
     const c = p.currentConfig
     mark(true, `profile ${p.name} 的补丁：${c?.present === true ? `已写入（enterpriseId=${c.config?.enterpriseId ?? '?'}, allowWrites=${c.config?.allowWrites ?? '?'}, requiredLabels=${c.config?.thresholds?.requiredLabels ?? '?'}）` : '未写入本插件配置'}`)
   }
+
+  // 协作环境（git / Obsidian / MCP / token / Apifox）
+  const env = await envCheck({ withSignal: facts.token.found })
+  // 分母排除 future：预留位不该把"就绪 6/5"这种数字算出来
+  const envConsidered = env.tools.filter((t) => t.scope !== 'future')
+  mark(env.ok, `协作环境：${envConsidered.filter((t) => t.ok).length}/${envConsidered.length} 项就绪`
+    + (env.summary.missing.length > 0 ? `（缺 ${env.summary.missing.join('、')}）` : '')
+    + (env.summary.skipped.length > 0 ? `（跳过 ${env.summary.skipped.join('、')}）` : '')
+    + `｜场景：${env.scope.known ? (env.scope.softwareDev ? '软件开发项目成员' : '非软件开发项目') : '未判定'}`
+    + `｜预留位 ${env.summary.reserved.length} 个`,
+    'node scripts/setup.mjs env   # 看每一项的安装方式')
 
   // 真实取数：只有 token 在才试
   if (facts.token.found) {
@@ -1683,7 +2217,7 @@ async function main() {
 
   if (cmd === 'questions') {
     const facts = await detect()
-    const q = questions(facts)
+    const q = questions(facts, await envCheck())
     process.stdout.write(asJson ? JSON.stringify(q, null, 2) + '\n' : renderQuestions(q) + '\n')
     process.exit(0)
   }
@@ -1717,6 +2251,45 @@ async function main() {
     process.exit(result.ok === false ? 1 : 0)
   }
 
+  if (cmd === 'env') {
+    const env = await envCheck()
+    if (flags.install !== undefined) {
+      const id = String(flags.install)
+      const tool = ENV_TOOLS.find((t) => t.id === id)
+      if (tool === undefined) {
+        process.stderr.write(`未知工具：${id}。可选：${ENV_TOOLS.map((t) => t.id).join(' / ')}\n`)
+        process.exit(2)
+      }
+      const auto = tool.install?.auto
+      if (!Array.isArray(auto)) {
+        process.stdout.write(`「${tool.label}」没有可自动执行的安装命令，按说明手工装：\n`)
+        for (const [k, v] of Object.entries(tool.install ?? {})) if (k !== 'note') process.stdout.write(`  ${k}: ${v}\n`)
+        process.exit(1)
+      }
+      const [bin, argv] = auto
+      process.stdout.write(`▶ 执行：${bin} ${argv.join(' ')}\n`)
+      try {
+        const { stdout, stderr } = await run(bin, argv, { timeout: 300_000, maxBuffer: 16 * 1024 * 1024 })
+        process.stdout.write(String(stdout) + String(stderr))
+      } catch (error) {
+        process.stderr.write(String(error?.stdout ?? '') + String(error?.stderr ?? error?.message ?? error))
+        process.stderr.write(`\n安装失败。按说明手工装：${JSON.stringify(tool.install)}\n`)
+        process.exit(1)
+      }
+      const after = await envCheck()
+      const t = after.tools.find((x) => x.id === id)
+      const shown = asJson ? JSON.stringify({ ok: t?.ok === true, tool: t }, null, 2) : renderEnv(after)
+      process.stdout.write('\n' + shown + '\n')
+      if (t?.install?.after !== undefined) process.stdout.write(`\n下一步：${t.install.after}\n`)
+      process.exit(t?.ok === true ? 0 : 1)
+    }
+    process.stdout.write(asJson ? JSON.stringify(env, null, 2) + '\n' : renderEnv(env) + '\n')
+    // `--json` 一律退 0：JSON 消费者读 `ok` 字段判断，不必处理退出码
+    // （否则 `node setup.mjs env --json` 在缺项时会以非零退出，管道就断了）。
+    // 人话模式才用退出码表达"齐 / 不齐"，方便写进 shell 脚本。
+    process.exit(asJson || env.ok ? 0 : 1)
+  }
+
   if (cmd === 'verify') {
     const r = await verify()
     process.stdout.write(r.text + '\n')
@@ -1743,7 +2316,7 @@ async function main() {
     process.exit(0)
   }
 
-  process.stderr.write(`未知子命令：${cmd}\n用法：detect | questions | apply | verify | repair\n`)
+  process.stderr.write(`未知子命令：${cmd}\n用法：env | detect | questions | apply | verify | repair\n`)
   process.exit(2)
 }
 
@@ -1794,7 +2367,7 @@ function renderQuestions(q) {
 }
 
 // 仅在被直接执行时跑 CLI（被 import 时不跑）。
-// 与 gq.mjs 同款守卫：这个模块的若干导出会被测试 import，
+// 与 gq.mjs 同款守卫：这个模块的 ENV_TOOLS 等导出会被测试 import，
 // 少了这一行，import 一次就会把整个 CLI 跑一遍（冒烟里当场撞到了）。
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {

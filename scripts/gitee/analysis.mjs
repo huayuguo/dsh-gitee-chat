@@ -486,7 +486,7 @@ export function computeDelivery(input) {
  *
  * ```md
  * ## 目标
- * 示例物料 A
+ * Phoenix/JST 端子散件
  * ## 前置依赖
  * - 无
  * ## 交付物

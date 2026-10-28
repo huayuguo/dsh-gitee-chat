@@ -5,7 +5,7 @@
 #      而 `cordis.patch.yml` 必须保持纯 insert —— 市场未识别
 #      `dsh.bundle.patch` 数组时只读那个文件，`parseSimplePatch` 见到
 #      `config:` 就返回 null，于是「关闭后再打开」永久失败并留下半状态
-#      （详见 `cordis.patch.yml` 头部与）。
+#      （详见 `cordis.patch.yml` 头部与 DESIGN.md §35）。
 #   2. 拆开后，两个文件各自只有一个顶层 `- insert:`，谁也不覆盖谁的行；
 #      市场识别数组之后（它按文件逐个判归属），本包任何一行都不算
 #      "外来行"，于是关闭插件时整包从 `dsh.profile.bundles` 干净移出。
@@ -14,7 +14,7 @@
 # 它教 AI 怎么**问使用者、写配置、自检** —— 也就是让安装与调参
 # 完全不需要使用者打开任何文件。
 #
-# 四个实测出来的要点（改动前先读）：
+# 四个实测出来的要点（改动前先读 DESIGN.md §17）：
 #
 #  1. `!!js` 里的 `baseUrl` 是 **profile 目录**（不是本包目录）。
 #     所以这里按**包名** `dsh-gitee-chat` 解析 —— bundle 就装在 profile 里，

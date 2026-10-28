@@ -1,7 +1,7 @@
 /**
  * preset 的路径与读取 —— **一处定义，三处（smoke / gen-capabilities / build-mcp）共用**。
  *
- * 为什么要有这个文件：preset 的交付形态变了——
+ * 为什么要有这个文件：DSH 0.1.7 起 preset 的交付形态变了（见 `DESIGN.md` §29）——
  * 不再是 `$DSH_HOME/.agent-presets/<id>/agent.cordis.yml` 那样的目录，
  * 而是**本包 bundle 补丁列表里**的 `presets/<id>.patch.yml`（声明式 preset 行）。
  * 于是"读某个 preset 的组合文本"这件事从"进目录"变成了"打开对应补丁文件"，

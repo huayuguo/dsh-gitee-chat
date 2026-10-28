@@ -14,7 +14,7 @@
  * **第四种 op：`doc-page-update`**（知识库文档页，整页替换）。
  * 它同样从这一个入口出去（UI 只有一条写路），但**实现是委派**：
  * 转交 MCP 的 `update_enterprise_document_page`，插件不拼文档端点。
- * MCP 是文档能力的唯一实现。
+ * 理由见 `DOCS.md` §7 —— MCP 是文档能力的唯一实现。
  *
  * @module dsh-gitee-chat/host/write
  */
@@ -32,7 +32,7 @@ export interface IssueWriterOptions {
    * 文档委派客户端（可选）。
    *
    * 文档写**不在这个文件里拼端点** —— 它委派给 MCP 的
-   * `update_enterprise_document_page`。
+   * `update_enterprise_document_page`（见 `DOCS.md` §7）。
    * 这里只负责"UI 的写只有一个入口"这条纪律。
    */
   readonly docs?: McpDocs
@@ -105,7 +105,7 @@ function normalizeIssueWrite(request: IssueWriteRequest): { args: string[]; stdi
 /**
  * 一次**文档页写**：整页替换，必须带 `expected_version` 与 `commit_message`。
  *
- * 三条纪律：
+ * 三条纪律（`DOCS.md` §6）：
  *   1. `expectedVersion` 取**清单**里的值 —— 这才是 CAS 语义；
  *   2. 乐观锁由 **MCP 工具**实现（它会先重读页面），插件**不重复实现**、
  *      也**绝不绕过**；

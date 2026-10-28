@@ -3,7 +3,7 @@
  *
  * 覆盖两半，并**专门守住平面纪律**：
  *   - host 半（profile）：路由 + giteeChat 服务 + **公开 gateway `gitee_ent` 一个工具**
- *     （故意例外）；除此之外**不得**注册工具/人格/门禁。
+ *     （DESIGN.md §37 的故意例外）；除此之外**不得**注册工具/人格/门禁。
  *     这条是回归守卫——早先版本把工具与人格注入写在 host 半，
  *     导致 PTC 等无关 preset 的新会话也被注入 Gitee 人格、也能看到 Gitee 工具。
  *   - agent 半（preset）：工具 + 人格注入 + 门禁 + 把公开 gateway `restrict` 掉；
@@ -14,7 +14,7 @@
 
 import assert from 'node:assert/strict'
 import { readFile, writeFile, mkdtemp, mkdir, rm, symlink } from 'node:fs/promises'
-import { existsSync as pathExists, readFileSync, readdirSync, readlinkSync, rmSync, statSync } from 'node:fs'
+import { existsSync as pathExists, readFileSync, writeFileSync, readdirSync, readlinkSync, rmSync, statSync } from 'node:fs'
 import { presetPatchPath, readPresetPatchText } from './preset-files.mjs'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
@@ -27,17 +27,33 @@ import { execFile } from 'node:child_process'
 
 const run = promisify(execFile)
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
+
+/**
+ * 随包 MCP 二进制应有的工具数（上游 40 + 本 fork 独有的 15 = 55）。
+ *
+ * 上游每并一个版本、每多一个工具，只改这一处；三处断言与工具集覆盖检查
+ * 都从这里取数，避免"改了两处漏了第三处"。真值以
+ * `vendor/mcp-gitee-ent/manifest.json` 的 `toolCount` 为准（构建时由真实
+ * MCP 握手探测得到），这里只是把它写死成冒烟断言。
+ */
+const BINARY_TOOL_COUNT = 55
 import {
   apply as applyHost, compositionMountsRow, createGqRunner, materializedPath, name as hostName,
   ensureMaterialized, platformKey, resolveConfig, toolGapOf, VERSION,
-  binaryName, isOnPath, userBinDir,
+  binaryName, isOnPath, legacyMaterializedPath, userBinDir,
   classifyPageState, rollupDocState, planPull, enterpriseLayer, safeSlug, pageRelPath,
   unwrapToolResult, DocError, createMcpDocs, createDocService,
   createRepoService, createWikiCache, toWorkspacePath, safeRepoSegment,
   createEnterpriseIdResolver, resolveEnterpriseIdNow, noEnterpriseHint, unauthorizedEnterpriseHint,
   classifyAttachState, readAttachManifest, cacheStats, humanBytes,
   createMcpClient, giteeEntGatewayTool, PUBLIC_GATEWAY_TOOL_NAME, WRITE_TOOLS,
+  Config as HostConfigSchema,
+  createLocalSettings, normalizeTtlSeconds, normalizeIntervalSeconds, normalizeIdleMinutes,
+  nowStamp, parseStamp,
 } from '../lib/index.js'
+// 冒烟跑在一个假 ctx 上：关掉 MCP 直连通道（否则每个文档请求都会真起子进程去连网，
+// 既慢又会污染断言）。真正的直连路径由本机实测覆盖，见 docs/design/0.5.4-api.md。
+process.env.GITEE_CHAT_NO_DIRECT = '1'
 import { apply as applyAgent, rawMcpToolName } from '../lib/agent.js'
 import { createIssueWriter } from '../lib/index.js'
 import { codeMatches, codeOfTitle, computeExtendedAnalysis, parseTemplate, resolveThresholds, THRESHOLD_DEFAULTS } from '../scripts/gitee/analysis.mjs'
@@ -94,8 +110,8 @@ function presetCommandExpression(path) {
  * 在隔离的 vm 里求值 preset 的 `!!js` 表达式。
  *
  * 只给 `process` —— 这正是 DSH 的 `!!js` 求值上下文提供的全部东西。
- * `materialized` 控制落地文件是否存在，用来验证回落的两个分支：
- *   `'user'` = 用户级 bin 那份在，`false` = 不在（应回落到 PATH 上的裸名）。
+ * `materialized` 控制"哪个落地文件存在"，用来验证三级回落的三个分支：
+ *   `'user'` = 0.5.1 的用户级 bin 那份在，`'legacy'` = 0.5.0 私有副本在，`false` = 都不在。
  */
 function evaluateExpression(expr, { env, platform, materialized }) {
   const home = platform === 'win32' ? (env.USERPROFILE ?? '') : (env.HOME ?? '')
@@ -103,7 +119,10 @@ function evaluateExpression(expr, { env, platform, materialized }) {
   const xdg = typeof env.XDG_BIN_HOME === 'string' && env.XDG_BIN_HOME.trim() !== '' ? env.XDG_BIN_HOME.trim() : null
   const binDir = platform === 'win32' ? join(home, '.local', 'bin') : (xdg ?? join(home, '.local', 'bin'))
   const userBin = join(binDir, name)
-  const existing = materialized === 'user' ? new Set([userBin]) : new Set()
+  const legacyBin = join(env.DSH_HOME ?? join(home, '.dsh'), '.gitee-chat', 'bin', name)
+  const existing = materialized === 'user'
+    ? new Set([userBin])
+    : materialized === 'legacy' ? new Set([legacyBin]) : new Set()
   const fakeProcess = {
     env,
     platform,
@@ -138,6 +157,14 @@ function fakeCtx() {
     listeners: {},
     /** 假的 preset 组合文本：presetId → YAML 文本（供 agentPresets.read 返回）。 */
     compositions: {},
+    /**
+     * 宿主发布的 Web 调用参数（`webStartup` 服务值）。
+     * 默认空 = 只信 loopback；信任栅栏那组测试会临时改成公网 authority，
+     * 并验证「老宿主只 provide webRuntime」与「环境变量逃生口」两条兜底。
+     */
+    webStartup: { trustedHosts: [], publicUrl: undefined },
+    /** 旧版宿主才有的 `webRuntime` 服务值（仅当 webStartup 置为 null 时才被读到）。 */
+    webRuntime: { trustedHosts: [] },
   }
   return {
     rec,
@@ -175,9 +202,10 @@ function fakeCtx() {
       for (const fn of rec.listeners[event] ?? []) fn(...args)
     },
     get(serviceName) {
-      if (serviceName === 'webRuntime') return { trustedHosts: [] }
+      if (serviceName === 'webStartup') return rec.webStartup
+      if (serviceName === 'webRuntime') return rec.webRuntime
       if (serviceName === 'agentPresets') {
-        // **0.1.7 的服务形状**：读声明文本是 `readDocument(id)` →
+        // **0.1.7 的服务形状**（DESIGN.md §30）：读声明文本是 `readDocument(id)` →
         // `{ content }`，读结构化行是 `compositionInventory()`。0.1.6 及以前那个
         // `read(id)` 已经不存在 —— `rec.legacyReadOnly` 专门用来复现"只剩旧方法"的现场。
         if (rec.legacyReadOnly === true) {
@@ -229,8 +257,8 @@ function fakeCtx() {
        *
        * 刻意按真契约校验（`@deepseek-ai/dsh-tools` 的
        * `restrict(filter: { allow?, deny? })`）：传数组或空对象都会抛。
-       * 名字数组会被真宿主静默 no-op，假 ctx 必须按真契约拒掉，
-       * 否则同类 bug 会假绿到人工测试才发现。
+       * 0.5.0 第一版把名字数组当 filter 传，真宿主静默 no-op，而这个假 ctx
+       * 照收不误 ⇒ 冒烟假绿、直到人工测试才发现（DESIGN.md §37 ⑧）。
        */
       restrict(filter) {
         if (filter === null || typeof filter !== 'object' || Array.isArray(filter)) {
@@ -306,9 +334,10 @@ async function main() {
   //
   // 为什么必须有这一步：host 半在装配时会自愈随包 MCP 二进制（`ensureMaterialized`），
   // 而本套测试在进程内挂载 host 半 ——
-  //   落点是用户级 bin（POSIX `$XDG_BIN_HOME` → `~/.local/bin`），
-  //   于是一定要同时把 `XDG_BIN_HOME` 钉进沙箱，否则会往真实的 `~/.local/bin`
-  //   写一份 8 MiB 的二进制。
+  //   · 0.5.0 及之前它会往真实 `$DSH_HOME/.gitee-chat/bin/` 里拷 8 MiB；
+  //   · 0.5.1 起落点改成用户级 bin（POSIX `$XDG_BIN_HOME` → `~/.local/bin`），
+  //     于是一定要同时把 `XDG_BIN_HOME` 钉进沙箱，否则会往真实的 `~/.local/bin`
+  //     写一份 8 MiB 的二进制。
   // 测试不该改使用者的状态，这条第一次跑就被发现了（文件时间对得上）。
   //
   // 单独需要真实现场的用例（如 12j/12l 的端到端）自己再覆盖一次 DSH_HOME。
@@ -362,6 +391,29 @@ async function main() {
   assert.ok(pathExists(blanks.scriptPath), `回落后的脚本必须真实存在：${blanks.scriptPath}`)
   assert.deepEqual(blanks.presetIds, ['my-preset'], 'presetIds 里的空白项要滤掉')
   console.log('  ✓ 空串配置 = 未设置（回归：曾导致「gq 输出不是 JSON：」）')
+
+  // ══ 1b'. 设置页表单契约：cache / autoRefresh 必须是 volatile + 带说明 ══
+  // 背景（用户 2026-10-27）：`@deepseek-ai/dsh-settings` 只把 schema 里标了
+  // `.volatile()` 的字段投影成表单；0.5.4 漏标了，于是「设置 → 插件 → Gitee 项目」
+  // 是空页面，用户报「没有开关，没有配置参数」。这条断言把它钉死。
+  {
+    // 直接看活的 schema 对象（`toJSON()` 在新版 schemastery 里是 refs 表，不适合断言）
+    for (const group of ['cache', 'autoRefresh']) {
+      const node = HostConfigSchema.dict?.[group]
+      assert.ok(node !== undefined, `Config 缺少 ${group} 分组`)
+      const leaves = Object.entries(node.dict ?? {})
+      assert.ok(leaves.length > 0, `${group} 分组没有任何字段`)
+      for (const [key, leaf] of leaves) {
+        assert.equal(leaf.meta?.volatile, true,
+          `${group}.${key} 必须标记 .volatile()，否则设置页不渲染这个字段`)
+        assert.ok((leaf.meta?.description ?? '').length > 4,
+          `${group}.${key} 缺少 description（设置页里会显示成空白项）`)
+        assert.ok(leaf.meta?.default !== undefined,
+          `${group}.${key} 缺少 default（表单初值会是 undefined）`)
+      }
+    }
+    console.log('  ✓ 设置页表单：cache / autoRefresh 字段均 volatile + 有说明 + 有默认值')
+  }
 
   // ══ 1c. 脚本不可用时必须报「脚本」而不是「输出不是 JSON」════════════════
   // 这条错误的误导性正是上次排障慢的原因：症状在 JSON，病根在路径。
@@ -424,7 +476,7 @@ async function main() {
     : []
   for (const file of presetPatches) {
     assert.ok(patchList.includes(`./presets/${file}`),
-      `presets/${file} 没列进 dsh.bundle.patch —— 装上也不会被组合`)
+      `presets/${file} 没列进 dsh.bundle.patch —— 装上也不会被组合（见 DESIGN.md §29）`)
   }
   assert.ok(pathExists(join(root, 'cordis.patch.yml')), 'cordis.patch.yml 必须真的在包里')
   assert.ok(pathExists(join(root, 'cordis.skills.patch.yml')), 'cordis.skills.patch.yml 必须真的在包里')
@@ -439,7 +491,7 @@ async function main() {
 
   // 复刻 dshmarket/lib/hot.js 的 parseSimplePatch()：**只**接受「- insert:」/缩进
   // 「- id: X」/缩进「name: Y」三类行；任何其它行（config、!!js、没被剥掉的注释）
-  // 都返回 null → 插件市场放弃热挂载 → 关掉再开启就留半状态。
+  // 都返回 null → 插件市场放弃热挂载 → 关掉再开启就留半状态（见 DESIGN.md §35）。
   const marketHotMountRows = (text) => {
     const rows = []
     let pending = null
@@ -463,7 +515,7 @@ async function main() {
   // 根补丁是插件市场「未识别数组」时**唯一**读到的文件，必须能被热挂载。
   const hotRows = marketHotMountRows(rootPatchText)
   assert.ok(hotRows !== null && hotRows.some((r) => r.id === 'gitee-chat' && r.name === 'dsh-gitee-chat'),
-    'cordis.patch.yml 必须是插件市场能热挂载的纯 insert 形态（不许有 config/!!js）')
+    'cordis.patch.yml 必须是插件市场能热挂载的纯 insert 形态（不许有 config/!!js，见 DESIGN.md §35）')
 
   // ② 前端半必须带 platform（否则宿主不知道往哪个前端挂）
   assert.equal(pkg.dsh?.client?.platform, 'web', 'dsh.client.platform 必填')
@@ -495,37 +547,50 @@ async function main() {
   assert.ok(!('@deepseek-ai/dsh-client-locale' in (pkg.peerDependencies ?? {})),
     'dsh-client-locale 不该在 peerDependencies：官方 client 插件把它放 devDependencies，'
     + '同时列进 dsh.client.inject；本包 src 里 0 处引用它')
-  assert.deepEqual(pkg.publishConfig, { access: 'public', registry: 'https://registry.npmjs.org/' },
-    'publishConfig 必须是 access=public + registry 钉官方源（本机 npm 常被配成镜像，'
-    + '不钉就会往只读镜像发）')
-  assert.equal(pkg.exports?.['./src/*'], './src/*',
-    'exports 要放行 ./src/*（官方包一致）')
-  assert.equal(pkg.types, 'types/index.d.ts',
-    'package.json 要有 types 字段（tsc 生成到 types/，由 types:check 守卫）')
-  assert.equal(pkg.exports?.['.']?.types, './types/index.d.ts',
-    'exports["."] 要带 types 条件（否则 TS 使用方拿不到声明）')
-  assert.equal(pkg.exports?.['./agent']?.types, './types/agent.d.ts',
-    'exports["./agent"] 要带 types 条件')
-  assert.equal(pkg.exports?.['./client']?.types, './types/client/index.d.ts',
-    'exports["./client"] 要带 types 条件（生成产物落在 client/index.d.ts）')
-  assert.ok('typescript' in (pkg.devDependencies ?? {}),
-    'typescript 要在 devDependencies（types/ 由它生成，不随包发布）')
-  assert.equal(pkg.exports?.['.']?.default, './lib/index.js',
-    'exports["."] 的 default 仍要指向 lib/index.js')
-  assert.ok((pkg.files ?? []).includes('types'),
-    'files 白名单必须包含 types（否则声明不会被发布）')
-  assert.ok((pkg.files ?? []).includes('CHANGELOG.md'),
-    'files 白名单必须包含 CHANGELOG.md')
+  assert.equal(pkg.publishConfig?.access, 'public',
+    '缺少 publishConfig.access=public（官方 dsh-* 包一致；scope 包默认 private，发布会被拦）')
+  // registry 允许两条线不同：内部线发 npmmirror/Gitee，外部线发 registry.npmjs.org —— 不强制、不禁止。
+  // 用户 2026-10-27 口径：「NPM 发布也把 TS 代码发布了？」—— 不再把 `src/` 独立发出去
+  //（852 KB 源码目录，包外没人 require 它：全仓 grep 无 `dsh-gitee-chat/src` 引用）。
+  // ⚠️ 注意这只是减体积，**不等于不发布源码**：`lib/*.js.map` 的 sourcesContent 里内联了
+  // 全部 TS 原文（23 个文件）。要真不发源码得关掉内联，那是另一个取舍（现场排错会变难）。
+  assert.equal(pkg.exports?.['./src/*'], undefined,
+    'exports 不再放行 ./src/*：本包不发布 src 目录（无 .d.ts，也没有外部消费者）')
+  assert.equal((pkg.files ?? []).includes('src'), false,
+    'files 不该包含 src：发布物只留跑得起来的东西（lib/vendor/scripts/skills/presets/文档）')
 
-  // ⑥ **只留一个锁文件**（2026-10-10 定，用户口径"按照标准作"）。
+  // ⑥ package-lock.json 的**根条目**必须与 package.json 同步。
   //
-  // 本包用 pnpm：`pnpm-workspace.yaml` 里那两个键（autoInstallPeers / allowBuilds.esbuild）
-  // 就是 pnpm 读的，CI 与 Windows 安装脚本也走 pnpm。两个锁并存时它们会**各自漂移**
-  // —— 旧门禁正是被这个咬过一次：改了 peer 却没同步 `package-lock.json`，
-  // 同事 `npm install` 完 `git status` 立刻是脏的。所以：只保留 `pnpm-lock.yaml`。
-  assert.ok(pathExists(join(root, 'pnpm-lock.yaml')), '必须有 pnpm-lock.yaml（唯一的锁文件）')
-  assert.equal(pathExists(join(root, 'package-lock.json')), false,
-    'package-lock.json 必须不存在（双锁文件会各自漂移；已统一到 pnpm）')
+  // 为什么这条归门禁管：Windows 上的安装路径（README 手工安装段）跑的是
+  // `npm install --legacy-peer-deps`，锁文件一旦过期，同事装完 `git status` 立刻就是脏的
+  // （npm 会当场改写它），而 `npm ci` 这类用法直接失败。实测（2026-09-28）：
+  // 改了 peer / 版本号却没同步锁 —— 锁里还停着 0.3.0 与 ^0.1.5-rc.2。
+  // 同步办法：`npm install --package-lock-only --legacy-peer-deps`（只动锁，20 行级别）。
+  // 锁文件不再入库（见 AGENTS.md §2）：内部开发机有就用它做一致性校验，没有就跳过。
+  // 外部发布线用的是 pnpm-lock.yaml，两边锁文件互不相干。
+  const lockPath = join(root, 'package-lock.json')
+  const usesPnpm = String(pkg.packageManager ?? '').startsWith('pnpm')
+  // 外部线用 pnpm（packageManager 字段声明）：那份 package-lock.json 是内部线在本机留下的，
+  // 与 pnpm 线的 package.json 本就不是一对 —— 判红只会逼人删掉别人的锁。
+  if (usesPnpm) {
+    console.log('  ✓ 该线用 pnpm 管理依赖，跳过 npm 锁文件一致性检查')
+  } else if (pathExists(lockPath)) {
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'))
+    const lockRoot = lock.packages?.[''] ?? {}
+    const sync = 'npm install --package-lock-only --legacy-peer-deps'
+    assert.equal(lockRoot.version, pkg.version,
+      `package-lock.json 根条目的 version（${lockRoot.version}）与 package.json（${pkg.version}）不一致 —— 跑 ${sync}`)
+    assert.deepEqual(lockRoot.engines, pkg.engines,
+      `package-lock.json 的 engines 与 package.json 不一致 —— 跑 ${sync}`)
+    assert.deepEqual(lockRoot.peerDependencies, pkg.peerDependencies,
+      `package-lock.json 的 peerDependencies 与 package.json 不一致 —— 跑 ${sync}`)
+    assert.deepEqual(lockRoot.dependencies, pkg.dependencies,
+      `package-lock.json 的 dependencies 与 package.json 不一致 —— 跑 ${sync}`)
+    assert.deepEqual(lockRoot.devDependencies, pkg.devDependencies,
+      `package-lock.json 的 devDependencies 与 package.json 不一致 —— 跑 ${sync}`)
+    assert.ok(Object.keys(lock.packages ?? {}).some((k) => k.includes('node_modules/esbuild')),
+      'package-lock.json 里必须有 esbuild（构建脚本依赖它；Windows 路径靠 npm install 装它）')
+  }
 
   // ④ license 声明了就要有 LICENSE 文件，并随包发（生态三家都这么做）
   assert.equal(pkg.license, 'MIT', 'license 字段应为 MIT')
@@ -537,6 +602,15 @@ async function main() {
   //    `file:` 装法（按 files 打包）会把两个 Gitee 模式整段丢掉。
   for (const need of ['lib', 'vendor', 'skills', 'presets', 'cordis.patch.yml', 'cordis.skills.patch.yml']) {
     assert.ok([...pkg.files].includes(need), `files 必须包含 ${need}（运行期需要）`)
+  }
+
+  // ⑤' 类型声明按 DSH 官方包约定落在 lib/types/（随 lib 一起发，不再单独列 types）
+  for (const [sub, target] of Object.entries(pkg.exports ?? {})) {
+    const types = typeof target === 'object' && target !== null ? target.types : undefined
+    if (!types) continue
+    assert.ok(types.startsWith('./lib/'), `${sub} 的 exports.types 必须落在 lib/ 内：实际 ${types}`)
+    assert.equal([...pkg.files].includes('types'), false, 'files 不该再列 types（声明文件在 lib/ 里）')
+    assert.ok(pathExists(join(root, types)), `${sub} 的 exports.types 指向的文件不存在：${types}`)
   }
 
   // ⑥ 溯源字段若给了，必须是 https（http 的仓库地址会被 npm 标成不安全，
@@ -621,156 +695,6 @@ async function main() {
   }
   console.log(`  ✓ 清单标准化 ⑦：peer/engines.dsh 都跟在本仓构建所对的 harness（${anchor}）上`)
   console.log('  ✓ 清单标准化：dsh.bundle / dsh.client.platform / peer 预发布分支 / LICENSE / files 覆盖面 / 溯源 https')
-
-  // ══ 1f. Windows 安装脚本的静态不变量 ═════════════════════════════════════
-  //
-  // 这个 .cmd 永远跑不到 CI 里（开发机是 Linux），所以它只能靠静态断言兜住。
-  // 下面三条各自对应一个**真机上真实发生过**的坑，不是想象的洁癖：
-  //   ① 行尾/编码：非 ASCII 的 .cmd 在 936 代码页下变乱码；LF 行尾会让 cmd 读岔
-  //   ② `^` 在双引号内不是转义符 —— 真机输出原样打出了 "file:^<repo dir^>"
-  //   ③ `!!` 会被 EnableDelayedExpansion 吃成空 → 提示语变成 "[]"
-  // 检查器先自证有效（负例），再断言脚本本体。
-  const cmdCaretInQuotes = (line) => {
-    let inQuote = false
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i]
-      if (ch === '"') { inQuote = !inQuote; continue }
-      if (inQuote && ch === '^' && (line[i + 1] === '<' || line[i + 1] === '>')) return true
-    }
-    return false
-  }
-  assert.ok(cmdCaretInQuotes('  echo add "file:^<repo dir^>"'),
-    '检查器必须能抓到真机那个 bug（引号内的 ^<）—— 抓不到就等于没守卫')
-  assert.ok(!cmdCaretInQuotes('  echo cd /d ^<repo^>'),
-    '引号外的 ^< 是正确写法，检查器不能误报')
-
-  const cmdPath = join(root, 'scripts/install-dsh.cmd')
-  const cmdRaw = readFileSync(cmdPath, 'utf8')
-  assert.ok(!/[^\x00-\x7F]/.test(cmdRaw),
-    'install-dsh.cmd 必须纯 ASCII：非 ASCII 的 .cmd 在 936 代码页下会乱码')
-  assert.ok(!/(^|[^\r])\n/.test(cmdRaw),
-    'install-dsh.cmd 必须是 CRLF 行尾（编辑器插入一个裸 LF 就可能让 cmd 读岔）')
-  const caretOffenders = cmdRaw.split('\r\n')
-    .filter((line) => /^\s*echo\b/i.test(line) && cmdCaretInQuotes(line))
-  assert.equal(caretOffenders.length, 0,
-    `echo 行在双引号内用了 ^< / ^>（cmd 只在引号外把 ^ 当转义符，引号内会原样打印）：\n    ${caretOffenders.join('\n    ')}`)
-  assert.ok(!cmdRaw.includes('!!'),
-    '提示语里不能出现 !!：EnableDelayedExpansion 会把它吃成空变量引用')
-  // 真机教训：npm 的 shim 有 dsh.ps1，PowerShell 优先选它、被 ExecutionPolicy 拦。
-  // 脚本验收走 cmd 所以看不见这个失败 —— 必须在结语里把出路打出来。
-  assert.ok(cmdRaw.includes('Set-ExecutionPolicy -Scope CurrentUser RemoteSigned') && cmdRaw.includes('dsh.cmd'),
-    '结语必须给出 PowerShell 的出路（dsh.cmd / Set-ExecutionPolicy RemoteSigned）：'
-    + '验收通过 ≠ 用户能用')
-  // 策略口径（同事机实测后定的三条）：
-  //  ① 只提升"出厂默认" Restricted → RemoteSigned（仅当前用户）
-  //  ② AllSigned 是**有人故意选的更严**档位，不许我们偷偷放宽，只能提示
-  //  ③ 5.1 与 7 的策略存储互相独立，两个都要探
-  assert.ok(cmdRaw.includes('Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force'),
-    '脚本应当真的尝试改策略，而不是只打印命令（用户明确要求"让改就改"）')
-  assert.ok(/if \/i "!POLICY!"=="Restricted" goto :PolicyTryFix/.test(cmdRaw)
-    && /if \/i "!POLICY!"=="AllSigned" goto :PolicyStricter/.test(cmdRaw),
-    'Restricted 才自动改；AllSigned 必须走"仅提示"分支（不许静默放宽安全策略）')
-  assert.ok(cmdRaw.includes('call :PolicyCheck powershell') && cmdRaw.includes('call :PolicyCheck pwsh'),
-    'Windows PowerShell 5.1 与 PowerShell 7 的策略存储是两套，两个都要探')
-  assert.ok(cmdRaw.includes('call :PolicyQuery') && /Get-ExecutionPolicy" 2\^>nul/.test(cmdRaw),
-    '改完必须**用新进程重新探测**确认（Set-ExecutionPolicy 被组策略覆盖时仍返回 0，'
-    + '且那句提示是本地化的，不能靠匹配文本判断成功）')
-  // 这个 .cmd 在这台机器上连语法都没法执行（无 cmd.exe / 无 wine），所以退一步：
-  // 至少保证每个 goto/call 的目标标签都真的存在 —— 打错一个字母就是一个死循环或直接跑飞。
-  const cmdLabels = new Set(cmdRaw.split('\r\n')
-    .filter((line) => /^\s*:[A-Za-z]/.test(line))
-    .map((line) => line.trim().slice(1).toLowerCase()))
-  const cmdTargets = [...cmdRaw.matchAll(/(?:goto|call)\s+:([A-Za-z_]\w*)/g)].map((m) => m[1].toLowerCase())
-  // `:eof` 是 cmd 的**内建**标签（`goto :eof` / `call :eof` = 本子过程返回），
-  // 不出现在文件里，所以不算悬空目标。
-  const dangling = [...new Set(cmdTargets)].filter((t) => t !== 'eof' && !cmdLabels.has(t))
-  assert.equal(dangling.length, 0,
-    `install-dsh.cmd 里 goto/call 了不存在的标签：${dangling.join(', ')}（已定义：${[...cmdLabels].join(', ')}）`)
-  // 结语不要再手写 "<repo dir>" 占位符：用 %~dp0.. 算真实路径，才可复制粘贴
-  assert.ok(/for %%I in \("%~dp0\.\."\) do set "REPO_DIR=%%~fI"/.test(cmdRaw),
-    '结语应打印真实仓库路径（%~dp0.. + %%~fI 折叠 ..），而不是 "<repo dir>" 占位符')
-
-  // ══ 1f-1b. 插件安装链（2026-09-22 真机缺口 ×2 补上）══════════════════════
-  //
-  // 脚本原本装完 DSH 就停，把"构建 + 装插件"留给手工 —— 同事在 PowerShell 5.1 里
-  // 照 SKILL.md 抄 `npm install ... && npm run build`，整行解析错误（PS 5.1 没有
-  // &&，一条都没执行）；接着 dsh plugin add 又死在没装 pnpm 上（"dsh: pnpm
-  // failed in profile directory"）。现在整链进脚本：
-  assert.ok(cmdRaw.includes('npm install -g pnpm'),
-    'install-dsh.cmd 必须装 pnpm：dsh plugin add 在 profile 目录里 shell 出去调它，'
-    + '没装就是真机那句 "pnpm failed in profile directory"')
-  assert.ok(cmdRaw.includes('--legacy-peer-deps'),
-    '仓库构建必须带 --legacy-peer-deps：@deepseek-ai/dsh-* peer 由 DSH 闭包提供，'
-    + 'registry 上没有对应版本')
-  // 变量写法两种都收：脚本后半段统一用延迟展开（`!REPO_DIR!`），老版用 `%REPO_DIR%`，
-  // 断言要守的是 **file: 前缀**，不是变量语法。
-  assert.ok(/plugin --profile "%PROFILE%" add "file:(?:%REPO_DIR%|!REPO_DIR!)"/.test(cmdRaw),
-    '装插件必须用 file: 前缀（裸路径记成 link:，realpath 落在 $DSH_HOME/profiles 之外，'
-    + 'agent 半裸导入 Cannot find package）')
-  assert.ok(cmdRaw.includes('scripts\\setup.mjs apply') && cmdRaw.includes('scripts\\setup.mjs verify'),
-    '装完插件要接着 setup.mjs apply（默认配置，幂等带备份）与 verify（自检报告）')
-  const pnpmAt = cmdRaw.indexOf('npm install -g pnpm')
-  const legacyAt = cmdRaw.indexOf('--legacy-peer-deps')
-  // 用真实的调用行（`call "!DSH_EXE!" plugin --profile "%PROFILE%" add "file:!REPO_DIR!"`）
-  // 定位，别按某一个变量写法去找 —— 脚本的变量写法会演进，顺序约束不会。
-  const addAt = cmdRaw.lastIndexOf('add "file:')
-  assert.ok(pnpmAt !== -1 && addAt !== -1 && pnpmAt < addAt, 'pnpm 必须先于 dsh plugin add 装好')
-  assert.ok(legacyAt !== -1 && legacyAt < addAt, '构建必须先于 dsh plugin add 完成（lib/ 不入库）')
-  assert.ok(cmdRaw.includes('set "PROFILE=web"') && cmdRaw.includes('GITEE_CHAT_DSH_PROFILE'),
-    'install-dsh.cmd 必须自动挑目标 profile（默认 web，GITEE_CHAT_DSH_PROFILE 可覆盖）—— '
-    + '桌面版固定加载 profiles\\desktop，装进没人加载的 profile 是静默失效（tab 与工具都不出现）')
-  // 两种"桌面版在场"的判据都收（0.4.5 重写后改成：找到**应用自带的 CLI** ⇒ 桌面版在场）：
-  // 断言要守的是行为——桌面版在用 desktop 这个固定 profile 名，不是某一行写法。
-  assert.ok(/if defined DSH_EXE \(\s*set "PROFILE=desktop"/.test(cmdRaw)
-    || cmdRaw.includes('if exist "%DSH_HOME%\\profiles\\desktop" set "PROFILE=desktop"'),
-    'install-dsh.cmd 必须在桌面版在场时改选 desktop（应用自带的 CLI 被找到 / profiles\\desktop 存在；'
-    + '桌面版 profile 名固定为 desktop）')
-  console.log('  ✓ Windows .cmd 插件安装链：pnpm → 构建（--legacy-peer-deps）→ file: add → apply/verify 顺序闭合')
-  console.log('  ✓ Windows .cmd 静态不变量：ASCII / CRLF / 引号内无 ^< / 无 !! / 结语含 PowerShell 出路')
-
-  // ══ 1f-2. Windows 卸载脚本（install-dsh 的严格逆操作）的静态不变量 ═════════
-  //
-  // 复位脚本同样进不了 CI（无 cmd.exe），同样的静态守卫，外加它自己的口径：
-  //   ① 撤销必须真的执行（CurrentUser 改回 Undefined），而不是只打印命令
-  //   ② 只有 install-dsh 提的那一档（CurrentUser RemoteSigned）才自动撤销；
-  //      脚本本身绝不允许出现"放宽"方向的 Set-ExecutionPolicy
-  //   ③ 5.1 与 7 两套存储都要还原；撤销前后都用新进程探作用域
-  //     （组策略覆盖时 Set-ExecutionPolicy 返回 0 但没改成，提示还是本地化的）
-  const uninstPath = join(root, 'scripts/uninstall-dsh.cmd')
-  const uninstRaw = readFileSync(uninstPath, 'utf8')
-  assert.ok(!/[^\x00-\x7F]/.test(uninstRaw),
-    'uninstall-dsh.cmd 必须纯 ASCII：非 ASCII 的 .cmd 在 936 代码页下会乱码')
-  assert.ok(!/(^|[^\r])\n/.test(uninstRaw),
-    'uninstall-dsh.cmd 必须是 CRLF 行尾（编辑器插入一个裸 LF 就可能让 cmd 读岔）')
-  assert.ok(!uninstRaw.includes('!!'),
-    'uninstall-dsh.cmd 提示语里不能出现 !!：EnableDelayedExpansion 会把它吃成空变量引用')
-  const unCaretOffenders = uninstRaw.split('\r\n')
-    .filter((line) => /^\s*echo\b/i.test(line) && cmdCaretInQuotes(line))
-  assert.equal(unCaretOffenders.length, 0,
-    `uninstall-dsh.cmd 的 echo 行在双引号内用了 ^< / ^>：\n    ${unCaretOffenders.join('\n    ')}`)
-  assert.ok(uninstRaw.includes('Set-ExecutionPolicy -Scope CurrentUser Undefined -Force'),
-    '复位必须真的执行撤销（CurrentUser 改回 Undefined），而不是只打印命令')
-  assert.ok(!/Set-ExecutionPolicy -Scope CurrentUser (?!Undefined)/.test(uninstRaw),
-    '卸载脚本里不许出现非 Undefined 方向的 Set-ExecutionPolicy —— 它的职责是还原出厂，不是放宽')
-  assert.ok(/if \/i "!POLICY_SCOPE!"=="RemoteSigned" goto :PRUndo/.test(uninstRaw),
-    '只有 CurrentUser 恰为 RemoteSigned（install-dsh 提的那一档）才自动撤销')
-  assert.ok(uninstRaw.includes('call :PolicyRestore powershell') && uninstRaw.includes('call :PolicyRestore pwsh'),
-    'Windows PowerShell 5.1 与 PowerShell 7 的策略存储是两套，两个都要还原')
-  assert.ok(uninstRaw.includes('call :ScopeQuery') && /Get-ExecutionPolicy -Scope CurrentUser" 2\^>nul/.test(uninstRaw),
-    '撤销前后都必须用新进程探 CurrentUser 作用域（Set-ExecutionPolicy 被组策略覆盖时仍返回 0，'
-    + '不能靠匹配输出文本判断成功）')
-  assert.ok(uninstRaw.includes('%USERPROFILE%\\.dsh') && uninstRaw.includes('%APPDATA%\\npm')
-    && uninstRaw.includes('%LOCALAPPDATA%\\npm-cache'),
-    '三个要删的文件夹（DSH home / npm 全局前缀 / npm 缓存）的默认路径必须写对')
-  const unLabels = new Set(uninstRaw.split('\r\n')
-    .filter((line) => /^\s*:[A-Za-z]/.test(line))
-    .map((line) => line.trim().slice(1).toLowerCase()))
-  const unTargets = [...uninstRaw.matchAll(/(?:goto|call)\s+:([A-Za-z_]\w*)/g)].map((m) => m[1].toLowerCase())
-  const unDangling = [...new Set(unTargets)].filter((t) => !unLabels.has(t))
-  assert.equal(unDangling.length, 0,
-    `uninstall-dsh.cmd 里 goto/call 了不存在的标签：${unDangling.join(', ')}（已定义：${[...unLabels].join(', ')}）`)
-  console.log('  ✓ Windows 卸载 .cmd 静态不变量：ASCII / CRLF / 无 !! / 撤销口径（只还 RemoteSigned 一档）/ 标签闭合')
-
   // ══ 1g. `pnpm install` 必须真能跑通（README 手工安装段的第一步）═══════════
   //
   // 真机上"照着 README 走卡在第一步"的两个原因，都在这一个文件里：
@@ -819,7 +743,7 @@ async function main() {
   // 可能互为前提 —— 把配置做进标签页，等于让使用者先有 token 才能找到配 token 的地方。
   const tabViewSrc = readFileSync(join(root, 'src', 'client', 'GiteeProjectView.tsx'), 'utf8')
   assert.ok(!/TokenSettings|TokenForm|粘贴企业版 access token/.test(tabViewSrc),
-    '「Gitee 项目」标签页不得再出现 token 配置代码 —— 入口只有应用「设置 → Gitee 企业项目」')
+    '「Gitee 项目」标签页不得再出现 token 配置代码 —— 入口只有应用「设置 → Gitee 企业项目」（DESIGN.md §30）')
   assert.ok(!/settings\.section/.test(tabViewSrc),
     '设置分节只能在 client/index.tsx 里注册，别在标签页视图里再注册一遍')
   console.log('  ✓ client 槽位：工具卡片 / 会话标签页 / 设置分节（Gitee 企业项目）都已注册且已进入构建产物')
@@ -838,7 +762,7 @@ async function main() {
   // ══ 3. 🔴 平面纪律回归守卫（本次 bug 的守卫）════════════════════════════
   //
   // host 半**只许**注册公开 gateway 这一个工具（`gitee_ent`，MCP 是工具类后端、
-  // 用户 2026-10-10 要求公共化），其余任何 agent 可见的东西
+  // 用户 2026-10-10 要求公共化；DESIGN.md §37），其余任何 agent 可见的东西
   // （人格上下文、门禁、第二个工具、restrict）都不许出现。
   assert.equal(hostCtx.rec.tools.length, 1,
     `host 半只许注册公开 gateway 一个工具，实际 ${hostCtx.rec.tools.length} 个——`
@@ -862,20 +786,30 @@ async function main() {
     enforceTier: true,
   })
 
-  assert.equal(agentCtx.rec.tools.length, 4, `agent 半应注册 4 个工具，实际 ${agentCtx.rec.tools.length}`)
+  assert.equal(agentCtx.rec.tools.length, 5, `agent 半应注册 5 个工具，实际 ${agentCtx.rec.tools.length}`)
   assert.deepEqual(
     agentCtx.rec.tools.map((t) => t.name).sort(),
-    ['gitee_board', 'gitee_chat_health', 'gitee_enterprises', 'gitee_role'],
+    // 0.5.5+：`gitee_board_snapshot` = 只读缓存的快照工具（用户口径 m02223「会话可读」）
+    ['gitee_board', 'gitee_board_snapshot', 'gitee_chat_health', 'gitee_enterprises', 'gitee_role'],
   )
   assert.equal(agentCtx.rec.promptContexts.length, 1, 'agent 半应注册 1 个人格上下文')
+  // 人格上下文必须经 `ctx.inject(['systemPrompt'], …)` 注册（可选依赖、服务晚到也生效）。
+  // 早先是在 apply 里同步 `ctx.get('systemPrompt')`：真宿主上 preset 行可能比
+  // dsh-system-prompt 先起来，get() 返回 undefined → 只 warn 一次、永不重试，
+  // 表现就是「人格与三档能力矩阵失效」（提示词里没有 <gitee-role>）。
+  assert.deepEqual(agentCtx.rec.promptContexts[0]?.name, 'gitee-role', '人格上下文名字应为 gitee-role')
+  assert.ok(
+    agentCtx.rec.injects.some((deps) => deps.includes('systemPrompt')),
+    '人格注入必须走 ctx.inject([\'systemPrompt\'])，不能在 apply 里同步 get()',
+  )
   assert.equal(agentCtx.rec.guards.length, 1, 'agent 半应注册 1 个门禁')
   assert.equal(agentCtx.rec.routes.length, 0, 'agent 半不得挂路由（路由是进程级，属 host 半）')
-  // Gitee 会话里必须把公开 gateway 隐藏掉：它不裁剪工具（48 个全可达），
+  // Gitee 会话里必须把公开 gateway 隐藏掉：它不裁剪工具（55 个全可达），
   // 而本 preset 已经挂着**原生** MCP 工具 + 能力档门禁，重复入口只是绕过档位的后门。
   assert.deepEqual(agentCtx.rec.restricts, [{ deny: [PUBLIC_GATEWAY_TOOL_NAME] }],
-    `agent 半必须 restrict 掉公开 gateway「${PUBLIC_GATEWAY_TOOL_NAME}」，改用原生 mcp__gitee_ent__* 工具`)
+    `agent 半必须 restrict 掉公开 gateway「${PUBLIC_GATEWAY_TOOL_NAME}」，改用原生 mcp__gitee_ent__* 工具（DESIGN.md §37）`)
   // 反向自检：这个假 ctx 真的会拦下"把数组当 filter"的写法吗？
-  // （真宿主对数组会静默 no-op，只有假 ctx 按契约拦下才不至于假绿。）
+  // （0.5.0 第一版正是这么写的，真宿主静默 no-op，人工测试才暴露。）
   assert.throws(() => agentCtx.tools.restrict([PUBLIC_GATEWAY_TOOL_NAME]),
     /期望 \{ allow\?, deny\? \} 对象/,
     '假 ctx 必须按真契约拒绝数组 filter，否则同类 bug 还会假绿')
@@ -887,7 +821,7 @@ async function main() {
   const promptContexts = agentCtx.rec.promptContexts
   const handler = hostCtx.rec.routes[0].handler
 
-  // ══ 4b. 公开 gateway════════════════════════════════════
+  // ══ 4b. 公开 gateway（DESIGN.md §37）════════════════════════════════════
   //
   // 真起一个假 MCP 后端（stdio + 换行分隔 JSON-RPC）——不碰真二进制、也不要 token，
   // 但握手/目录/取 schema/执行/报错/只读硬拦/后端缺失这七条路都真跑一遍。
@@ -911,12 +845,19 @@ process.stdin.on('data', (chunk) => {
     } else if (message.method === 'tools/list') {
       send({ jsonrpc: '2.0', id: message.id, result: { tools: [
         { name: 'list_things', description: '列出东西\\n第二行细节不该进目录', inputSchema: { type: 'object', properties: { q: { type: 'string' } } } },
-        { name: 'create_enterprise_issue', description: '创建工作项（写操作）', inputSchema: { type: 'object', properties: {} } },
+        { name: 'list_enterprise_issues', description: '列出工作项', inputSchema: { type: 'object', properties: { enterprise_id: { type: 'number' }, project_id: { type: 'string' } } } },
+        { name: 'create_enterprise_issue', description: '创建工作项（写操作）', inputSchema: { type: 'object', properties: { enterprise_id: { type: 'number' }, project_id: { type: 'string' }, program_id: { type: 'number' } } } },
+        { name: 'list_enterprise_members', description: '列出企业成员（只读，回显参数）', inputSchema: { type: 'object', properties: { enterprise_id: { type: 'number' }, page: { type: 'number' } } } },
       ] } })
     } else if (message.method === 'tools/call') {
       const name = message.params?.name
       if (name === 'boom') {
         send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'unknown tool: boom' } })
+      } else if (name === 'list_enterprise_issues') {
+        // 仓库 1 是"查不到所属项目"的那条（用来钉住"宁可拒建"这条纪律）。
+        const empty = String(message.params?.arguments?.project_id) === '1'
+        const data = empty ? [] : [{ id: 1, program_id: 897677 }]
+        send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: JSON.stringify({ total_count: data.length, data }) }] } })
       } else {
         send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'RESULT:' + name + ':' + JSON.stringify(message.params?.arguments ?? {}) }] } })
       }
@@ -941,7 +882,7 @@ process.stdin.on('data', (chunk) => {
       enterpriseSelector: () => ({ id: 31415926, describe: '合成来源（冒烟用）' }),
     })
     assert.equal(gwTool.name, PUBLIC_GATEWAY_TOOL_NAME, '公开 gateway 的工具名必须是 gitee_ent')
-    // 两级暴露的全部意义：**常驻的那一个 schema 必须很小**（48 个全量 ≈ 14.6K tokens）。
+    // 两级暴露的全部意义：**常驻的那一个 schema 必须很小**（55 个全量 ≈ 17.6K tokens）。
     const gwBytes = Buffer.byteLength(JSON.stringify({
       name: gwTool.name, description: gwTool.description, parameters: gwTool.parameters,
     }), 'utf8')
@@ -982,6 +923,40 @@ process.stdin.on('data', (chunk) => {
     assert.match((await gwTool.execute({ op: 'call', name: 'boom' }, {})).text, /工具名可能不对/,
       'MCP 报 unknown tool 时应提示改用 op=list')
 
+    // 入参归一化（2026-10-27 事故：工作项建到别的企业、且没关联项目）。
+    const fixed = await gwTool.execute({
+      op: 'call',
+      name: 'create_enterprise_issue',
+      args: { enterprise_id: 16772430, project_id: '50438614', title: 't' },
+    }, {})
+    assert.match(fixed.text, /纠正为配置企业 31415926/, '显式传了别的企业 id 必须被纠正回配置企业')
+    assert.match(fixed.text, /自动关联项目 program_id=897677/, '缺 program_id 时按仓库反查并补上')
+    assert.match(fixed.text, /"enterprise_id":31415926/, '真正发给后端的企业 id 必须是配置企业')
+    assert.match(fixed.text, /"program_id":897677/, '真正发给后端的 program_id 必须是反查结果')
+
+    // 只读调用：显式给别家企业要原样放行（同一账号可属多家企业，查别家是正当用法），
+    // 只有"没给 / 给 0"才补配置企业 —— 写操作才强制归到配置企业。
+    const otherEnterprise = await gwTool.execute({
+      op: 'call',
+      name: 'list_enterprise_members',
+      args: { enterprise_id: 16772430 },
+    }, {})
+    assert.match(otherEnterprise.text, /RESULT:list_enterprise_members:\{"enterprise_id":16772430\}/,
+      '只读调用里显式指定的其他企业必须原样放行，不能一律改成配置企业')
+    assert.doesNotMatch(otherEnterprise.text, /纠正为配置企业/, '只读放行时不该出现"已纠正"的说明')
+
+    const zeroEnterprise = await gwTool.execute({
+      op: 'call',
+      name: 'list_enterprise_members',
+      args: { enterprise_id: 0 },
+    }, {})
+    assert.match(zeroEnterprise.text, /"enterprise_id":31415926/, '只读调用给 0 时必须补成配置企业（0 发出去就是 401）')
+    assert.match(zeroEnterprise.text, /已自动补上 enterprise_id=31415926/, '补默认企业时要告诉模型补了什么')
+
+    const refused = await gwTool.execute({ op: 'call', name: 'create_enterprise_issue', args: { project_id: '1' } }, {})
+    assert.match(refused.text, /未关联项目，已拒绝创建/, '查不到项目时必须拒建，不能产出没有项目的工作项')
+    assert.ok(!/RESULT:create_enterprise_issue/.test(refused.text), '拒建时不得真的打到后端')
+
     // 只读部署：写工具硬拦（用生成表里真实存在的写工具名，顺带钉住生成物被真的读到了）。
     assert.ok(WRITE_TOOLS.includes('create_enterprise_issue'),
       'src/generated/tierWrites.ts 必须含 create_enterprise_issue（读不到就是生成物没进构建）')
@@ -1008,7 +983,7 @@ process.stdin.on('data', (chunk) => {
     assert.match((await silentTool.execute({ op: 'list' }, {})).text, /调用超时/,
       '后端不响应时应报超时并给缩小范围的建议')
 
-    console.log(`  ✓ 公开 gateway：${gwTool.name} 常数 1 个工具（schema ${gwBytes} 字节）—— list/schema/call + 只读硬拦 + 失败文案`)
+    console.log(`  ✓ 公开 gateway：${gwTool.name} 常数 1 个工具（schema ${gwBytes} 字节）—— list/schema/call + 企业/项目归一化 + 只读硬拦 + 失败文案`)
   } finally {
     for (const client of gwClients) client.dispose()
     await rm(gwDir, { recursive: true, force: true })
@@ -1020,6 +995,9 @@ process.stdin.on('data', (chunk) => {
   assert.equal(typeof toolResult.text, 'string')
   assert.match(toolResult.text, /样例数据/, '未配置 token 时应提示样例数据')
   assert.match(toolResult.text, /风险/)
+  // 时效性提醒义务（用户口径 m02223）：工具输出必须自带「多久以前的数据 + 是否过期」
+  assert.match(toolResult.text, /数据时效/, 'gitee_board 输出必须自带数据时效说明')
+  assert.match(toolResult.text, /ageSeconds=/, '时效行必须带机器可读的 ageSeconds')
   console.log(`  ✓ gitee_board.execute → ${toolResult.text.length} 字符摘要`)
 
   const healthTool = ctx.tools.find((t) => t.name === 'gitee_chat_health')
@@ -1027,6 +1005,162 @@ process.stdin.on('data', (chunk) => {
   console.log('  ✓ gitee_chat_health.execute → 自检报告')
 
   // ══ 6. 路由（host 半）═══════════════════════════════════════════════════
+  // ── 缓存 / 后台刷新开关（「设置 → Gitee 企业项目」那几个开关）────────────
+  //
+  // 用户 2026-10-27 报「设置里没有开关」两次：第一次是 Config 漏标 volatile，
+  // 第二次是那套自动表单只出现在「插件管理」格子里、跟 Gitee 页不在同一处。
+  // 现在开关走本地覆盖 + `/settings` 路由，这里钉死读写与规整规则。
+  {
+    const settingsDir = join(sandboxHome, '.gitee-chat')
+    const store = createLocalSettings(settingsDir)
+    const base = {
+      cache: { agentReadable: true, persist: true, ttlSeconds: 60 },
+      autoRefresh: { enabled: false, intervalSeconds: 60, idleMinutes: 30 },
+    }
+    assert.deepEqual(store.resolve(base), base, '没有本地覆盖时必须原样返回静态配置')
+
+    const written = store.write({ cache: { ttlSeconds: 120 }, autoRefresh: { enabled: true } }, base)
+    assert.equal(written.cache.ttlSeconds, 120)
+    assert.equal(written.autoRefresh.enabled, true)
+    assert.equal(written.cache.persist, true, '没写的字段要沿用静态配置')
+    assert.deepEqual(store.resolve(base), written, '写完之后现读必须拿到新值（不用重启）')
+
+    // 规整：0 表示关闭缓存；1..9 抬到最小 10；非法值回落
+    assert.equal(normalizeTtlSeconds(0, 60), 0, '0 表示关闭缓存')
+    assert.equal(normalizeTtlSeconds(3, 60), 10, '新鲜期最小 10 秒')
+    assert.equal(normalizeTtlSeconds(Number.NaN, 60), 60)
+    assert.equal(normalizeIntervalSeconds(3, 60), 10, '刷新间隔最小 10 秒')
+    assert.equal(normalizeIdleMinutes(0, 30), 1, '闲置分钟最小 1')
+    assert.equal(normalizeIdleMinutes(9999, 30), 1440, '闲置分钟上限 1440')
+
+    // 写覆盖不能踩掉 config.json 里别人的字段（企业、模板绑定）
+    const cfgPath = join(settingsDir, 'config.json')
+    const raw = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    raw.enterpriseId = 16859203
+    writeFileSync(cfgPath, JSON.stringify(raw, null, 2))
+    store.write({ cache: { persist: false } }, base)
+    const after = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    assert.equal(after.enterpriseId, 16859203, '写设置时不能丢掉 enterpriseId')
+    assert.equal(after.cache.persist, false)
+    console.log('  ✓ 缓存/刷新开关：本地覆盖读写 + 规整 + 不踩别的键')
+  }
+
+  // 时间戳必须用**本机时间**且不打印时区（用户 2026-10-27：先「04:57:40 不对」，后「+08:00 不用显示」）
+  {
+    const stamp = nowStamp()
+    assert.match(stamp, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, `时间戳不应带时区段：${stamp}`)
+    const parsed = parseStamp(stamp)
+    assert.ok(Math.abs(Date.now() - parsed) < 5000, `nowStamp 必须是本机当前时间：${stamp}`)
+    // 显式钉住「是本机小时」：UTC 会差 8 小时（CI 不在 +08:00 也能过，因为比的是本机）
+    const now = new Date()
+    assert.equal(stamp.slice(0, 10), `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`, '日期必须是本机日期')
+    assert.ok(Math.abs(Number(stamp.slice(11, 13)) - now.getHours()) <= 1, `小时必须是本机小时：${stamp}`)
+    // 过渡期写出去过的带偏移串仍要能解析（老缓存文件）
+    assert.ok(Number.isFinite(parseStamp('2026-10-27 12:57:40 +08:00')), '带偏移的旧串必须仍可解析')
+    console.log(`  ✓ 时间戳为本机时间且不带时区：${stamp}`)
+  }
+
+  // 仓库下钻页 = 项目列表 + 仓库列表 + 仓库资源 三栏，两列表都能切换
+  // （用户 2026-10-27 m03483：项目列表还在、仓库用左侧列表而不是下拉）
+  {
+    const view = readFileSync(new URL('../src/client/GiteeProjectView.tsx', import.meta.url), 'utf8')
+    const branch = view.slice(view.indexOf('} else if (drillDown) {'))
+    const block = branch.slice(0, branch.indexOf('} else {'))
+    assert.ok(block.includes('<ProgramNav'), '下钻页要保留项目列表（可切项目）')
+    assert.ok(block.includes('<RepoPanel'), '下钻页要渲染 RepoPanel（含本项目仓库列表）')
+    assert.ok(block.includes('setRepoFocus(null)'), '换项目要清掉旧仓库焦点')
+    assert.ok(block.includes('<ColResizer'), '下钻页的项目列表栏宽要可拖')
+    assert.ok(!/embedded/.test(block), '仓库切换必须是左侧列表，不是下拉')
+    // 注释里引用了用户原话（含「切换仓库 ▾」），所以只钉代码形态：不能有下拉/actions
+    assert.ok(!/<select/.test(block) && !/actions:/.test(block), '不能再用下拉方式切仓库')
+    // 换项目不许退回卡片页（用户 2026-10-27）：块里只允许「返回项目」按钮那一处 setDrillDown(false)
+    assert.equal(block.match(/setDrillDown\(false\)/g)?.length ?? 0, 1, '换项目不能退出下钻（只有返回按钮能退）')
+    console.log('  ✓ 仓库下钻页：项目列表 + 仓库列表 + 资源，两者都可切换（换项目留在本页）')
+  }
+
+  // 栏宽可拖 + 换项目不回卡片页（用户 2026-10-27）
+  {
+    const resize = readFileSync(new URL('../src/client/resize.tsx', import.meta.url), 'utf8')
+    assert.ok(resize.includes('export function useColWidth'), '栏宽 hook 必须在')
+    assert.ok(resize.includes('export function ColResizer'), '拖拽把手组件必须在')
+    assert.ok(resize.includes("gq:colw:"), '栏宽要存在 localStorage（键带 gq:colw: 前缀）')
+    const view = readFileSync(new URL('../src/client/GiteeProjectView.tsx', import.meta.url), 'utf8')
+    assert.ok(view.includes("useColWidth('project'"), '项目列表栏宽要可拖')
+    assert.ok(view.includes('drillDown'), '下钻页用独立 drillDown 状态')
+    assert.ok(!view.includes('} else if (repoFocus !== null) {'), '下钻分支不能再以 repoFocus 判定（换项目会掉回卡片页）')
+    const repo = readFileSync(new URL('../src/client/RepoPanel.tsx', import.meta.url), 'utf8')
+    assert.ok(repo.includes("useColWidth('repo'"), '仓库列表栏宽要可拖')
+    // 分栏容器必须不换行，否则一拖宽就把右列挤到下一行（"能拉的范围非常小"的根因）
+    const boardCss = readFileSync(new URL('../src/client/board.module.css', import.meta.url), 'utf8')
+    const split = boardCss.slice(boardCss.indexOf('.gqVSplit {'))
+    assert.ok(/\.gqVSplit \{[^}]*flex-wrap: nowrap/.test(split), '分栏容器必须 flex-wrap: nowrap')
+    assert.ok(view.includes('gqVSplit') && repo.includes('gqVSplit'), '下钻页与仓库页都要用不换行的分栏容器')
+    console.log('  ✓ 项目/仓库列表栏宽可拖拽并记住；换项目留在下钻页只换仓库列表')
+  }
+
+  // 点别的仓库不能被 focus 弹回去（用户 2026-10-27：「点击之后又非常快的被切回了」）
+  {
+    const repo = readFileSync(new URL('../src/client/RepoPanel.tsx', import.meta.url), 'utf8')
+    assert.ok(repo.includes('appliedFocus'), 'focusRepoId 必须只应用一次（appliedFocus 标记）')
+    assert.ok(/\[list, pick, props\.focusRepoId\]/.test(repo), 'focus effect 依赖里不能带 selected（会弹回原仓库）')
+    assert.ok(!repo.includes('当前口径：'), '面板顶部的口径说明不再显示')
+    console.log('  ✓ 仓库列表点选不会被 focus 弹回、无多余口径说明')
+  }
+
+  // 口径要在切项目/重挂载后保留（用户 2026-10-27：「点击切换项目后：内源仓库选中失效」）
+  {
+    const repo = readFileSync(new URL('../src/client/RepoPanel.tsx', import.meta.url), 'utf8')
+    assert.ok(repo.includes("const SCOPE_KEY = 'gq:repo-scope'"), '口径要有 localStorage 记忆键')
+    assert.ok(/localStorage\.getItem\(SCOPE_KEY\)/.test(repo), '挂载时要读回上次的口径')
+    assert.ok(/localStorage\.setItem\(SCOPE_KEY/.test(repo), '切口径时要写回 localStorage')
+    console.log('  ✓ 仓库口径（本项目 / 内源仓库）跨项目切换保留')
+  }
+
+  // 知识库页 = 左项目列表 + 右知识库，切「本项目 / 公共知识库」
+  // （用户 2026-10-27：「点击知识库 左侧项目列表右侧展示项目下 知识库，切换卡本项目和公共知识库」）
+  {
+    const view = readFileSync(new URL('../src/client/GiteeProjectView.tsx', import.meta.url), 'utf8')
+    const branch = view.slice(view.indexOf("} else if (tab === 'docs') {"))
+    const block = branch.slice(0, branch.indexOf("} else if (tab === 'analysis') {"))
+    assert.ok(block.includes('<ProgramNav'), '知识库页要有左侧项目列表')
+    assert.ok(block.includes('<DocPanel'), '知识库页要渲染 DocPanel')
+    assert.ok(block.includes('<ColResizer'), '知识库页的项目列表栏宽要可拖')
+    const doc = readFileSync(new URL('../src/client/DocPanel.tsx', import.meta.url), 'utf8')
+    assert.ok(doc.includes('公共知识库'), 'DocPanel 要能切到公共知识库')
+    // 用户 2026-10-27：「本项目删除这个胶囊，默认打开就是本项目的知识库」→ 只剩一枚「公共知识库」胶囊
+    assert.ok(!/\{ key: 'project', label: '本项目' \}/.test(doc), '不再保留「本项目」胶囊（默认就是本项目）')
+    assert.ok(doc.includes('gqVScopeChip'), '范围切换用胶囊（与仓库页同一套）')
+    assert.ok(!/label: '公共知识库'/.test(doc), '范围切换不再用分段控件')
+    // 工具栏分两行：过滤框一行，胶囊/按钮一行
+    assert.ok(/flexDirection: 'column'/.test(doc), '知识库工具栏要分行展示')
+    console.log('  ✓ 知识库页：左项目列表 + 右知识库（本项目 / 公共知识库 可切）')
+  }
+
+  // 仓库页的工作项要能点开详情（用户 2026-10-27：「这三个工作项目不可点击」）
+  {
+    const repo = readFileSync(new URL('../src/client/RepoPanel.tsx', import.meta.url), 'utf8')
+    assert.ok(repo.includes('onClick: () => setOpenIdent(it.ident)'), '仓库工作项行必须可点击')
+    assert.ok(repo.includes('h(IssueDetail'), '仓库页点开工作项要渲染 IssueDetail')
+    assert.ok(repo.includes('prefetchIssue(it.ident)'), '仓库工作项悬停要预取详情（点击不再等网络）')
+    assert.ok(!repo.includes('embedded'), 'RepoPanel 不该有 embedded 分支（列表就是切换器）')
+    assert.ok(repo.includes('onClick: () => pick(repo)'), '仓库列表项点一下就切换')
+    console.log('  ✓ 仓库页工作项可点开详情、仓库列表可点切换')
+  }
+
+  const settingsGet = await call(handler, { method: 'GET', url: '/api/gitee-chat/settings' })
+  assert.equal(settingsGet.status, 200)
+  assert.equal(typeof settingsGet.json.values.cache.ttlSeconds, 'number')
+  const settingsPost = await call(handler, {
+    method: 'POST',
+    url: '/api/gitee-chat/settings',
+    body: JSON.stringify({ cache: { ttlSeconds: 30 } }),
+  })
+  assert.equal(settingsPost.status, 200)
+  assert.equal(settingsPost.json.values.cache.ttlSeconds, 30, 'POST /settings 要回显新值')
+  const settingsBad = await call(handler, { method: 'POST', url: '/api/gitee-chat/settings', body: '{}' })
+  assert.equal(settingsBad.status, 400, '空 patch 要报 400，不能默默写空对象')
+  console.log('  ✓ GET/POST /settings → 读写缓存开关')
+
   const ping = await call(handler, { method: 'GET', url: '/api/gitee-chat/ping' })
   assert.equal(ping.status, 200)
   assert.equal(ping.json.ok, true)
@@ -1063,6 +1197,58 @@ process.stdin.on('data', (chunk) => {
     method: 'GET', url: '/api/gitee-chat/ping', host: 'evil.example.com',
   })).status, 403)
   console.log('  ✓ 信任栅栏：跨站 403 / 陌生 Host 403')
+
+  // 信任栅栏的**可信 authority 从哪儿来**——这里守的是一个真事故：
+  // 插件曾只读 `ctx.get('webRuntime')`，而 dsh 0.2.x 全树没有任何插件 provide 它，
+  // 于是可信列表恒为空 → 公网入口（`--trusted-host` / `--public-url` 都配了）
+  // 所有路由一律 403「请求未通过浏览器信任栅栏」，连配 token 都进不去。
+  //
+  // 真源是 @deepseek-ai/dsh-web-app/startup 的 `webStartup` 服务
+  // （WEB_STARTUP_SERVICE）：`trustedHosts` = `--trusted-host`，`publicUrl` = `--public-url`。
+  const originalStartup = hostCtx.rec.webStartup
+  const originalRuntime = hostCtx.rec.webRuntime
+  try {
+    // (a) 宿主 --trusted-host 的 authority 必须放行（哪怕端口不是默认的）
+    hostCtx.rec.webStartup = { trustedHosts: ['gitee.example.com:8443'] }
+    const viaTrustedHost = await call(handler, {
+      method: 'GET', url: '/api/gitee-chat/ping', host: 'gitee.example.com:8443',
+    })
+    assert.equal(viaTrustedHost.status, 200,
+      '宿主 --trusted-host 声明过的 authority 必须放行，否则公网部署所有路由 403')
+    console.log('  ✓ 信任栅栏：webStartup.trustedHosts 放行（外网入口可用）')
+
+    // (b) --public-url 公告的入口也算可信（带路径的 URL 只取 authority）
+    hostCtx.rec.webStartup = { trustedHosts: [], publicUrl: 'https://gitee.example.com/ui/' }
+    assert.equal((await call(handler, {
+      method: 'GET', url: '/api/gitee-chat/ping', host: 'gitee.example.com',
+    })).status, 200, '--public-url 公告的入口必须放行（否则外网入口只能靠 --trusted-host 再写一遍）')
+
+    // (c) 老宿主只 provide webRuntime 时仍然工作（向后兼容，不因升级/降级双双失效）
+    hostCtx.rec.webStartup = null
+    hostCtx.rec.webRuntime = { trustedHosts: ['legacy.example.com:3080'] }
+    assert.equal((await call(handler, {
+      method: 'GET', url: '/api/gitee-chat/ping', host: 'legacy.example.com:3080',
+    })).status, 200, '没有 webStartup 的老宿主应从 webRuntime 读到 trustedHosts')
+
+    // (d) 环境变量逃生口：反代改写 Host、宿主没把 authority 告诉插件时，运维不用改宿主
+    hostCtx.rec.webRuntime = { trustedHosts: [] }
+    process.env.DSH_GITEE_CHAT_TRUSTED_HOSTS = ' proxied.example.com:18574 , '
+    assert.equal((await call(handler, {
+      method: 'GET', url: '/api/gitee-chat/ping', host: 'proxied.example.com:18574',
+    })).status, 200, 'DSH_GITEE_CHAT_TRUSTED_HOSTS 必须能追加可信 authority')
+
+    // (e) 放宽的只是"哪些 Host 可信"，跨站标记照样拦
+    assert.equal((await call(handler, {
+      method: 'GET', url: '/api/gitee-chat/ping',
+      host: 'proxied.example.com:18574',
+      headers: { 'sec-fetch-site': 'cross-site' },
+    })).status, 403, '可信 authority 不能顺带放过跨站请求')
+    console.log('  ✓ 信任栅栏：publicUrl / webRuntime 兜底 / 环境变量 + 跨站仍 403')
+  } finally {
+    hostCtx.rec.webStartup = originalStartup
+    hostCtx.rec.webRuntime = originalRuntime
+    delete process.env.DSH_GITEE_CHAT_TRUSTED_HOSTS
+  }
 
   // ══ 8. 能力档推导规则 ══════════════════════════════════════════════════
   const { deriveTier, personaOf, TIERS, renderMatrix } = await import('../scripts/gitee/gq.mjs')
@@ -1112,7 +1298,7 @@ process.stdin.on('data', (chunk) => {
     console.log('  ✓ <docs> 人格块：主路径=节点树+附件 · 仓库 WIKI 单列 · WikiInfo 降级为条件块')
   }
 
-  // 工具集单调 + 越权剔除 + 覆盖真实 41
+  // 工具集单调 + 越权剔除 + 覆盖真实工具数
   const execTools = new Set(TIERS.exec.tools)
   const projTools = new Set(TIERS.project.tools)
   const mgrTools = new Set(TIERS.manager.tools)
@@ -1122,8 +1308,9 @@ process.stdin.on('data', (chunk) => {
     assert.ok(!execTools.has(t) && !projTools.has(t), `${t} 不该出现在执行/负责人档`)
     assert.ok(mgrTools.has(t), `${t} 应在管理者档`)
   }
-  assert.equal(mgrTools.size, 48, `管理者档应恰好覆盖二进制的 48 个工具，实际 ${mgrTools.size}`)
-  console.log(`  ✓ 工具集：执行 ${execTools.size} ⊂ 负责人 ${projTools.size} ⊂ 管理者 ${mgrTools.size}（覆盖全部 48）`)
+  assert.equal(mgrTools.size, BINARY_TOOL_COUNT,
+    `管理者档应恰好覆盖二进制的 ${BINARY_TOOL_COUNT} 个工具，实际 ${mgrTools.size}`)
+  console.log(`  ✓ 工具集：执行 ${execTools.size} ⊂ 负责人 ${projTools.size} ⊂ 管理者 ${mgrTools.size}（覆盖全部 ${BINARY_TOOL_COUNT}）`)
 
   // 写工具子集：只读部署（allowWrites=false）的门禁按它硬拦，必须真的是 tools 的子集
   for (const k of ['exec', 'project', 'manager']) {
@@ -1155,6 +1342,19 @@ process.stdin.on('data', (chunk) => {
   assert.ok(execTools.has('update_enterprise_document_page'), '执行档应能改自己可写目录里的页面')
   assert.ok(execTools.has('upload_enterprise_document_files'), '执行档应能导入文档')
   console.log('  ✓ 文档工具已并入矩阵（我们 9 个 + 上游 6 个：读类三档全有，改页面/导入在执行档）')
+
+  // CAPABILITIES.md 防漂移（该文档只在本机维护、不入库；干净检出里没有它 → 跳过，不判红）
+  const { readFile: readF } = await import('node:fs/promises')
+  const doc = await readF(new URL('../docs/CAPABILITIES.md', import.meta.url), 'utf8').catch(() => null)
+  if (doc === null) {
+    console.log('  ✓ 本地未生成 docs/CAPABILITIES.md，跳过文档比对（防漂移仍由 tierWrites.ts + preset 工具集兜底）')
+  } else {
+    assert.ok(
+      doc.replace(/\r\n/g, '\n').includes(renderMatrix()), // 行尾（core.autocrlf）不该让这个守卫变红
+      'docs/CAPABILITIES.md 与 TIERS 不一致，请运行 gen-capabilities.mjs',
+    )
+    console.log('  ✓ docs/CAPABILITIES.md 与能力矩阵一致（无漂移）')
+  }
 
   // ══ 9. 人格注入 ════════════════════════════════════════════════════════
   assert.equal(promptContexts[0].name, 'gitee-role')
@@ -1199,7 +1399,7 @@ process.stdin.on('data', (chunk) => {
   // ══ 11. 能力档门禁 ═════════════════════════════════════════════════════
   const guard = ctx.rec.guards[0]
   assert.equal(rawMcpToolName('mcp__gitee_ent__create_enterprise_issue'), 'create_enterprise_issue')
-  // ⚠️ 只认**本部署那个 server**。别家 MCP server 的工具
+  // ⚠️ 只认**本部署那个 server**。别家 MCP（OpenViking 记忆、钉钉、Apifox…）的工具
   // 同样以 `mcp__` 开头，裸名却不在三张档位表里 —— 早先"只看 mcp__"会让门禁拿
   // Gitee 的表去审它们，把 `mcp__openviking__remember` 误判成越权（2026-09-17）。
   assert.equal(rawMcpToolName('mcp__gitee__list_programs'), undefined,
@@ -1428,7 +1628,7 @@ process.stdin.on('data', (chunk) => {
 
   // ── 0.1.7 的服务形状：结构化清单优先，文本作退路 ─────────────────────────
   //
-  // 🔴 真实事故（2026-09-28）：0.1.6 的 `agentPresets.read(id)` 在 0.1.7
+  // 🔴 真实事故（2026-09-28，DESIGN.md §30）：0.1.6 的 `agentPresets.read(id)` 在 0.1.7
   // 改成了 `readDocument(id) → {content}`。旧代码调 `read` 拿到 undefined、被 catch 吞掉
   // → 判定"未知" → 界面**永远**显示「本会话未使用 Gitee 模式」，哪怕当前 preset 就是
   // gitee-manager。方法变名不报错，所以这三条都必须钉住：
@@ -1514,37 +1714,29 @@ process.stdin.on('data', (chunk) => {
   assert.equal((await call(handler, { method: 'GET', url: '/api/gitee-chat/members' })).status, 400)
   console.log(`  ✓ GET /members → ${membersRes.json.members.length} 个成员（改派用）；缺参数 400`)
 
-  // ══ 12e. 写通道（G-05 / F-10）—— 唯一写入口 + 会话门禁 ═══════════════════
+  // ══ 12e. 写通道（G-05 / F-10）—— 唯一写入口，**不要求会话处于 Gitee 模式** ═══
   //
-  // 🔴 冒烟测试**绝不真的写 Gitee**。所以这里分两层验证：
-  //   1. 路由层的会话门禁（不通过时根本到不了脚本）；
-  //   2. 写通道自身的校验，用**桩执行器**（不会发任何网络请求）。
+  // 🔴 冒烟测试**绝不真的写 Gitee**。所以这里验证的是路由与写通道的**判定**：
+  //   0.5.4 起「能不能写」由 token 角色 + allowWrites 决定，不再看会话 preset
+  //   （旧版那道 403「该会话未使用 Gitee 模式」把「任何模式都能用」卡死过一次）。
   const wNoSession = await call(handler, {
     method: 'POST', url: '/api/gitee-chat/write',
     body: JSON.stringify({ op: 'comment', ident: 'DM0001', body: 'hi' }),
   })
-  assert.equal(wNoSession.status, 403, '缺少 sessionId 的写请求必须拒绝')
-  assert.equal(wNoSession.json.code, 'forbidden')
+  assert.notStrictEqual(wNoSession.status, 403, '缺 sessionId 的写请求不再被 403 门禁拦下（改由写通道判定）')
 
   const wPtcSession = await call(handler, {
     method: 'POST', url: '/api/gitee-chat/write',
     body: JSON.stringify({ op: 'comment', ident: 'DM0001', body: 'hi', sessionId: 'sess-ptc' }),
   })
-  assert.equal(wPtcSession.status, 403, '非 Gitee 会话的写请求必须拒绝')
-  assert.match(wPtcSession.json.message, /未使用 Gitee 模式/)
+  assert.notStrictEqual(wPtcSession.status, 403, '非 Gitee 会话的写请求不再被 403 拦下（任何模式都能用）')
 
-  // 会话门禁通过后，非法 op 在写通道里被挡住（400），且**不会**碰脚本
+  // 没有会话门禁以后，业务校验就是第一道关：未知 op 必须 400，且**不会**碰脚本
   const wBadOp = await call(handler, {
     method: 'POST', url: '/api/gitee-chat/write',
     body: JSON.stringify({ op: 'drop-database', ident: 'DM0001', sessionId: 'sess-ptc2' }),
   })
-  assert.equal(wBadOp.status, 403, '门禁先于业务校验：非 Gitee 会话一律 403')
-  hostCtx.emit('agent-preset/selected', 'sess-ptc2', '我的项目助手')
-  const wBadOp2 = await call(handler, {
-    method: 'POST', url: '/api/gitee-chat/write',
-    body: JSON.stringify({ op: 'drop-database', ident: 'DM0001', sessionId: 'sess-ptc2' }),
-  })
-  assert.equal(wBadOp2.status, 400, '未知写操作必须 400（只有三种 op 被允许）')
+  assert.equal(wBadOp.status, 400, '未知写操作必须 400（只有几种 op 被允许）')
 
   const wBadIdent = await call(handler, {
     method: 'POST', url: '/api/gitee-chat/write',
@@ -1726,7 +1918,7 @@ process.stdin.on('data', (chunk) => {
   // ══ 12h. skill 按插件标准随包加载（不是拷到 $DSH_HOME/skills）═══════════
   //
   // 🔴 这一节守的是"安装方式"本身：skill 真源在插件包里，由本包 bundle 补丁
-  // （0.4.5 起是 cordis.skills.patch.yml）挂一个 skill provider
+  // （0.4.5 起是 cordis.skills.patch.yml，见 DESIGN.md §35）挂一个 skill provider
   // 指向 <包>/skills。踩过的两个坑都在断言里：
   //   · providerName 必须换名（宿主的 provider 叫 filesystem，同名即启动失败）
   //   · !!js 元素必须返回**字符串**（返回数组会变成 [[path]]，schema 直接报错）
@@ -1747,11 +1939,128 @@ process.stdin.on('data', (chunk) => {
   assert.ok(fm !== null, 'SKILL.md 必须有 YAML frontmatter')
   assert.match(fm[1], /^name: dsh-gitee-chat$/m, 'SKILL.md 的 name 必须与目录名一致')
   assert.match(fm[1], /^description: .{40,}$/m, 'SKILL.md 必须有像样的 description（检索靠它）')
-  // 这个 skill 是"教 AI 装/配"的，必须真的讲清四步与两条硬规则
-  for (const needle of ['setup.mjs detect', 'setup.mjs apply', 'setup.mjs verify', 'cordis.patch.yml', '绝不']) {
+  // 这个 skill 是"教 AI 用"的（安装/配置挪到 references/install.md —— 用户 2026-10-26 口径：
+  // 「协作环境体检不是当前的东西了」）。必须真的讲清：两条建 PR 路径、MCP 用法、模板、硬规则。
+  for (const needle of ['create_enterprise_repo_pull', 'POST /pr/create', 'templates/pr.md', '子智能体', 'references/install.md', '数据时效']) {
     assert.ok(skillText.includes(needle), `SKILL.md 缺少「${needle}」`)
   }
-  console.log('  ✓ skill：随包分发，SKILL.md frontmatter 合法，补丁行声明齐全')
+  // 反向断言：安装动作不许再回到「开局先体检」那条老路上（真源现在是 references/install.md）
+  assert.equal(skillText.includes('setup.mjs detect'), false,
+    'SKILL.md 不该再教「先跑 setup.mjs detect」：装/配备份归 references/install.md')
+  const installText = (await readFile(join(root, 'skills', 'dsh-gitee-chat', 'references', 'install.md'), 'utf8')).replace(/\r\n/g, '\n')
+  assert.ok(installText.includes('setup.mjs'), 'references/install.md 必须保留 setup.mjs 用法（装/配/排障）')
+  // 只读部署（allowWrites=false）必须真的拦住面板写路由，不能只写在文档里：
+  // 0.5.4 之前 allowWrites 只传给 createIssueWriter，/write、/issue-create、/pr/create、
+  // /pr/action 四个入口照样会打 Gitee。这里锚住「路由层有一份统一拦截 + index 传了开关」。
+  const routesSrc = await readFile(join(root, 'src', 'host', 'routes.ts'), 'utf8')
+  assert.ok(routesSrc.includes("new Set(['/write', '/issue-create', '/pr/create', '/pr/action'])"),
+    'routes.ts 必须有只读部署的写路由拦截表')
+  assert.ok(routesSrc.includes("code: 'read-only'"),
+    'routes.ts 的只读拦截要回 code=read-only（客户端按它给白话提示）')
+  const indexSrc = await readFile(join(root, 'src', 'index.ts'), 'utf8')
+  assert.ok(indexSrc.includes('allowWrites: () => resolved.allowWrites'),
+    'index.ts 必须把 allowWrites 传给 createRouteHandler')
+
+  // 建 PR 的源/目标分支必须是**下拉**（MCP 没有列分支工具，走宿主自己的通道）：
+  // 0.5.4 之前只能手输，用户实测「源分支、目标分支不能下拉选择」即此问题。
+  const gqSrc = await readFile(join(root, 'scripts', 'gitee', 'gq.mjs'), 'utf8')
+  assert.ok(gqSrc.includes('export async function listRepoBranches'),
+    'gq.mjs 必须有 listRepoBranches（列仓库分支）')
+  assert.ok(gqSrc.includes("if (cmd === 'branches')"),
+    'gq.mjs 必须有 `branches --repo <id>` 子命令')
+  assert.ok(routesSrc.includes("route === '/repo/branches'"),
+    'routes.ts 必须暴露 GET /repo/branches')
+  const createDialogSrc = await readFile(join(root, 'src', 'client', 'PrCreateDialog.tsx'), 'utf8')
+  assert.ok(createDialogSrc.includes('onlyDefaultBranch'),
+    'PrCreateDialog 必须处理「仓库只有默认分支，无法 PR」这一情形')
+  assert.ok(createDialogSrc.includes('fetchRepoBranches'),
+    'PrCreateDialog 的分支下拉必须来自 fetchRepoBranches')
+
+  // AI 起草 PR 内容：分支比对走 gq compare（MCP 没有 compare 工具），
+  // 写作要求来自 pr-guide 模板；干净骨架与说明版必须是**两份**文件。
+  assert.ok(gqSrc.includes('export async function compareRefs'),
+    'gq.mjs 必须有 compareRefs（分支比对，AI 起草的数据源）')
+  assert.ok(gqSrc.includes("if (cmd === 'compare')"), 'gq.mjs 必须有 compare 子命令')
+  assert.ok(routesSrc.includes("route === '/pr/draft'"), 'routes.ts 必须暴露 POST /pr/draft')
+  const prServiceSrc = await readFile(join(root, 'src', 'host', 'prService.ts'), 'utf8')
+  assert.ok(prServiceSrc.includes('async draftPull('), 'prService 必须有 draftPull（渲染起草 prompt）')
+  // 0.5.4 实测事故：deps 解构漏了 runner → 点「AI 起草」报 "AI runner is not defined"。
+  assert.ok(prServiceSrc.includes('const { docs, templates, runner } = deps'),
+    'prService 必须从 deps 解构出 runner（漏了就是运行期 ReferenceError）')
+  const cleanTemplate = await readFile(join(root, 'skills', 'dsh-gitee-chat', 'templates', 'pr.md'), 'utf8')
+  const guideTemplate = await readFile(join(root, 'skills', 'dsh-gitee-chat', 'templates', 'pr-guide.md'), 'utf8')
+  assert.ok(!cleanTemplate.includes('<!--'), 'pr.md 必须是干净骨架（不含 HTML 注释/说明）')
+  assert.ok(cleanTemplate.includes('## 背景') && cleanTemplate.includes('## 怎么验证'),
+    'pr.md 必须保留五个分节')
+  assert.ok(guideTemplate.includes('填写说明'), 'pr-guide.md 必须是带说明的版本')
+  assert.ok(createDialogSrc.includes('startPrDraft') && createDialogSrc.includes('parseDraft'),
+    'PrCreateDialog 必须能发起 AI 起草并解析 {title, body}')
+
+  // AI 起草的三条使用反馈（2026-10-27）：
+  // ① 起草也要选「工作区 + 会话」，并**按仓库记住**（仓库分属不同工作区，权限边界不同）；
+  // ② 输入优先用**本地仓库**比对（毫秒级），本地没有才回落远端 compare；
+  // ③ prompt 里明确禁止子智能体调工具（否则它去查代码，一次起草 40 秒起步）。
+  assert.ok(createDialogSrc.includes('投递到') && createDialogSrc.includes('saveDraftTarget'),
+    'PrCreateDialog 必须有「投递到」（工作区 + 会话）并按仓库记住')
+  assert.ok(createDialogSrc.includes('startPrDraft(effectiveTarget'),
+    'AI 起草必须投到选中的目标会话，而不是写死当前会话')
+  assert.ok(routesSrc.includes("route === '/draft-target'"), 'routes.ts 必须暴露 /draft-target')
+  const localSettingsSrc = await readFile(join(root, 'src', 'host', 'localSettings.ts'), 'utf8')
+  assert.ok(localSettingsSrc.includes('getDraftTarget') && localSettingsSrc.includes('setDraftTarget'),
+    'localSettings 必须提供 getDraftTarget/setDraftTarget')
+  assert.ok(prServiceSrc.includes('findLocalRepo') && prServiceSrc.includes('localCompare'),
+    'prService.draftPull 必须先试本地仓库比对（快路径）')
+  assert.ok(prServiceSrc.includes('不要调用任何工具'), 'AI 起草 prompt 必须禁止子智能体调工具')
+
+  // 「子智能体」胶囊勾选框（2026-10-27）：默认勾选；取消后投到主会话；
+  // 勾选状态与工作区/会话一起按仓库记住。
+  assert.ok(localSettingsSrc.includes('deliverSubagent'), 'localSettings.DraftTarget 必须带 deliverSubagent')
+  assert.ok(routesSrc.includes("deliver === 'session'"), '/pr/draft 必须支持 deliver=session（结论也投进主会话）')
+  // 投到主会话也要能回填：同一个跑批，用 DSH 的 delivery='parent' 让结论落进会话。
+  const prSubagentSrc = await readFile(join(root, 'src', 'host', 'prSubagent.ts'), 'utf8')
+  assert.ok(prSubagentSrc.includes("delivery: input.delivery ?? 'caller'"),
+    'prSubagent 必须支持 delivery 透传（parent = 结论进主会话）')
+  assert.ok(routesSrc.includes("delivery: 'parent'"),
+    'routes 里 deliver=session 必须走 delivery=parent（而不是只渲染 prompt）')
+  assert.ok(createDialogSrc.includes('PillCheck') && createDialogSrc.includes('子智能体'),
+    'PrCreateDialog 的「投递到」行必须有「子智能体」胶囊勾选框')
+  const prAiPaneSrc = await readFile(join(root, 'src', 'client', 'PrAiPane.tsx'), 'utf8')
+  assert.ok(prAiPaneSrc.includes('PillCheck') && prAiPaneSrc.includes('useSubagent'),
+    'AI 审核弹窗必须有「子智能体」胶囊勾选框')
+  const prApiSrc = await readFile(join(root, 'src', 'client', 'prApi.ts'), 'utf8')
+  assert.ok(prApiSrc.includes('deliverSubagent') && prApiSrc.includes("deliver === undefined"),
+    'prApi 必须记住 deliverSubagent，并把 deliver 透传给宿主')
+  // 两条路径都回填：对话框里禁止再出现「要回会话里取」这种半成品提示
+  assert.equal(createDialogSrc.includes('不会自动填回本表单'), false,
+    '投到主会话也必须回填表单，不能再提示「要回会话里取」')
+
+  // PR 正文模板必须随包（面板「套用模板」与 AI 建 PR 的 body 都读它）
+  const prTemplateText = (await readFile(join(root, 'skills', 'dsh-gitee-chat', 'templates', 'pr.md'), 'utf8')).replace(/\r\n/g, '\n')
+  assert.ok(prTemplateText.trim() !== '', 'templates/pr.md 不能为空')
+
+  // ── SKILL.md 的 token 预算（用户 2026-10-27 口径：「SKILL 写了很多代码出处，别的 AI 读取
+  // 需要连接这么仔细么，我感觉这会多消费 TOKEN」）─────────────────────────────
+  // 契约：SKILL.md 是**索引层**，只留「何时用 / 怎么开始 / 去哪读细节」，细节进 references/。
+  // 细节按需读 = 触发时只付索引的钱；把这条钉成断言，防止下一轮又把手册塞回正文。
+  const skillRefDir = join(root, 'skills', 'dsh-gitee-chat', 'references')
+  for (const name of ['mcp.md', 'panel.md', 'recipes.md', 'install.md']) {
+    const p = join(skillRefDir, name)
+    assert.equal(pathExists(p), true, `references/${name} 必须存在（SKILL.md 索引指向它）`)
+    assert.ok(skillText.includes(`references/${name}`), `SKILL.md 的索引里必须列出 references/${name}`)
+  }
+  assert.ok(skillText.length <= 3000,
+    `SKILL.md 超预算：${skillText.length} 字符 > 3000（细节放 references/，正文只做索引）`)
+  for (const name of ['mcp.md', 'panel.md', 'recipes.md', 'install.md']) {
+    const body = (await readFile(join(skillRefDir, name), 'utf8')).replace(/\r\n/g, '\n')
+    assert.ok(body.length <= 12000, `references/${name} 超预算：${body.length} 字符 > 12000`)
+  }
+  // 行号引用会烂（改一次代码就全错），一律不许进 skill：只留文件名
+  for (const name of ['SKILL.md', 'references/mcp.md', 'references/panel.md', 'references/recipes.md', 'references/install.md', 'templates/pr.md']) {
+    const body = name === 'SKILL.md' ? skillText : (await readFile(join(root, 'skills', 'dsh-gitee-chat', name), 'utf8')).replace(/\r\n/g, '\n')
+    const hit = /[\w./-]+\.(?:tsx?|mjs|js|md|yml|yaml|go|json):\d+/.exec(body)
+    assert.equal(hit, null, `${name} 里不许写死行号（${hit?.[0] ?? ''}）：只写文件名，行号会随改动失效`)
+  }
+  console.log(`  ✓ skill：随包分发，SKILL.md ${skillText.length} 字符（索引层）+ ${4} 篇 references 按需读；无行号引用`)
 
   // !!js 表达式：成功分支解析到本包 skills/，失败分支 fail-soft 回落到不存在的路径
   const exprMatch = /customSkillDirs:\s*\n\s*-\s*!!js\s*"([^"]+)"/.exec(patchText)
@@ -2028,7 +2337,7 @@ process.stdin.on('data', (chunk) => {
 
   // 补丁注释里的 MCP 那一行必须说"随包"，不能说"未找到" ——
   // 随包二进制落在 $DSH_HOME/.gitee-chat/bin/，本来就不在 PATH 上；旧代码只看 PATH，
-  // 于是同一轮 apply 里"刚落地 48 个工具的二进制"和注释里"MCP 可执行: 未找到"同时出现。
+  // 于是同一轮 apply 里"刚落地 55 个工具的二进制"和注释里"MCP 可执行: 未找到"同时出现。
   const healPatch = readFileSync(join(agentHealProfile, 'cordis.patch.yml'), 'utf8')
   assert.match(healPatch, /# {3}MCP 可执行 : .+随包分发/,
     '补丁注释要报三级回落（env → 随包 → PATH）解析出来的那份，而不是"PATH 上有没有"')
@@ -2041,8 +2350,8 @@ process.stdin.on('data', (chunk) => {
 
   // ══ 12j-quater. 真机 Windows 上暴露的两个 setup.mjs 误报（回归）═══════════
   //
-  // 都不是洁癖，是同事机器上真的发生了：装完插件，`detect`/`verify` 说企业 MCP 没装、
-  // 还劝你去 `go install` 那个其实**随包分发**的 MCP；同时
+  // 都不是洁癖，是同事机器上真的发生了：装完插件，`env`/`verify` 说 git、Obsidian、
+  // 企业 MCP 全都没装，还劝你去 `go install` 那个其实**随包分发**的 MCP；同时
   // `verify` 对 `file:`（官方推荐装法）稳定报「skill 未生效 ❌」。
   const { which, inspectSkill } = await import('../scripts/setup.mjs')
 
@@ -2050,9 +2359,9 @@ process.stdin.on('data', (chunk) => {
   //    用例在 Linux 上跑：env / platform 是注入的，所以不需要真机。
   const winBin = await mkdtemp(join(tmpdir(), 'gitee-which-'))
   await writeFile(join(winBin, 'git.EXE'), '')
-  // Windows 文件系统大小写不敏感、PATHEXT 给的是大写，两者照样配得上；
-  // Linux 的 fixture 必须按 PATHEXT 的大小写写，才能模拟这个行为。
-  await writeFile(join(winBin, 'runner.COM'), '')
+  // 真机上是 `Obsidian.com`：Windows 文件系统大小写不敏感，PATHEXT 给的是大写，
+  // 两者照样能配上；Linux 的 fixture 必须写成 PATHEXT 的大小写才能模拟这个行为。
+  await writeFile(join(winBin, 'obsidian.COM'), '')
   await writeFile(join(winBin, 'notes.txt'), '')
   // 靠前的条目里也真放一个 git.EXE：这才既验了「按 ';' 切 + 按顺序找」，又不会像早先
   // 写死 `C:\Program Files\Git\cmd` 那样，在**真的装了 Git 的机器**上被那个目录抢先命中
@@ -2062,8 +2371,8 @@ process.stdin.on('data', (chunk) => {
   const winEnv = { PATH: `C:\\Windows\\System32;${winBinFirst};${winBin}`, PATHEXT: '.COM;.EXE;.BAT;.CMD' }
   assert.equal(which('git', winEnv, 'win32'), join(winBinFirst, 'git.EXE'),
     'Windows PATH 是 ";" 分隔、按顺序找，可执行文件带 PATHEXT 后缀（git.exe），都要处理')
-  assert.equal(which('runner', winEnv, 'win32'), join(winBin, 'runner.COM'),
-    '带 .COM 后缀的程序也要认得 —— 只试 .exe 就不够了')
+  assert.equal(which('obsidian', winEnv, 'win32'), join(winBin, 'obsidian.COM'),
+    'Obsidian CLI 是 .com shim —— 只试 .exe 就不够了')
   assert.equal(which('notes', winEnv, 'win32'), null,
     '不在 PATHEXT 里的后缀不算可执行程序（.txt 不该命中）')
   assert.equal(which('git', winEnv, 'linux'), null,
@@ -2135,6 +2444,123 @@ process.stdin.on('data', (chunk) => {
   console.log('  ✓ Windows 误报回归：which() 认 ";"+PATHEXT（":" 切法作为负例被钉死）；'
     + 'skill 按"解析结果里有 SKILL.md"判生效（file: 副本 ✓ / link: ✓ / 缺文件 ✗）')
 
+  // ══ 12k. 协作基本环境体检（git / Obsidian / MCP / token / Apifox / 预留）══
+  //
+  // 这一节守两件事：
+  //   1. **注册表是声明式的**：加一个协作工具只改 ENV_TOOLS，不改检测逻辑 ——
+  //      这就是"后期加入测试协作工具的预留"能被验证的形式。
+  //   2. **不误报**：检测不到 ≠ 没装（Obsidian CLI 在 App 未运行时也会失败）。
+  // import 必须无副作用（只导出注册表，不跑 CLI）—— 这一行同时验证了那个守卫
+  const { ENV_TOOLS } = await import('../scripts/setup.mjs')
+  assert.ok(Array.isArray(ENV_TOOLS) && ENV_TOOLS.length >= 6,
+    'import setup.mjs 应只导出注册表、不执行 CLI')
+
+  // 同一个 Windows 误报的第三处：`alsoDirs` 是"装了但不在 PATH"**唯一**的兜底证据，
+  // 而它之前只写了 Linux 的 ~/.config/obsidian —— Windows 上永远匹配不上，
+  // 于是"装了 Obsidian 却报没装"照样发生。
+  const obsDef = ENV_TOOLS.find((t) => t.id === 'obsidian')
+  const obsDirs = obsDef.alsoDirs ?? []
+  assert.ok(obsDirs.some((d) => d.includes('%APPDATA%')),
+    'Windows 上 Obsidian 的数据目录是 %APPDATA%\\obsidian —— 只写 ~/.config 就永远匹配不上')
+  assert.ok(obsDirs.some((d) => d.includes('Library/Application Support')), 'macOS 同理')
+
+  // 端到端：清空 PATH + 给一个含 obsidian/ 的 APPDATA → 必须报"装了但不在 PATH"。
+  //
+  // ⚠️ 光造应用目录还不够：ok 判的是「二进制或应用目录在 **且** 该工具的 skill 集齐全」
+  // （scripts/setup.mjs 里 `item.ok = probe.found || dirs.length > 0` 之后，missingSkills
+  // 非空会把 ok 打回 false）。skill 是从 cwd 的 `.dsh/skills` 等处扫的，于是**没装
+  // Obsidian skill 集的开发机、以及任何 CI runner** 都必然红 —— 哪怕应用目录明明在。
+  // 夹具自己造齐那 5 个 skill，这条断言才只测"应用目录能不能被认出来"。
+  const emptyPath = await mkdtemp(join(tmpdir(), 'gitee-nopath-'))
+  const fakeAppData = await mkdtemp(join(tmpdir(), 'gitee-appdata-'))
+  const fakeEnvCwd = await mkdtemp(join(tmpdir(), 'gitee-env-cwd-'))
+  await mkdir(join(fakeAppData, 'obsidian'), { recursive: true })
+  for (const name of ENV_TOOLS.find((t) => t.id === 'obsidian').skills ?? []) {
+    await mkdir(join(fakeEnvCwd, '.dsh', 'skills', name), { recursive: true })
+    await writeFile(join(fakeEnvCwd, '.dsh', 'skills', name, 'SKILL.md'), `---\nname: ${name}\n---\n`)
+  }
+  const { stdout: envNoPath } = await run(process.execPath, [join(root, 'scripts/setup.mjs'), 'env', '--json'], {
+    cwd: fakeEnvCwd, timeout: 120_000, maxBuffer: 8 * 1024 * 1024,
+    env: { ...process.env, PATH: emptyPath, APPDATA: fakeAppData },
+  })
+  const obsOffPath = JSON.parse(envNoPath).tools.find((t) => t.id === 'obsidian')
+  assert.equal(obsOffPath.ok, true,
+    '应用目录在就该判为"装了"——判成没装会让人白重装一遍 Obsidian')
+  assert.match(String(obsOffPath.note), /不在 PATH/,
+    `要说清"命令行用不了"，不能只丢一个目录了事，实际：${obsOffPath.note}`)
+  await rm(emptyPath, { recursive: true, force: true })
+  await rm(fakeAppData, { recursive: true, force: true })
+  await rm(fakeEnvCwd, { recursive: true, force: true })
+  console.log('  ✓ 装了但不在 PATH：alsoDirs 三平台齐全（%APPDATA% 展开实测），不再误报"没装"')
+
+  // 本包的 skills/ 要被 `env` 发现，前提是它真的**装在 profile 里**（现实里由
+  // `dsh plugin add` 落盘）。沙箱 profile 建的时候只写了 bundles 名单、没有 node_modules，
+  // 于是补丁里的 `!!js` 表达式解析不到本包 → 回落到哨兵路径，custom 根就不见了。
+  // 这里补一个 `link:` 形态（realpath = 源码目录，与 12j 的 link: 口径一致）。
+  await mkdir(join(sandboxProfile, 'node_modules'), { recursive: true })
+  // 用 linkDir：Windows 上普通用户建不了 symlink（EPERM），junction 才能过
+  await linkDir(root, join(sandboxProfile, 'node_modules', 'dsh-gitee-chat'))
+
+  const { stdout: envOut } = await run(process.execPath, [join(root, 'scripts/setup.mjs'), 'env', '--json'], {
+    cwd: root, timeout: 120_000, maxBuffer: 8 * 1024 * 1024,
+  })
+  const env = JSON.parse(envOut)
+
+  // 七项都在，且每项都带"要不要强求 / 怎么装"的信息
+  const ids = env.tools.map((t) => t.id)
+  for (const id of ['git', 'obsidian', 'gitee-mcp', 'gitee-token', 'apifox', 'test-collab']) {
+    assert.ok(ids.includes(id), `协作环境体检缺少「${id}」`)
+  }
+  assert.ok(env.tools.every((t) => 'required' in t && 'ok' in t && 'scope' in t),
+    '每一项都要给出 required / ok / scope —— AI 靠它决定装不装')
+  assert.ok(env.tools.every((t) => t.install !== null && t.install !== undefined),
+    '每一项都要带安装方式（否则"指导安装"就是空话）')
+  // 预留位：登记了、但不判失败
+  const reserved = env.tools.find((t) => t.id === 'test-collab')
+  assert.equal(reserved.scope, 'future', '测试协作工具必须是 future scope 的预留位')
+  assert.equal(reserved.required, false, '预留位不得被判为必需')
+  assert.ok(!env.summary.missing.includes('test-collab'), '预留位不得出现在缺失清单里')
+  assert.ok(reserved.install.note.includes('scope'), '预留位必须写清"接入时改哪两处"')
+
+  // skill 根：顺序与 dsh-skill-filesystem 的 roots() 一致，且本包的 skills/ 一定在里面
+  const sources = env.skillRoots.map((r) => r.source)
+  for (const src of ['project-dsh', 'project-agents', 'user-dsh', 'user-agents']) {
+    assert.ok(sources.includes(src), `skill 根缺少 ${src}（顺序应与 dsh-skill-filesystem 的 roots() 一致）`)
+  }
+  const customRoot = env.skillRoots.find((r) => r.source === 'custom' && r.path === join(root, 'skills'))
+  assert.ok(customRoot !== undefined, '本包的 skills/ 必须作为一个 custom 根被发现')
+  assert.ok(customRoot.count >= 1, '本包 skills/ 根下必须扫到至少 1 个 skill（否则线上发现不了）')
+
+  // 不误报：Obsidian CLI 在 App 未运行时也失败，那必须记为"已装但不可用"
+  const obsidian = env.tools.find((t) => t.id === 'obsidian')
+  if (obsidian.binary !== null && /obsidian$/.test(obsidian.binary)) {
+    assert.equal(obsidian.ok, true, 'CLI 存在即算已安装（不能因为 App 没开就判成没装）')
+    if (obsidian.note !== null && obsidian.note.includes('不可用')) {
+      assert.ok(obsidian.note.includes('已安装'), 'App 未运行时应说明「已安装（…），但当前不可用」')
+    }
+  }
+
+  // 场景判定：unknown 时不得把 Apifox 判成必需（宁可问，不猜）
+  if (env.scope.softwareDev !== true) {
+    const apifox = env.tools.find((t) => t.id === 'apifox')
+    assert.equal(apifox.required, false, '软件开发生存场景未判定时，Apifox 不得被判为必需')
+    assert.equal(apifox.skipped, true, '未判定时 Apifox 应标记为"跳过"而不是"缺失"')
+  }
+  console.log(`  ✓ 协作环境体检：${env.tools.length} 项（含预留位）/ ${env.skillRoots.length} 个 skill 根 / 现场 skill ${env.skillCount} 个`)
+  console.log(`  ✓ 场景判定：${env.scope.known ? (env.scope.softwareDev ? '软件开发项目成员' : '非软件开发项目') : '未判定（因此 Apifox 不判失败，转由 questions 询问）'}`)
+
+  // 注册表是"预留位"的实现：接入只需改一条，不改检测逻辑
+  const reservedDef = ENV_TOOLS.find((t) => t.id === 'test-collab')
+  assert.ok(reservedDef !== undefined, 'ENV_TOOLS 里必须有 test-collab 这一条')
+  assert.equal(reservedDef.scope, 'future', '预留位的 scope 必须是 future')
+  // 注册表里每一条都必须自带"为什么 / 要不要强求 / 怎么装"
+  for (const def of ENV_TOOLS) {
+    assert.ok(typeof def.why === 'string' && def.why.length > 10, `${def.id} 缺少 why`)
+    assert.ok(['all', 'software-dev', 'future'].includes(def.scope), `${def.id} 的 scope 非法`)
+    assert.ok(def.install !== undefined, `${def.id} 缺少 install（"指导安装"靠它）`)
+  }
+  console.log('  ✓ 预留位：ENV_TOOLS 是可 import 的声明式注册表，接入新工具只改这一条')
+
   // ══ 12l. 随包 MCP 后端（让同事不需要 Go 环境）════════════════════════════
   //
   // 这一节守三件事，每一件都是"出错时不会报错、只会静默退化"的那一类：
@@ -2152,12 +2578,14 @@ process.stdin.on('data', (chunk) => {
   assert.ok(Array.isArray(mcpManifest.tools) && mcpManifest.tools.length > 0,
     'manifest 必须记录二进制的真实工具清单（这是"换错二进制"的唯一探针）')
   assert.equal(mcpManifest.tools.length, mcpManifest.toolCount, 'toolCount 应与 tools 长度一致')
-  assert.equal(mcpManifest.toolCount, 48, `二进制应有 48 个工具（上游 37 + fork 独有 11），实际 ${mcpManifest.toolCount}`)
+  assert.equal(mcpManifest.toolCount, BINARY_TOOL_COUNT,
+    `二进制应有 ${BINARY_TOOL_COUNT} 个工具（上游 40 + fork 独有 11），实际 ${mcpManifest.toolCount}`)
 
 
   // 🔴 最关键的一条：能力矩阵声明的工具，入库二进制必须都给
-  const declaredToolsets = presetToolsetsFromFile(presetPatchPath('gitee-manager'))
-  assert.equal(declaredToolsets.length, 48, `gitee-manager 的 --enabled-toolsets 应为 manager 档的 48 个，实际 ${declaredToolsets.length}`)
+  const declaredToolsets = presetToolsetsFromFile(presetPatchPath('gitee'))
+  assert.equal(declaredToolsets.length, BINARY_TOOL_COUNT,
+    `gitee 的 --enabled-toolsets 应为 manager 档的 ${BINARY_TOOL_COUNT} 个，实际 ${declaredToolsets.length}`)
   const provided = new Set(mcpManifest.tools)
   const toolGap = declaredToolsets.filter((t) => !provided.has(t))
   assert.deepEqual(toolGap, [],
@@ -2181,10 +2609,10 @@ process.stdin.on('data', (chunk) => {
   assert.ok(mcpManifest.sourceFileCount > 0, '记录指纹覆盖了多少个文件')
 
   // 互补关系要**记录在案**，不能只活在人的记忆里
-  assert.ok(Array.isArray(mcpManifest.forkOnlyTools) && mcpManifest.forkOnlyTools.length === 11,
-    `fork 独有工具应记录 11 个，实际 ${mcpManifest.forkOnlyTools?.length}`)
-  assert.ok(Array.isArray(mcpManifest.mergedUpstreamTools) && mcpManifest.mergedUpstreamTools.length === 6,
-    '从上游并进来的工具应记录为 6 个（两边的知识库能力是互补+两处重叠）')
+  assert.ok(Array.isArray(mcpManifest.forkOnlyTools) && mcpManifest.forkOnlyTools.length === 15,
+    `fork 独有工具应记录 15 个（11 个文档/项目 + 4 个 PR 审查测试），实际 ${mcpManifest.forkOnlyTools?.length}`)
+  assert.ok(Array.isArray(mcpManifest.mergedUpstreamTools) && mcpManifest.mergedUpstreamTools.length === 9,
+    '从上游并进来的工具应记录为 9 个（v0.2.0–v0.2.4；两边知识库能力互补+两处重叠）')
   // 并进来的必须真的在（曾经的失败模式就是"静默少工具"）
   const mergedGone = mcpManifest.mergedUpstreamTools.filter((t) => !provided.has(t))
   assert.deepEqual(mergedGone, [], `入库二进制缺少已并入的上游工具：${mergedGone.join(', ')}`)
@@ -2199,7 +2627,7 @@ process.stdin.on('data', (chunk) => {
     + ` · 源码指纹 ${mcpManifest.sourceFingerprint.slice(0, 12)}…`
     + ` · 独有 ${mcpManifest.forkOnlyTools.length} / 已并入 ${mcpManifest.mergedUpstreamTools.length}`)
 
-  // 三处路径算法一致：宿主 / setup / preset 表达式（落在**用户级 bin**）
+  // 三处路径算法一致：宿主 / setup / preset 表达式（0.5.1 起落在**用户级 bin**）
   assert.equal(platformKey('linux', 'x64'), 'linux-x64')
   assert.equal(platformKey('win32', 'x64'), 'win32-x64')
   assert.equal(userBinDir('linux', {}, '/home/x'), join('/home/x', '.local', 'bin'))
@@ -2210,6 +2638,9 @@ process.stdin.on('data', (chunk) => {
   assert.equal(binaryName('win32'), 'mcp-gitee-ent.exe')
   assert.match(materializedPath('win32', {}, 'C:/u/b'), /\.local[\\/]bin[\\/]mcp-gitee-ent\.exe$/,
     'Windows 上是 %USERPROFILE%\\.local\\bin 且带 .exe')
+  // 0.5.0 的私有路径仍能算出来（迁移时要删的就是它）
+  assert.equal(legacyMaterializedPath('linux', '/home/x/.dsh'),
+    join('/home/x/.dsh', '.gitee-chat', 'bin', 'mcp-gitee-ent'))
   // PATH 判定：Windows 不区分大小写、忽略分隔符与尾斜杠
   assert.equal(isOnPath('/opt/b', { PATH: '/usr/bin:/opt/b/' }, 'linux'), true)
   assert.equal(isOnPath('/opt/c', { PATH: '/usr/bin:/opt/b' }, 'linux'), false)
@@ -2221,7 +2652,8 @@ process.stdin.on('data', (chunk) => {
     ['linux', { HOME: '/home/x', XDG_BIN_HOME: '/opt/b' }, 'HOME'],
     ['win32', { USERPROFILE: 'C:/u/b' }, 'USERPROFILE'],
   ]) {
-    for (const preset of ['gitee-manager', 'gitee-exec']) {
+    // 0.5.4 起只有一个 preset（执行/管理合并），所以这里只有一个名字要验。
+    for (const preset of ['gitee']) {
       const expr = presetCommandExpression(presetPatchPath(preset))
       assert.ok(expr !== null, `${preset} 的 mcp 行应写成 command: !!js "…" 的形式`)
       const expected = materializedPath(platform, env, env[homeKey]).replace(/\\/g, '/')
@@ -2231,15 +2663,23 @@ process.stdin.on('data', (chunk) => {
       // 新位置没有、PATH 上也没有 → 回落到裸名，而不是一个不存在的绝对路径
       const fallback = evaluateExpression(expr, { env, platform, materialized: false })
       assert.equal(fallback, 'mcp-gitee-ent', `${preset} 未落地时应回落到 PATH 上的 mcp-gitee-ent`)
+      // 0.5.0 的旧副本还在（升级过渡）→ 认它，别让升级瞬间工具全挂
+      const legacyExpected = join('/dsh', '.gitee-chat', 'bin',
+        platform === 'win32' ? 'mcp-gitee-ent.exe' : 'mcp-gitee-ent').replace(/\\/g, '/')
+      assert.equal(
+        evaluateExpression(expr, { env: { ...env, DSH_HOME: '/dsh' }, platform, materialized: 'legacy' })
+          .replace(/\\/g, '/'),
+        legacyExpected,
+        `${preset} 在 0.5.0 旧副本尚存时应回落到它（过渡期）`)
     }
   }
   // MCP_GITEE_ENT_BIN 优先级最高（自己带二进制的同事）
-  const overrideExpr = presetCommandExpression(presetPatchPath('gitee-manager'))
+  const overrideExpr = presetCommandExpression(presetPatchPath('gitee'))
   assert.equal(evaluateExpression(overrideExpr, {
     env: { MCP_GITEE_ENT_BIN: '/my/bin', HOME: '/home/x' }, platform: 'linux', materialized: 'user',
   }), '/my/bin')
   // 表达式只在 command: 那一行、且整句被引号包住（含 `: ` 的 plain 标量会被 YAML 截断）
-  for (const preset of ['gitee-manager', 'gitee-exec']) {
+  for (const preset of ['gitee']) {
     const text = readPresetPatchText(preset)
     const line = text.split('\n').find((l) => l.trim().startsWith('command:'))
     assert.match(line, /command: !!js "/, `${preset} 的 command 必须是双引号包住的 !!js（含 ': '，plain 标量会被截断）`)
@@ -2259,7 +2699,8 @@ process.stdin.on('data', (chunk) => {
   }
   console.log('  ✓ 随包 MCP 二进制与 manifest 逐字节一致（sha256 全部命中）')
 
-  // 隔离 DSH_HOME + 用户级 bin 里真的落地一次：apply 之后 preset 表达式必须能取到那个文件。
+  // 隔离 DSH_HOME + 用户 bin 里真的落地一次：apply 之后 preset 表达式必须能取到那个文件，
+  // 并且要把 0.5.0 的私有副本迁移掉。
   //
   // ⚠️ 落点由**平台**决定，不能只按 POSIX 那份写：Windows 是 `%USERPROFILE%\.local\bin`
   // 且二进制带 `.exe`（见 src/host/mcpBinary.ts 的 userBinDir / binaryName），而 Node 的
@@ -2282,7 +2723,13 @@ process.stdin.on('data', (chunk) => {
       name: 'mcp-profile', private: true,
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-gitee-chat'] } },
     }, null, 2) + '\n')
-    // 先造一个垃圾 .tmp-*（与产品清理用的 `<target>.tmp-<pid>` 同形），验证落地会顺手清掉它
+    // 先造一份 0.5.0 的私有副本 + 一个垃圾 .tmp-*，验证迁移与落地会清掉它们。
+    // 名字也得按平台取：Windows 上二进制叫 `mcp-gitee-ent.exe`
+    // （见 src/host/mcpBinary.ts 的 binaryName）。
+    const legacyName = mcpWin ? 'mcp-gitee-ent.exe' : 'mcp-gitee-ent'
+    const legacyDir = join(mcpHome, '.gitee-chat', 'bin')
+    await mkdir(legacyDir, { recursive: true })
+    await writeFile(join(legacyDir, legacyName), 'old private copy')
     await mkdir(mcpLandingDir, { recursive: true })
     await writeFile(join(mcpLandingDir, `${mcpBinName}.tmp-99999`), 'stale tmp')
 
@@ -2301,6 +2748,8 @@ process.stdin.on('data', (chunk) => {
     }
     assert.equal(createHash('sha256').update(readFileSync(landed)).digest('hex'),
       mcpManifest.platforms[platformKey()].sha256, '落地的必须就是随包那份')
+    assert.equal(pathExists(join(legacyDir, legacyName)), false,
+      '0.5.0 的私有副本应在迁移后被删掉')
     assert.equal(pathExists(join(mcpLandingDir, `${mcpBinName}.tmp-99999`)), false,
       '落地前应顺手清掉上一轮留下的 .tmp-* 垃圾')
     // 幂等：再跑一次不应重拷（copied=false）
@@ -2311,22 +2760,24 @@ process.stdin.on('data', (chunk) => {
     }).then((r) => r.stdout))
     assert.equal(again.mcp.copied, false, '内容一致时不应重复拷贝（幂等）')
     assert.equal(again.mcp.ok, true)
-    console.log('  ✓ apply 落地随包 MCP 二进制到用户级 bin：可执行、sha256 一致、幂等')
+    console.log('  ✓ apply 落地随包 MCP 二进制到用户级 bin：可执行、sha256 一致、幂等、并清掉 0.5.0 私有副本')
   } finally {
     await rm(mcpHome, { recursive: true, force: true })
   }
 
   // 宿主装配期的**自愈**路径（ensureMaterialized）：装机后目录被清、换了新版本、
-  // 目标被换成上游版、或本平台没随包，都在这里定死。
+  // 0.5.0 私有副本要迁移、新位置写不进去、或本平台没随包，都在这里定死。
   const healHome = await mkdtemp(join(tmpdir(), 'gq-mcp-heal-'))
+  const healDsh = join(healHome, 'dsh-home')
   const healBin = join(healHome, '.local', 'bin')
-  const healOpts = { platform: 'linux', env: {}, home: healHome }
+  const healOpts = { platform: 'linux', env: {}, home: healHome, dshHome: healDsh }
   try {
     const first = ensureMaterialized(healOpts)
     assert.equal(first.source, 'vendored', `有随包覆盖时应用随包二进制：${first.detail}`)
     assert.equal(first.copied, true, '第一次应真的拷过去')
-    assert.equal(first.command, join(healBin, 'mcp-gitee-ent'), '落在用户级 bin')
+    assert.equal(first.command, join(healBin, 'mcp-gitee-ent'), '0.5.1 起落在用户级 bin')
     assert.equal(first.onPath, false, '环境里没有 PATH 时必须报"不在 PATH 上"')
+    assert.equal(first.legacyRemoved, false, '没有旧副本时不该声称删了东西')
     assert.ok(pathExists(first.command), '自愈后文件必须存在')
 
     const second = ensureMaterialized(healOpts)
@@ -2352,10 +2803,32 @@ process.stdin.on('data', (chunk) => {
     assert.equal(readFileSync(`${healed.command}.bak`, 'utf8'), 'not a real binary',
       '被替换掉的那份必须备份成 .bak，不能静默丢掉别人的二进制')
 
+    // 0.5.0 的私有副本 → 迁移：新位置就位后必须删掉它
+    const legacyFile = join(healDsh, '.gitee-chat', 'bin', 'mcp-gitee-ent')
+    await mkdir(dirname(legacyFile), { recursive: true })
+    await writeFile(legacyFile, 'old private copy')
+    const migrated = ensureMaterialized(healOpts)
+    assert.equal(migrated.legacyRemoved, true, '新位置就位后应清掉 0.5.0 的私有副本')
+    assert.equal(pathExists(legacyFile), false, '旧副本文件应被删掉')
 
+    // 新位置写不进去（`~/.local` 是普通文件）而旧副本还在 → 过渡期回落到旧副本，
+    // 而不是让 preset 拿到一个不存在的绝对路径、工具全挂。
+    const roHome = await mkdtemp(join(tmpdir(), 'gq-mcp-ro-'))
+    try {
+      const roDsh = join(roHome, 'dsh')
+      const roLegacy = join(roDsh, '.gitee-chat', 'bin', 'mcp-gitee-ent')
+      await mkdir(dirname(roLegacy), { recursive: true })
+      await writeFile(roLegacy, 'old private copy')
+      await writeFile(join(roHome, '.local'), 'not a directory')
+      const stuck = ensureMaterialized({ platform: 'linux', env: {}, home: roHome, dshHome: roDsh })
+      assert.equal(stuck.command, roLegacy, `新位置写不进去时应暂时沿用旧副本：${stuck.detail}`)
+      assert.equal(pathExists(roLegacy), true, '回落时不能把旧副本也删了')
+    } finally {
+      await rm(roHome, { recursive: true, force: true })
+    }
 
     // 本平台未随包（拿一个清单里没有的组合）→ 回落 PATH，而不是给个不存在的绝对路径
-    const unsupported = ensureMaterialized({ platform: 'aix', home: healHome })
+    const unsupported = ensureMaterialized({ platform: 'aix', home: healHome, dshHome: healDsh })
     assert.equal(unsupported.source, 'path', `未随包的平台应回落到 PATH：${unsupported.detail}`)
     assert.equal(unsupported.command, 'mcp-gitee-ent')
     assert.equal(unsupported.bundledForPlatform, false)
@@ -2382,7 +2855,7 @@ process.stdin.on('data', (chunk) => {
       process.env.MCP_GITEE_ENT_BIN = '/my/own/mcp-gitee-ent'
       try {
         const overridden = ensureMaterialized({
-          platform: 'linux', home: overrideHome,
+          platform: 'linux', home: overrideHome, dshHome: join(overrideHome, 'dsh'),
         })
         assert.equal(overridden.command, '/my/own/mcp-gitee-ent', '显式指定必须赢过随包那份')
         assert.equal(overridden.source, 'path')
@@ -2396,7 +2869,7 @@ process.stdin.on('data', (chunk) => {
       await rm(overrideHome, { recursive: true, force: true })
     }
     console.log('  ✓ 宿主自愈：用户级 bin 落地 / 复用不重拷 / XDG_BIN_HOME 优先 / 替换留 .bak'
-      + ' / 未随包回落 PATH / 环境变量优先')
+      + ' / 迁移清旧副本 / 写不进去回落旧副本 / 未随包回落 PATH / 环境变量优先')
   } finally {
     await rm(healHome, { recursive: true, force: true })
   }
@@ -2408,9 +2881,9 @@ process.stdin.on('data', (chunk) => {
   assert.equal(typeof pingBody.mcp.matchesManifest, 'boolean')
   console.log('  ✓ /ping 携带随包 MCP 状态（platform/bundled/installed/matchesManifest）')
 
-  // ══ 13b. 知识库文档：四态判定 / 缓存布局 / MCP 委派════════════
+  // ══ 13b. 知识库文档：四态判定 / 缓存布局 / MCP 委派（DOCS.md）════════════
   //
-  // 这一节守的是两条纪律：
+  // 这一节守的是 DOCS.md 的两条纪律：
   //   ① 变更单位是「页」—— 四态判定必须是可断言的纯函数；
   //   ② MCP 是文档能力的**唯一实现** —— 插件侧不得出现任何文档端点。
   {
@@ -2795,7 +3268,10 @@ process.stdin.on('data', (chunk) => {
     // 冒烟用的假 ctx 没有 tools 注册表 —— 委派层必须**明说**原因，不能静默空白
     const noTools = await call(handler, { method: 'GET', url: '/api/gitee-chat/docs?sessionId=sess-gitee' })
     assert.equal(noTools.status, 409, '没有活 agent 时先报会话未加载（比"没有 tools"更贴近使用者的处境）')
-    assert.match(noTools.json.message, /会话|agent/)
+    // 0.5.4 起文档委派也可能走**进程级直连通道**（deps.direct）：
+    // 假 ctx 里没有真 MCP 进程，于是退化成「还没确定企业」——比"会话未加载"更靠后一步，
+    // 但同样是可行动的失败原因。两条都接受，只要求「不许静默空白」。
+    assert.match(noTools.json.message, /会话|agent|企业|enterprise/)
     const nodesNoAgent = await call(handler, { method: 'GET', url: '/api/gitee-chat/doc/nodes?sessionId=sess-gitee' })
     assert.equal(nodesNoAgent.status, 409, '节点树这条路也必须给同样可行动的失败原因')
     console.log('  ✓ 文档委派失败给可行动原因（会话未加载 / 无 tools 注册表），不静默空白')
