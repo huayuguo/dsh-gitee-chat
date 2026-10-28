@@ -1,5 +1,10 @@
 # dsh-gitee-chat
 
+[![npm](https://img.shields.io/npm/v/dsh-gitee-chat.svg)](https://www.npmjs.com/package/dsh-gitee-chat)
+[![CI](https://github.com/huayuguo/dsh-gitee-chat/actions/workflows/check.yml/badge.svg)](https://github.com/huayuguo/dsh-gitee-chat/actions/workflows/check.yml)
+[![DSH](https://img.shields.io/badge/DSH-%5E0.2.0--rc.2-4a6cf7.svg)](https://www.npmjs.com/package/@deepseek-ai/dsh)
+[![license](https://img.shields.io/npm/l/dsh-gitee-chat.svg)](./LICENSE)
+
 Gitee Enterprise project management inside a [DSH](https://github.com/deepseek-ai/deepseek-harness)
 conversation: a full-page project workbench, a small set of write tools, and 55 bundled Gitee Enterprise
 MCP tools.
@@ -16,90 +21,72 @@ MCP tools.
 ## What you get
 
 The **Gitee Project** entry in the session header is a **full-page workbench** (it renders in the
-conversation body and does not take over or push out the right sidebar). Calling `gitee_board` also
-pins a **board card** into the conversation (KPIs, state distribution, project progress, risk list,
-trimmed to the summary); the workbench is where you drill down.
+conversation body and does not take over or push out the right sidebar). Calling `gitee_board` also pins
+a **board card** into the conversation; the workbench is where you drill down.
 
-**There is no "Gitee mode" gate since 0.5.4**: the panel and the four write routes work in any
-session. What you can see and change is decided by **your token's role in Gitee Cloud** plus the
-deployment setting `allowWrites`, never by the session you happen to be in.
-
-Six tabs:
+**There is no "Gitee mode" gate since 0.5.4**: the panel and the write routes work in any session. What
+you see and change is decided by **your token's role in Gitee Cloud** plus `allowWrites`, never by the
+session you happen to be in.
 
 | Tab | Contents |
 |---|---|
-| Overview | Four KPI cards (projects · work items · PRs waiting on me · overdue items), work-item state ring chart, project progress bars, risks assigned to me, pending PRs |
-| Projects | Project list on the left, work-item table on the right; click a **repo card** to drill into repos, click a row for details |
-| My Work Items | Items across the enterprise where you are **assignee or collaborator** (computed inside one payload — no extra request), switchable between open / done / overdue / all; click a row to open it |
-| Merge Requests | Four filters (awaiting my review / awaiting my test / opened by me / all) × four states (open / merged / closed / all states), plus a "mergeable" card (review and test both passed); the drawer reviews, tests and merges |
-| Knowledge Base | The enterprise knowledge base as a **node tree** (folders + uploaded attachments): project list on the left, tree on the right, layers load lazily; previews go to the sidebar plugin |
+| Overview | Enterprise KPIs, risk reminders, recent activity |
+| Projects | Project list + repo cards + work-item table (open / done / overdue / all); a row opens details, a repo card drills into three columns |
+| My Work Items | Items where you are assignee **or** collaborator, with open / done / overdue filters |
+| Merge Requests | Awaiting my review / awaiting my test / opened by me / all, times four states; a row opens the drawer |
+| Knowledge Base | Project list + node tree with a draggable split; nodes and attachments load on demand, previews go to the sidebar |
 | Fixed Analysis | Nine cards: project health / member load / overdue / stalled / conventions / schedule variance / capacity / milestones / delivery trend |
 
-**Repo card drilldown**: clicking a repo card in a project opens three columns (project list | repo
-list | repo resources). Column widths are draggable and remembered; switching the repo only refetches
-the right column. The repo's three tabs are work items (create from the repo, open rows in place) /
-merge requests (open the drawer) / WIKI (first click shallow-clones the wiki repo, then reads the local
-copy; `Refresh` fetches — offline still works). Repos without a WIKI say so instead of going blank.
+**Repo card drilldown**: three columns (project list | repo list | repo resources), column widths
+draggable and remembered; scope defaults to "this project" and can switch to internal open-source,
+kept across projects; the repo page has three tabs (work items / merge requests / WIKI) in warm tints.
 
-**Merge request flow** (create → review → test → merge), all inside the plugin:
+**Merge request flow** (all inside the drawer): overview · changed files · comments · AI review →
+approve / reject → tests pass → merge. **New PR** opens a panel dialog (repo / branches / title /
+description / reviewer / tester count / draft / template) and posts to the host route `POST /pr/create`,
+equivalent to the MCP tool `create_enterprise_repo_pull`.
 
-- **New PR** opens an in-panel dialog: repo dropdown, **source / target branch dropdowns** (branches
-  come from the enterprise API; the button grays out with a reason when source = target or the repo has
-  only its default branch), title, description, one-click **apply template**, reviewer count, tester
-  count, draft. It posts to the host route `POST /pr/create`, equivalent to the MCP tool
-  `create_enterprise_repo_pull` — no need to open the web UI.
-- **AI draft** — the host fetches `compare` (real commits and file diff between the branches) plus the
-  PR template, then starts a **subagent under the selected session** that returns a title and
-  description and fills the form back in. Untick "subagent" and the same result is also delivered into
-  the selected main session (you can follow up there); the form is still filled.
-- **AI review** — in the PR drawer's AI review tab, pick a workspace / session, and a subagent under
-  that session reads the diff and returns a **blocking / important / minor** verdict (by default
-  nothing is injected as a user message into the main conversation; untick "subagent" to also deliver
-  the verdict into the selected main session). From the verdict you can
-  **submit comment + reject** or **submit comment only** and act manually; nothing is auto-approved by
-  default.
-- **Writes in the drawer** — approve / reject / reset review, test pass / fail, merge, comment. Buttons
-  are enabled or disabled by cloud permissions (not reviewer / cannot merge → disabled with a reason),
-  and failure codes are mapped to plain language (`not-reviewer` / `nothing-to-reset` /
-  `nothing-to-merge`). Review and test templates are bound separately and editable in the panel (saved
-  as user copies); the PR description template is only applied when creating a PR.
+**AI draft and review**: draft and review both run as a **subagent under the session you pick** (no user
+message is injected into the main conversation); the panel polls the result and fills the form back in,
+or offers one-click "comment + reject" / "comment only". Untick "subagent" to also deliver the result
+into the selected main session. Review and test templates are bound separately and editable in the
+panel; the PR description template is applied when creating a PR.
 
-**Work items**: create (title / assignee / priority / schedule required, mirroring the Gitee web form),
-change state, reassign, comment; states use four-color pills. Writes do not reload the whole page:
-the panel refetches in the background and updates in place. The detail pane shows the description,
-prerequisites (both Gitee IDs and WBS codes) and the comment thread.
+**Work items**: create (title / assignee / priority / schedule required), change state, reassign,
+comment; four-color state pills; writes update in place instead of reloading the page. Details show the
+description, prerequisites (Gitee IDs and WBS codes) and the comment thread.
 
-**Capability tiers**: there is exactly one agent preset, "Gitee 项目管理", injecting a `gitee-role`
-system prompt context. The tier is not selected; it is derived on every fetch from **the token's role
-and project relationships in Gitee Cloud**: enterprise owner / super-admin / admin = manager (all 55
-MCP tools, cross-project analysis); a project assignee = project tier (48); everyone else = exec tier
-(40, own work items only). Switching enterprise or token changes the tier immediately. The tier gates
-which tools you get (a hard refusal by default; `enforceTier: false` turns the local layer off), while
-the real boundary stays in Gitee Cloud. Read-only deployments (`allowWrites: false`) hard-block the
-write tools in all three tiers.
+**Capability tiers**: one agent preset, "Gitee 项目管理". The tier is not selected — it is derived on
+every fetch from **the token's role and project relationships in Gitee Cloud**: enterprise owner /
+super-admin / admin = manager (55 MCP tools); project assignee = project tier (48); everyone else = exec
+tier (40, own work items only). Switching enterprise or token changes the tier immediately.
 
 ## Install
 
 Requires DSH `^0.2.0-rc.2` and Node `^22.19 || >=24`.
 
 ```sh
-# 1) build (lib/ is generated, not committed; lib/types/ ships with lib)
-npm install --legacy-peer-deps
-npm run build
-
-# 2) install into a profile (desktop app: desktop, dsh web: web)
-dsh plugin --profile desktop add "file:$(pwd)"
-
-# 3) in the app: Settings → Gitee Enterprise, paste an enterprise access token, save
+# recommended: npm
+dsh plugin --profile desktop add dsh-gitee-chat
 ```
 
-You can also use Settings → Plugins → Add plugin with `file:<absolute path>`.
-**Upgrading means `remove` then `add`** — `file:` installs are copies. If you are coming from 0.5.3,
-your profile may still contain the old preset rows (`preset-gitee-exec` / `preset-gitee-manager`);
-remove them so you don't have two Gitee entries.
-On the script side it ships only runtime scripts (`scripts/setup.mjs`, `scripts/check-presets.mjs`,
-`scripts/gitee/`); build and self-check scripts stay in the repo (`npm run check`). The npm package
-ships `lib/` (including `lib/types/`) and no longer ships `src`.
+| Source | Command | When |
+|---|---|---|
+| **npm** | `dsh plugin --profile desktop add dsh-gitee-chat` | default |
+| GitHub Release asset | `dsh plugin --profile desktop add "https://github.com/huayuguo/dsh-gitee-chat/releases/download/v0.5.4/dsh-gitee-chat-0.5.4.tgz"` | npm is slow/unreachable |
+| git tag | `dsh plugin --profile desktop add "git+https://github.com/huayuguo/dsh-gitee-chat.git#v0.5.4"` | pin a tag |
+| local source | `npm install --legacy-peer-deps && npm run build`, then `add "file:$(pwd)"` | development |
+
+- **Pick the right profile**: `desktop` for the desktop app, `web` for `dsh web`. A wrong profile fails
+  **silently** — the UI simply shows nothing.
+- On Windows use the app's own `dsh` (`<app>\resources\runtime\cli\bin\dsh.cmd`) or
+  Settings → Plugins → Add plugin.
+- **Upgrading means `remove` then `add`** — installs are copies. Coming from 0.5.3, your profile may still
+  contain the old preset rows (`preset-gitee-exec` / `preset-gitee-manager`); remove them so you don't end
+  up with two Gitee entries.
+- npm publishes to the official registry only; mirrors sync automatically.
+- After installing, open **Settings → Gitee Enterprise** and paste an enterprise access token.
+
 To let an agent do it, the bundle ships `skills/dsh-gitee-chat/SKILL.md`; just ask it to install the
 Gitee plugin and answer its questions.
 
@@ -169,6 +156,11 @@ back automatically on 404.
   `fetchedAt / ageSeconds / stale / ttlSeconds` so the model never presents stale numbers as live.
 - Background refresh is optional and only runs while someone is actually looking at the panel.
 - Slow requests log a `[gitee-chat][slow]` line; `GITEE_CHAT_TRACE=1` logs everything.
+
+## Compatibility
+
+DSH `^0.2.0-rc.2`, Node `^22.19 || >=24`, Linux / macOS / Windows. The repository's `check.yml` runs the
+same self-check on every push, and `release.yml` publishes on `v*` tags.
 
 ## Development
 
