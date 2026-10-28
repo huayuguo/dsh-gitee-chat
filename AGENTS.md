@@ -12,12 +12,15 @@
   该文件不在时，`smoke.mjs` 与 `gen-capabilities.mjs --check` 会**跳过比对而不是判红**。真正的防漂移靠两份
   入库产物：`src/generated/tierWrites.ts` 与各 preset 的 `--enabled-toolsets`。
 
-## 2. 锁文件：内部维护，不入库
+## 2. 锁文件：pnpm 锁入库，两条线同一份
 
-- `package-lock.json` **不入库**（两条线都忽略）。内部开发机照常用它保证 `npm ci` 可复现，
-  但它属于「本机环境产物」，不是发布物（npm 包的 `files` 从不包含锁文件）。
-- 更新依赖后：`npm install` → 本地 `npm run check` 绿 → **不要** `git add package-lock.json`。
-- 外部发布线用 pnpm（`pnpm-lock.yaml`），与 npm 锁互不相干；两边都别互相搬。
+- `package-lock.json` **不入库**（两条线都忽略）：那是本机 `npm install` 的产物，不是发布物。
+- `pnpm-lock.yaml` **入库，且两条线逐字节相同**：CI（`check.yml` / `release.yml`）靠
+  `pnpm install --frozen-lockfile` 复现构建，锁一分叉 CI 就会红。
+- 改依赖后的顺序：改 `package.json` → `pnpm install --lockfile-only` → 两条线同步这一份锁 →
+  `npm run parity` 必须绿 → 再 `npm run check`。
+- pnpm 的设置（`autoInstallPeers: false`、`allowBuilds.esbuild`、`minimumReleaseAgeExclude`）在
+  `pnpm-workspace.yaml`，同样是两线同一份。
 
 ## 3. 两条线的命名
 
@@ -30,13 +33,23 @@
   `refname 'github/main' is ambiguous`，脚本里得一直写 `refs/heads/...` 才不歧义。
 
 - 目标状态：`0.5.4` 与 `v0.5.4` **内容等位**（同一份发布物，只是线不同）。
-- 等位由 `release-manifest.json` 记录「外部提交 ← 内部提交」的对应关系，`check-tags.mjs` 负责断言。
+- **等位的判定方式（2026-10-28 起）**：两条线**文件集相同**、`scripts/` **逐字节相同**，内容差异只允许出现在
+  ① `README.md` / `README.en.md` 的 `<!-- parity:install:begin … end -->` 之间（装法），
+  ② `package.json` 的 `repository` / `homepage` / `bugs` 三个字段。
+  由 `scripts/check-parity.mjs` 断言：`npm run parity`（对等）、`npm run release:check`（对等 + 发布包必须能力）。
+  规则与被哪个脚本强制，记在 `release-manifest.json`。
+- `scripts/check-tags.mjs` 只管另一件事：tag ↔ `package.json` 版本 ↔ `CHANGELOG` 条目三者一致。
+- 改代码的顺序固定：**先落内部线 → 投影到对外线 → `npm run parity` 绿 → 再谈打 tag / 推送**。
 - 推送纪律：每次 push 都要当次批准，禁止 `git push --tags` 一把梭。
 
 ## 4. 代码与发布物
 
 - `lib/`（构建产物）、`types/`、`.tmp/`、`node_modules/` 不入库。
-- npm 包内容以 `package.json` 的 `files` 为准：`lib`、`vendor`、`scripts`、`skills`、`presets`、`assets`、
-  `cordis.patch.yml`、`cordis.skills.patch.yml`、`README.md`、`README.en.md`、`USAGE.md`、`LICENSE`。
+- npm 包内容以 `package.json` 的 `files` 为准：`lib`、`vendor`、`assets`、
+  `scripts/setup.mjs`、`scripts/check-presets.mjs`、`scripts/gitee`（运行期脚本只有这三个路径）、
+  `skills`、`presets`、`cordis.patch.yml`、`cordis.skills.patch.yml`、
+  `LICENSE`、`README.md`、`README.en.md`、`USAGE.md`、`icon.svg`。
+- `scripts/` 里其余脚本（`check-parity`、`check-tags`、`check-types`、`smoke`、`render-check`、
+  `gen-capabilities`、`build-mcp`、`preset-files`）只留在仓库、**不进包**；两条线的 `scripts/` 必须完全一致。
 - 随包 MCP 二进制在 `vendor/mcp-gitee-ent/`，由 `scripts/build-mcp.mjs` 从 fork 仓（`dsh-mcp-gitee-ent`）构建，
   `manifest.json` 里的 `forkCommit` 必须与 fork 仓 HEAD 一致。
