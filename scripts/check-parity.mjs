@@ -75,16 +75,18 @@ function jsonOf(text, label) {
 const lineNo = (text, marker) => text.split('\n').findIndex((l) => l.includes(marker)) + 1
 
 // ---- 1) 文件集 --------------------------------------------------------------
+let pairSkipped = false
 if (!refExists(BASE) || !refExists(OTHER)) {
   const missing = [!refExists(BASE) && BASE, !refExists(OTHER) && OTHER].filter(Boolean)
   if (ALLOW_MISSING) {
+    pairSkipped = true
     notes.push(`另一条线不可用（${missing.join(' / ')}），跳过对等检查（--allow-missing-other）`)
   } else {
     fail(`找不到分支：${missing.join(' / ')}（本机需同时有内部线与发布线；CI 可用 --allow-missing-other 跳过）`)
   }
 }
 
-if (problems.length === 0) {
+if (problems.length === 0 && !pairSkipped) {
   const a = new Set(listFiles(BASE))
   const b = new Set(listFiles(OTHER))
   const onlyA = [...a].filter((f) => !b.has(f))
