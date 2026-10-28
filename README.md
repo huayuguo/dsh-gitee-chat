@@ -47,6 +47,7 @@ Gitee 云端的角色与项目关系**推导：企业拥有者/超管/管理员 
 
 要求：DSH `^0.2.0-rc.2`，Node `^22.19 || >=24`。
 
+<!-- parity:install:begin —— 两条线只在这一段分叉（装法），其余正文逐字一致 -->
 ```sh
 # 从 npm 官方源装（推荐）
 dsh plugin --profile desktop add dsh-gitee-chat
@@ -57,20 +58,18 @@ dsh plugin --profile desktop add dsh-gitee-chat
 | **npm 官方源** | `dsh plugin --profile desktop add dsh-gitee-chat` | 默认 |
 | GitHub Release 附件 | `dsh plugin --profile desktop add "https://github.com/huayuguo/dsh-gitee-chat/releases/download/v0.5.4/dsh-gitee-chat-0.5.4.tgz"` | 直连 npm 不稳时 |
 | git 直装 | `dsh plugin --profile desktop add "git+https://github.com/huayuguo/dsh-gitee-chat.git#v0.5.4"` | 想跟某个 tag |
-| 本地源码 | 见下方「本地源码」 | 开发 / 改代码 |
 
 **本地源码**（开发、改代码）：
 
 ```sh
-# 1) 构建（lib/ 是产物，不进仓库；lib/types/ 随 lib 一起发）
 npm install --legacy-peer-deps
 npm run build
-
-# 2) 装进 profile（桌面版用 desktop，dsh web 用 web）
 dsh plugin --profile desktop add "file:$(pwd)"
 ```
+<!-- parity:install:end -->
 
 也可以在应用里「设置 → 插件 → 添加插件」填 `file:<本目录绝对路径>`。
+
 - **profile 要对**：装错是静默失效 —— 界面里什么都没有，也不报错。
 - 桌面版用**应用自带**的 `dsh`（`<应用目录>\resources\runtime\cli\bin\dsh.cmd`），全局装的那个会拒绝 `--profile desktop`。
 - **升级 = `remove` 再 `add`**（装进去的是副本，没有自动更新）。从 0.5.3 升上来时，profile 里可能还留着
@@ -154,7 +153,8 @@ npm pack             # 产出可安装的 tgz（只含 package.json `files` 列�
 | [`USAGE.md`](./USAGE.md) | 使用者：界面怎么用、出问题怎么办 |
 | [`skills/dsh-gitee-chat/SKILL.md`](./skills/dsh-gitee-chat/SKILL.md) | AI：安装 / 配置 / 诊断 / MCP 用法（索引层，细节在 `references/{mcp,panel,recipes,install}.md`） |
 
-设计说明、决策记录、功能清单、能力矩阵属于**内部开发资料**，不在本仓库。
+设计说明、决策记录、功能清单、能力矩阵属于**内部开发资料**，不随仓库分发
+（`node scripts/gen-capabilities.mjs` 可重建能力矩阵）。
 
 English: [README.en.md](./README.en.md)
 

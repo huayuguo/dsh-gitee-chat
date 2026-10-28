@@ -53,3 +53,7 @@ jobs:
       # smoke 会真实 import lib/*.js；types:check 会 tsc 重新生成后比对。
       - name: 全量回归（pnpm run check）
         run: pnpm run check
+
+      # 双线对等：只在本机同时有两条线时生效；GitHub 上只有发布线，用 --allow-missing-other 跳过
+      - name: 双线对等检查
+        run: node scripts/check-parity.mjs --allow-missing-other

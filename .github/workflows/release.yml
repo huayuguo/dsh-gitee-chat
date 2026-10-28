@@ -72,6 +72,10 @@ jobs:
       - name: 全量回归（pnpm run check）
         run: pnpm run check
 
+      # 发布前必须能力：包内容必须项/禁止项、元数据、双平台二进制、版本 ↔ CHANGELOG
+      - name: 对外发布必须能力
+        run: node scripts/check-parity.mjs --pack --allow-missing-other
+
       - name: 发布到 npm 官方源（带 provenance）
         # 没有 token 时 npm 只会回一句 `ENEEDAUTH / need auth`，看不出缺的是哪个 secret
         # （2026-10-10 首次发布就是这么挂的：secrets.NPM_TOKEN 根本没建）。这里提前说清楚。
