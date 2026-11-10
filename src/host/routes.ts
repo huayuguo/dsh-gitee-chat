@@ -980,7 +980,9 @@ export function createRouteHandler(deps: RouteDeps) {
           })
         } catch (cause) {
           const failure = cause as { code?: string; message?: string; hint?: string }
-          const status = failure.code === 'no-subagents' || failure.code === 'session-not-live' ? 409 : 400
+          const status = failure.code === 'session-not-found'
+            ? 404
+            : failure.code === 'no-subagents' || failure.code === 'session-not-live' ? 409 : 400
           writeJson(res, status, {
             ok: false,
             code: failure.code ?? 'start-failed',

@@ -2020,6 +2020,13 @@ process.stdin.on('data', (chunk) => {
   const prSubagentSrc = await readFile(join(root, 'src', 'host', 'prSubagent.ts'), 'utf8')
   assert.ok(prSubagentSrc.includes("delivery: input.delivery ?? 'caller'"),
     'prSubagent 必须支持 delivery 透传（parent = 结论进主会话）')
+  // 0.2.2 宿主：会话空闲时 agents.get() 是 undefined；必须能通过宿主
+  // sessionController.resolveAgent() 把所选会话恢复成活 Agent，否则
+  // 「投递到别的工作区会话」永远 session-not-live。
+  assert.ok(prSubagentSrc.includes('resolveAgent'), 'prSubagent 必须支持会话空闲时恢复活 Agent（resolveAgent）')
+  assert.ok(prSubagentSrc.includes('session-not-found'), 'prSubagent 必须区分「会话不存在」与「会话没在跑」')
+  assert.ok(indexSrc.includes('resolveSessionAgent') && indexSrc.includes("ctx.get('sessionController')"),
+    'index.ts 必须把宿主 sessionController.resolveAgent 接到子智能体投递上')
   assert.ok(routesSrc.includes("delivery: 'parent'"),
     'routes 里 deliver=session 必须走 delivery=parent（而不是只渲染 prompt）')
   assert.ok(createDialogSrc.includes('PillCheck') && createDialogSrc.includes('子智能体'),

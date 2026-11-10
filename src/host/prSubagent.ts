@@ -7,8 +7,10 @@
  *
  * 用的就是 DSH 自己的子智能体服务（`ctx.get('subagents')`，0.2.1 起有）：
  *   `startActivation({provider, label, request, signal, delivery})`
- * `request.parent` 必须是**活着的** Agent 实例，所以这里只能挂到正在运行的会话上
- * （会话空闲时 `agents.get(id)` 是 undefined，此时报 session-not-live 让使用者选当前会话）。
+ * `request.parent` 必须是**活着的** Agent 实例。会话空闲时 `agents.get(id)` 是 undefined，
+ * 此时走宿主 `sessionController.resolveAgent(sessionId)`（"Resolve or resume one ordinary
+ * Session for another Host API domain"）把它**恢复**成活着的 Agent 再用 —— 这样「投递到别的
+ * 工作区的会话」不用先在那个会话里发一条消息唤醒（0.2.2 宿主上实测旧的 session-not-live 太硬）。
  */
 
 /** 子智能体服务的最小形状（宿主内部类型没有导出，这里按用到的成员声明）。 */
@@ -45,7 +47,7 @@ export interface PrSubagentRun {
 
 export class PrSubagentError extends Error {
   constructor(
-    readonly code: 'no-subagents' | 'session-not-live' | 'start-failed' | 'run-not-found',
+    readonly code: 'no-subagents' | 'session-not-live' | 'session-not-found' | 'start-failed' | 'run-not-found',
     message: string,
     readonly hint: string,
   ) {
@@ -74,6 +76,12 @@ function flattenOutput(output: unknown): string {
 export function createPrSubagentRunner(deps: {
   readonly subagents: () => SubagentsLike | undefined
   readonly agents: () => AgentsLike | undefined
+  /**
+   * 会话没在跑时，让宿主把它「解析或恢复」成一个活 Agent
+   * （宿主 `sessionController.resolveAgent(sessionId)`：返回 Agent，或 `{ error }`）。
+   * 缺省或直接抛错时维持原来的 session-not-live 行为。
+   */
+  readonly resolveAgent?: (sessionId: string) => Promise<unknown>
   readonly logger?: { warn?: (message: string) => void }
 }) {
   const runs = new Map<string, { run: PrSubagentRun; controller: AbortController }>()
@@ -82,6 +90,42 @@ export function createPrSubagentRunner(deps: {
     for (const [key, entry] of runs) {
       if (entry.run.finishedAt !== null && now - entry.run.finishedAt > RUN_TTL_MS) runs.delete(key)
     }
+  }
+
+  /** 取（必要时恢复）用一个活着的父 Agent；两路都拿不到就报 session-not-live。 */
+  const resolveParent = async (sessionId: string): Promise<unknown> => {
+    const live = deps.agents()?.get?.(sessionId)
+    if (live !== undefined && live !== null) return live
+
+    if (deps.resolveAgent !== undefined) {
+      let resumed: unknown
+      try {
+        resumed = await deps.resolveAgent(sessionId)
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause)
+        throw new PrSubagentError('session-not-live', `所选会话恢复失败：${message}`, '换「当前会话」再试；如果那个会话已被归档或删掉，先在会话列表里打开它一次。')
+      }
+      if (resumed !== null && typeof resumed === 'object' && 'error' in resumed) {
+        const error = (resumed as { error?: { message?: string; code?: string } }).error
+        const detail = error?.message ?? '未知原因'
+        throw new PrSubagentError(
+          error?.code === 'session/not-found' ? 'session-not-found' : 'session-not-live',
+          error?.code === 'session/not-found' ? `找不到这个会话：${detail}` : `所选会话恢复失败：${detail}`,
+          error?.code === 'session/not-found' ? '会话可能已被删除或归档；刷新会话列表后重新选一个。' : '换「当前会话」再试，或先在那边打开一次会话。',
+        )
+      }
+      const agent = (resumed as { agent?: unknown } | undefined)?.agent ?? resumed
+      if (agent !== undefined && agent !== null) {
+        deps.logger?.warn?.(`[gitee-chat] 会话 ${sessionId} 原本空闲，已由宿主恢复成活 Agent 后挂载子智能体`)
+        return agent
+      }
+    }
+
+    throw new PrSubagentError(
+      'session-not-live',
+      '所选会话当前没有在跑的智能体。',
+      '子智能体必须挂在活着的会话下：选「当前会话」，或先在那个会话里发一条消息把它唤醒，再回来发起。',
+    )
   }
 
   const start = async (input: {
@@ -104,14 +148,7 @@ export function createPrSubagentRunner(deps: {
     if (subagents?.startActivation === undefined) {
       throw new PrSubagentError('no-subagents', '当前 DSH 没有子智能体服务。', '这个版本的宿主不支持子智能体；把结论手工投给会话，或升级 DSH 到 0.2.1 以上。')
     }
-    const parent = deps.agents()?.get?.(input.sessionId)
-    if (parent === undefined || parent === null) {
-      throw new PrSubagentError(
-        'session-not-live',
-        '所选会话当前没有在跑的智能体。',
-        '子智能体必须挂在活着的会话下：选「当前会话」，或先在那个会话里发一条消息把它唤醒，再回来发起。',
-      )
-    }
+    const parent = await resolveParent(input.sessionId)
 
     const controller = new AbortController()
     const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS

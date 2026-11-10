@@ -901,9 +901,21 @@ export function apply(ctx: any, config?: Config): void {
    * 服务是懒取的：`ctx.get('subagents')` 在装配期可能还没注册完，
    * 且老宿主根本没有这两个服务（那时 start() 会报 no-subagents）。
    */
+  // 会话空闲时（GUI 里没打开那个标签页）`agents.get()` 是 undefined；宿主的
+  // `sessionController.resolveAgent(id)` 能把会话「解析或恢复」成一个活 Agent，
+  // 这样「投递到别的工作区的会话」不用先手动唤醒那个会话。
+  const resolveSessionAgent = async (sessionId: string): Promise<unknown> => {
+    const controller = ctx.get('sessionController') as
+      | { resolveAgent?: (id: string) => Promise<unknown> }
+      | undefined
+    if (controller?.resolveAgent === undefined) return undefined
+    return await controller.resolveAgent(sessionId)
+  }
+
   const prSubagent = createPrSubagentRunner({
     subagents: () => ctx.get('subagents') as never,
     agents: () => ctx.get('agents') as never,
+    resolveAgent: resolveSessionAgent,
     logger: ctx.logger as never,
   })
   ctx.effect(() => () => prSubagent.dispose())
