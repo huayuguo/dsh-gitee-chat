@@ -1,15 +1,15 @@
 {
-  "version": "0.5.5",
+  "version": "0.5.6",
   "internal": {
     "line": "gitee",
     "ref": "dev/win",
-    "tag": "0.5.5",
+    "tag": "0.5.6",
     "note": "内部开发线（Gitee origin + lidakeji）。唯一事实源：改动先落这里，再按文件投影到对外线。"
   },
   "external": {
     "line": "github",
-    "ref": "release/0.5.5",
-    "tag": "v0.5.5",
+    "ref": "release/0.5.6",
+    "tag": "v0.5.6",
     "note": "对外发布线（GitHub + npm）。由内部线按文件重放而来，不是 merge；打 v* tag 触发 release.yml。"
   },
   "policy": "两条线文件集相同、scripts/ 逐字节相同；内容差异只允许在 README 的安装段与 package.json 的 repository/homepage/bugs。",

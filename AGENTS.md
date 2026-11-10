@@ -26,13 +26,13 @@
 
 | 线 | 分支 | tag 形态 |
 |---|---|---|
-| 内部（Gitee 私有，`origin` + `lidakeji`） | `dev/win`（正在改）、`main`（上一版 `0.5.4` 的发布主线） | `0.5.5`（不带 `v`） |
-| 外部（GitHub 公开，`github`） | `release/0.5.5`（本仓准备）→ 推送为 GitHub 的 `main`；`v0.5.4` 那一版在 GitHub 上保持不动 | `v0.5.5`（带 `v`） |
+| 内部（Gitee 私有，`origin` + `lidakeji`） | `dev/win`（正在改）、`main`（上一版的发布主线） | `0.5.x`（不带 `v`，当前 `0.5.6`） |
+| 外部（GitHub 公开，`github`） | `release/0.5.x`（本仓准备，当前 `release/0.5.6`）→ 推送为 GitHub 的 `main`；上一版 tag 在 GitHub 上保持不动 | `v0.5.x`（带 `v`，当前 `v0.5.6`） |
 
 - 不要把外部线分支命名成 `github/main`：它与远端跟踪分支同名，git 会报
   `refname 'github/main' is ambiguous`，脚本里得一直写 `refs/heads/...` 才不歧义。
 
-- 目标状态：`0.5.5` 与 `v0.5.5` **内容等位**（同一份发布物，只是线不同）。
+- 目标状态：同一版的 `0.5.x` 与 `v0.5.x` **内容等位**（同一份发布物，只是线不同）。
 - **等位的判定方式（2026-10-28 起）**：两条线**文件集相同**、`scripts/` **逐字节相同**，内容差异只允许出现在
   ① `README.md` / `README.en.md` 的 `<!-- parity:install:begin … end -->` 之间（装法），
   ② `package.json` 的 `repository` / `homepage` / `bugs` 三个字段。

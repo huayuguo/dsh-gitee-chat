@@ -3,6 +3,19 @@
 本文件记录 dsh-gitee-chat 的版本变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)；日期为本地（Asia/Shanghai）日期。
 
+## [0.5.6] - 2026-11-10
+
+**桌面版修复：拉起子智能体失败**。0.5.5 在桌面版（应用内置 DSH）上报
+「拉起子智能体失败：Cannot read properties of undefined (reading 'id')」，AI 审核与 AI 起草两条链路都不可用。
+
+### 修复
+
+- **`startActivation` 的参数形状**：DSH 0.2.2-rc.1 有两个构建 —— 桌面版（应用内置 `app.asar`）把
+  spec 拍平成 `{ parent, prompt, … }`，全局 CLI 版用嵌套的 `{ request: { parent, prompt, … } }`。
+  插件原来只给嵌套形状，桌面版读 `spec.parent.id` 时 `parent` 是 `undefined`，于是抛 TypeError。
+  现在两种形状同时给（两个构建都不校验未知键），谁认哪个都能跑。
+- **错误提示**：形状不匹配时不再让人去猜「是不是会话关了」，直接说明宿主与插件的接口形状不一致。
+
 ## [0.5.5] - 2026-11-10
 
 **宿主 0.2.2 兼容 + AI 起草链路修复版**。0.5.4 之后宿主升到 0.2.2，`agents.get(sessionId)` 只返回

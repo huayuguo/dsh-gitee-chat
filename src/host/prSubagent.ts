@@ -155,23 +155,41 @@ export function createPrSubagentRunner(deps: {
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     timer.unref?.()
 
+    // 只给文字 prompt：不给 outputSchema，子智能体就按模板自然输出 Markdown，
+    // 面板拿到的正文可以直接当 PR 评论用。
+    const promptBlocks = [{ type: 'text' as const, text: input.prompt }]
+
+    // DSH 0.2.2-rc.1 有两个构建，startActivation 的参数形状不一样：
+    //   · 桌面版（应用内置 app.asar）：拍平的 { parent, prompt, maxDepth… }
+    //   · 全局 CLI 版（npm 装的 dsh）：嵌套的 { request: { parent, prompt, maxDepth… } }
+    // 只给其中一种，另一种会读到 undefined 而抛
+    // 「Cannot read properties of undefined (reading 'id')」（读 spec.parent.id）。
+    // 两个构建都不校验未知键，所以两种形状一起给，谁认哪个都用得上。
+    const activationSpec = {
+      provider: 'spawn',
+      label: input.label,
+      parent,
+      prompt: promptBlocks,
+      request: { parent, prompt: promptBlocks },
+      signal: controller.signal,
+      // 'caller'：不往主会话里插系统消息，结果只回到本插件；
+      // 'parent'：结论也落进主会话（结算消息），用于「投递到主会话」那一档。
+      delivery: input.delivery ?? 'caller',
+    }
+
     let activation: Awaited<ReturnType<NonNullable<SubagentsLike['startActivation']>>>
     try {
-      activation = await subagents.startActivation({
-        provider: 'spawn',
-        label: input.label,
-        // 只给文字 prompt：不给 outputSchema，子智能体就按模板自然输出 Markdown，
-        // 面板拿到的正文可以直接当 PR 评论用。
-        request: { parent, prompt: [{ type: 'text', text: input.prompt }] },
-        signal: controller.signal,
-        // 'caller'：不往主会话里插系统消息，结果只回到本插件；
-        // 'parent'：结论也落进主会话（结算消息），用于「投递到主会话」那一档。
-        delivery: input.delivery ?? 'caller',
-      })
+      activation = await subagents.startActivation(
+        activationSpec as Parameters<NonNullable<SubagentsLike['startActivation']>>[0],
+      )
     } catch (cause) {
       clearTimeout(timer)
       const message = cause instanceof Error ? cause.message : String(cause)
-      throw new PrSubagentError('start-failed', `拉起子智能体失败：${message}`, '确认所选会话还活着；如果刚关闭了标签页，选当前会话重试。')
+      // 形状不匹配时错误恰好是读 'id'：给一句能自查的提示，别再让人去猜会话死没死。
+      const hint = /reading 'id'/.test(message)
+        ? '宿主与插件对 startActivation 的参数形状不一致（桌面版拍平、CLI 版嵌套）。插件已同时给两种形状；如果还看到这句，说明宿主又是第三种形状，请把 DSH 与插件升到同一发布线。'
+        : '确认所选会话还活着；如果刚关闭了标签页，选当前会话重试。'
+      throw new PrSubagentError('start-failed', `拉起子智能体失败：${message}`, hint)
     }
 
     const now = Date.now()

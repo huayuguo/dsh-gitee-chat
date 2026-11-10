@@ -2067,6 +2067,13 @@ process.stdin.on('data', (chunk) => {
   const prSubagentSrc = await readFile(join(root, 'src', 'host', 'prSubagent.ts'), 'utf8')
   assert.ok(prSubagentSrc.includes("delivery: input.delivery ?? 'caller'"),
     'prSubagent 必须支持 delivery 透传（parent = 结论进主会话）')
+  // 0.2.2-rc.1 的两个构建参数形状不同：桌面版（app.asar）是拍平的
+  // { parent, prompt }，全局 CLI 版是 { request: { parent, prompt } }。
+  // 只给一种，另一种会读 spec.parent.id 抛 Cannot read properties of undefined。
+  assert.ok(prSubagentSrc.includes('request: { parent, prompt: promptBlocks }') && prSubagentSrc.includes('      parent,'),
+    'startActivation 必须同时给拍平与嵌套两种形状（桌面版/CLI 版参数形状不同）')
+  assert.ok(prSubagentSrc.includes('startActivation 的参数形状不一致'),
+    '形状不匹配时要给人话提示，而不是让人去猜会话是否还活着')
   // 0.2.2 宿主：会话空闲时 agents.get() 是 undefined；必须能通过宿主
   // sessionController.resolveAgent() 把所选会话恢复成活 Agent，否则
   // 「投递到别的工作区会话」永远 session-not-live。
