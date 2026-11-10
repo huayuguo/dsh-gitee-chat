@@ -1,5 +1,7 @@
 # dsh-gitee-chat
 
+[中文](README.md) · [English](README.en.md)
+
 把 **Gitee 项目管理**装进 [DSH](https://github.com/deepseek-ai/deepseek-harness) 会话：
 一整页能点的项目工作台 + 一套能写的工具 + 随包的 55 个 Gitee 企业 MCP 工具。
 
@@ -56,8 +58,8 @@ dsh plugin --profile desktop add dsh-gitee-chat
 | 来源 | 命令 | 什么时候用 |
 |---|---|---|
 | **npm 官方源** | `dsh plugin --profile desktop add dsh-gitee-chat` | 默认 |
-| GitHub Release 附件 | `dsh plugin --profile desktop add "https://github.com/huayuguo/dsh-gitee-chat/releases/download/v0.5.4/dsh-gitee-chat-0.5.4.tgz"` | 直连 npm 不稳时 |
-| git 直装 | `dsh plugin --profile desktop add "git+https://github.com/huayuguo/dsh-gitee-chat.git#v0.5.4"` | 想跟某个 tag |
+| GitHub Release 附件 | `dsh plugin --profile desktop add "https://github.com/huayuguo/dsh-gitee-chat/releases/download/v0.5.5/dsh-gitee-chat-0.5.5.tgz"` | 直连 npm 不稳时 |
+| git 直装 | `dsh plugin --profile desktop add "git+https://github.com/huayuguo/dsh-gitee-chat.git#v0.5.5"` | 想跟某个 tag |
 
 **本地源码**（开发、改代码）：
 

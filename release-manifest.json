@@ -1,22 +1,26 @@
 {
-  "version": "0.5.4",
+  "version": "0.5.5",
   "internal": {
     "line": "gitee",
     "ref": "dev/win",
-    "tag": "0.5.4",
+    "tag": "0.5.5",
     "note": "内部开发线（Gitee origin + lidakeji）。唯一事实源：改动先落这里，再按文件投影到对外线。"
   },
   "external": {
     "line": "github",
-    "ref": "release/0.5.4",
-    "tag": "v0.5.4",
+    "ref": "release/0.5.5",
+    "tag": "v0.5.5",
     "note": "对外发布线（GitHub + npm）。由内部线按文件重放而来，不是 merge；打 v* tag 触发 release.yml。"
   },
   "policy": "两条线文件集相同、scripts/ 逐字节相同；内容差异只允许在 README 的安装段与 package.json 的 repository/homepage/bugs。",
   "allowedDifferences": {
     "README.md": "<!-- parity:install:begin --> 与 <!-- parity:install:end --> 之间（装法：内部=本地源码，对外=npm/Release/git）",
     "README.en.md": "同上",
-    "package.json": ["repository", "homepage", "bugs"]
+    "package.json": [
+      "repository",
+      "homepage",
+      "bugs"
+    ]
   },
   "enforcedBy": "scripts/check-parity.mjs —— npm run parity（对等）、npm run release:check（对等 + 发布包必须能力）"
 }

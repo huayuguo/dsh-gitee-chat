@@ -3,6 +3,32 @@
 本文件记录 dsh-gitee-chat 的版本变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)；日期为本地（Asia/Shanghai）日期。
 
+## [0.5.5] - 2026-11-10
+
+**宿主 0.2.2 兼容 + AI 起草链路修复版**。0.5.4 之后宿主升到 0.2.2，`agents.get(sessionId)` 只返回
+活着的 Agent；同时 AI 起草在真实数据下拿不到 diff、结论里混着过程自述。这一版把投递与起草两条链路
+补齐，并给「设置写不进去」补上可读错误。
+
+### 修复
+
+- **AI 审核 / AI 起草投递给空闲会话**：所选目标会话当前没在跑时，先经宿主
+  `sessionController.resolveAgent()` 把它恢复成活 Agent 再挂子智能体；会话真不存在时返回 404
+  `session-not-found`，不再与「没在跑」混报 409 `session-not-live`。实测投给空闲的 Greeting 会话
+  → 200 `dispatched`，约 50 秒收到结论。
+- **AI 起草拿不到 diff**：企业版 `compare` 的 `diffs[].patch` 是对象 `{ diff, too_large, … }` 而非字符串，
+  旧代码 `String(patch)` 得到 `"[object Object]"`，prompt 里没有任何真实改动，模型只能写「待补充」。
+  改为取 `patch.diff`（`too_large` 时留空）；同一对比实测 17 个文件里 13 个带真实 hunk、0 处占位。
+- **起草结论解析**：子智能体常在 JSON 前写大段过程自述（实测 9.5K 回复里前 6.8K 是过程），
+  旧的「第一个 `{` 到最后一个 `}`」必然解析失败、表单不回填。改为把每个 `{` 当候选起点、从后往前试解析；
+  prompt 里同时钉死「最终回复第一行第一个字符必须是 `{`」。
+- **设置落盘失败给人话**：Windows 上 `config.json` 被杀软/编辑器占用时 `renameSync` 抛 `EPERM`，
+  设置页只看到英文 errno。统一成 `SettingsWriteError`（`code=settings-write-failed`）+ 中文提示 +
+  按平台 hint，临时文件自动清理；「按仓库记住投递目标」降级为尽力而为，写不进去不影响起草。
+
+### 变更
+
+- README 增加中英切换（默认中文），版本号推进到 0.5.5。
+
 ## [0.5.4] - 2026-10-27
 
 **合并请求全流程 + 面板重构版**。0.5.3 只有「看板 + 工作项写回 + 固定分析」，PR 相关的事都得回 Gitee

@@ -13,7 +13,7 @@
 //
 // 用法：
 //   node scripts/check-parity.mjs                       # 当前分支 vs 内部线
-//   node scripts/check-parity.mjs --base dev/win --other release/0.5.4
+//   node scripts/check-parity.mjs --base dev/win --other release/0.5.5
 //   node scripts/check-parity.mjs --pack                # 再校验 npm 包内容（必须项/禁止项/元数据）
 //   --allow-missing-other   另一条线不可用（例如 CI 只 checkout 了发布线）时跳过对等检查
 import { execFileSync } from 'node:child_process'
@@ -29,7 +29,7 @@ const opt = (name, fallback) => {
 }
 
 const ALLOW_MISSING = has('--allow-missing-other')
-const OTHER = opt('--other', 'release/0.5.4')
+const OTHER = opt('--other', 'release/0.5.5')
 const BASE = opt('--base', 'dev/win')
 
 const problems = []

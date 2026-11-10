@@ -1,5 +1,7 @@
 # dsh-gitee-chat
 
+[中文](README.md) · [English](README.en.md)
+
 Gitee project management inside a [DSH](https://github.com/deepseek-ai/deepseek-harness) session:
 a full-page, clickable project workbench + a set of write-capable tools + 55 Gitee Enterprise MCP tools
 bundled in.
@@ -65,8 +67,8 @@ dsh plugin --profile desktop add dsh-gitee-chat
 | Source | Command | When to use |
 |---|---|---|
 | **npm registry** | `dsh plugin --profile desktop add dsh-gitee-chat` | Default |
-| GitHub Release asset | `dsh plugin --profile desktop add "https://github.com/huayuguo/dsh-gitee-chat/releases/download/v0.5.4/dsh-gitee-chat-0.5.4.tgz"` | When npm is unreachable |
-| Direct from git | `dsh plugin --profile desktop add "git+https://github.com/huayuguo/dsh-gitee-chat.git#v0.5.4"` | Pin a tag |
+| GitHub Release asset | `dsh plugin --profile desktop add "https://github.com/huayuguo/dsh-gitee-chat/releases/download/v0.5.5/dsh-gitee-chat-0.5.5.tgz"` | When npm is unreachable |
+| Direct from git | `dsh plugin --profile desktop add "git+https://github.com/huayuguo/dsh-gitee-chat.git#v0.5.5"` | Pin a tag |
 
 **From source** (development, code changes):
 
