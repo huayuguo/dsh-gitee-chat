@@ -16,7 +16,7 @@
  * @module dsh-gitee-chat/host/localSettings
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** 缓存三件套（与设置页表单一一对应）。 */
@@ -212,13 +212,35 @@ export function createLocalSettings(configRoot: string) {
     }
   }
 
-  /** 原子写整份 JSON（先写临时文件再 rename，免得读到半个文件）。 */
+  /**
+   * 原子写整份 JSON（先写临时文件再 rename，免得读到半个文件）。
+   *
+   * 失败一律抛 {@link SettingsWriteError}：`config.json` 是使用者能看见、也可能正被
+   * 别的程序打开的文件（Windows 上尤其如此），把平台原始错误抛给上层只会得到
+   * `EPERM: operation not permitted, rename …` 这种没人看得懂的东西。
+   */
   function writeRawJson(raw: Record<string, unknown>): void {
-    mkdirSync(configRoot, { recursive: true })
-    const tmp = `${configPath}.tmp-${process.pid}`
-    writeFileSync(tmp, `${JSON.stringify(raw, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-    renameSync(tmp, configPath)
-    memo = undefined
+    // 临时名带随机后缀：同一进程并发两次写（设置页连点）不会互相踩
+    const tmp = `${configPath}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    try {
+      mkdirSync(configRoot, { recursive: true })
+      writeFileSync(tmp, `${JSON.stringify(raw, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+      renameSync(tmp, configPath)
+      memo = undefined
+    } catch (cause) {
+      try {
+        rmSync(tmp, { force: true })
+      } catch {
+        // 临时文件清不掉不影响主流程
+      }
+      const detail = cause instanceof Error ? cause.message : String(cause)
+      throw new SettingsWriteError(
+        `设置没写进去：${detail}`,
+        process.platform === 'win32'
+          ? '目标文件可能正被别的程序占用（杀软、编辑器）。关掉那个程序再存一次；也可以直接改 config.json 后重试。'
+          : '检查磁盘空间与目录权限（配置目录应可写）；也可以直接改 config.json 后重试。',
+      )
+    }
   }
 
   /**
@@ -262,11 +284,34 @@ export function createLocalSettings(configRoot: string) {
     if (target === null || target.sessionId === '') delete map[repoKey]
     else map[repoKey] = target
     raw.draftTargets = map
-    writeRawJson(raw)
+    try {
+      writeRawJson(raw)
+    } catch {
+      // 「记住上次选的会话」是锦上添花：写不进去就这次不记，绝不能因此让起草失败
+      return target === null ? undefined : target
+    }
     return target === null ? undefined : getDraftTarget(repoKey)
   }
 
   return { path: configPath, read: readFile, resolve, write, getDraftTarget, setDraftTarget }
+}
+
+/**
+ * 设置落盘失败（跨平台都有，但 Windows 更常见：目标文件被杀软/编辑器占用时
+ * `renameSync` 会抛 `EPERM`，Linux 上几乎只会遇到磁盘满/只读挂载）。
+ *
+ * 单独成类是为了让路由层给一句人话，而不是把 `EPERM: operation not permitted` 原样吐给使用者。
+ */
+export class SettingsWriteError extends Error {
+  readonly code = 'settings-write-failed'
+
+  constructor(
+    message: string,
+    readonly hint: string,
+  ) {
+    super(message)
+    this.name = 'SettingsWriteError'
+  }
 }
 
 /** 本地设置读写器。 */

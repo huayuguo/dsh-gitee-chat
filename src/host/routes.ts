@@ -1248,8 +1248,20 @@ export function createRouteHandler(deps: RouteDeps) {
           if (typeof autoRefresh.intervalSeconds === 'number') patch.autoRefresh.intervalSeconds = autoRefresh.intervalSeconds
           if (typeof autoRefresh.idleMinutes === 'number') patch.autoRefresh.idleMinutes = autoRefresh.idleMinutes
         }
-        const values = deps.settings.write(patch)
-        writeJson(res, 200, { ok: true, values, path: deps.settings.path })
+        try {
+          const values = deps.settings.write(patch)
+          writeJson(res, 200, { ok: true, values, path: deps.settings.path })
+        } catch (cause) {
+          // 落盘失败（Windows 上多半是 config.json 被占用）：给一句人话 + 可执行提示，
+          // 不要把 EPERM/EBUSY 的原始堆栈吐给使用者。
+          const failure = cause as { code?: string; message?: string; hint?: string }
+          writeJson(res, 500, {
+            ok: false,
+            code: failure.code ?? 'settings-write-failed',
+            message: failure.message ?? '设置没写进去。',
+            hint: failure.hint ?? '稍后重试；或直接改 config.json 后重启宿主。',
+          } satisfies ErrorResponse)
+        }
         return
       }
 

@@ -1045,6 +1045,37 @@ process.stdin.on('data', (chunk) => {
     console.log('  ✓ 缓存/刷新开关：本地覆盖读写 + 规整 + 不踩别的键')
   }
 
+  // 设置落盘失败必须是「人话错误」，不能把平台原始错误（Windows 上常见
+  // EPERM/EBUSY：config.json 被杀软或编辑器占着）原样吐给使用者。
+  // 这里用「config.json 这个位置放一个目录」制造必然失败的 rename：
+  // Linux 是 EISDIR，Windows 是 EPERM/EEXIST，两平台都必失败。
+  {
+    const failDir = join(sandboxHome, 'settings-fail', '.gitee-chat')
+    await mkdir(join(failDir, 'config.json'), { recursive: true })
+    const store = createLocalSettings(failDir)
+    const base = {
+      cache: { agentReadable: true, persist: true, ttlSeconds: 60 },
+      autoRefresh: { enabled: false, intervalSeconds: 60, idleMinutes: 30 },
+    }
+    let caught
+    try {
+      store.write({ cache: { ttlSeconds: 90 } }, base)
+    } catch (error) {
+      caught = error
+    }
+    assert.ok(caught !== undefined, '落盘失败必须抛出，不能静默当成功')
+    assert.equal(caught.name, 'SettingsWriteError', `落盘失败要用 SettingsWriteError：${String(caught)}`)
+    assert.equal(caught.code, 'settings-write-failed', '错误码必须是 settings-write-failed（路由按它回 500）')
+    assert.match(caught.message, /设置没写进去/, '错误信息要像人话')
+    assert.ok(typeof caught.hint === 'string' && caught.hint.length > 10, '必须带可执行提示（被占用/权限/磁盘）')
+    // 「记住上次选的会话」是锦上添花：写不进去也不能让起草失败
+    const remembered = store.setDraftTarget('g/p', {
+      sessionId: 'session-x', sessionTitle: 't', workspaceTitle: 'w', deliverSubagent: true, at: '2026-01-01 00:00:00',
+    })
+    assert.equal(remembered?.sessionId, 'session-x', '记住投递目标必须尽力而为：写不进去也要返回这次选的目标')
+    console.log(`  ✓ 设置落盘失败可读：${caught.message.slice(0, 24)}…（code=${caught.code}）`)
+  }
+
   // 时间戳必须用**本机时间**且不打印时区（用户 2026-10-27：先「04:57:40 不对」，后「+08:00 不用显示」）
   {
     const stamp = nowStamp()

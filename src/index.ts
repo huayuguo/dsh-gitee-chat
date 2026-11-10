@@ -1304,7 +1304,7 @@ export { createRepoService, visibilityOf } from './host/repoService.ts'
 export { createPrService, PrError } from './host/prService.ts'
 export { createPrTemplates } from './host/prTemplates.ts'
 export {
-  createLocalSettings, normalizeTtlSeconds, normalizeIntervalSeconds, normalizeIdleMinutes,
+  createLocalSettings, SettingsWriteError, normalizeTtlSeconds, normalizeIntervalSeconds, normalizeIdleMinutes,
 } from './host/localSettings.ts'
 export type { CacheSettings, AutoRefreshSettings, DraftTarget, LocalSettings, ResolvedSettings, SettingsPatch } from './host/localSettings.ts'
 export {
