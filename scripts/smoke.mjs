@@ -2074,6 +2074,50 @@ process.stdin.on('data', (chunk) => {
     'startActivation 必须同时给拍平与嵌套两种形状（桌面版/CLI 版参数形状不同）')
   assert.ok(prSubagentSrc.includes('startActivation 的参数形状不一致'),
     '形状不匹配时要给人话提示，而不是让人去猜会话是否还活着')
+
+  // 行为回归（不只是字符串断言）：把 prSubagent 单独打包，用两个「假宿主」
+  // 分别按桌面版（读 spec.parent）与 CLI 版（读 spec.request.parent）的方式取参数。
+  // 2026-11-10 桌面版报的「Cannot read properties of undefined (reading 'id')」就是只给了嵌套形状。
+  {
+    const { build } = await import('esbuild')
+    const bundlePath = join(tmpdir(), `dsh-gitee-chat-prsubagent-${process.pid}.mjs`)
+    await build({
+      entryPoints: [join(root, 'src', 'host', 'prSubagent.ts')],
+      bundle: true,
+      platform: 'node',
+      format: 'esm',
+      outfile: bundlePath,
+      logLevel: 'silent',
+    })
+    const { createPrSubagentRunner } = await import(`${pathToFileURL(bundlePath).href}?t=${Date.now()}`)
+    const parent = { id: 'agent-parent-1' }
+    const fakeOf = (kind) => ({
+      startActivation(spec) {
+        const picked = kind === 'flat'
+          ? { parent: spec.parent, prompt: spec.prompt }
+          : { parent: spec.request?.parent, prompt: spec.request?.prompt }
+        if (picked.parent === undefined) throw new TypeError("Cannot read properties of undefined (reading 'id')")
+        const text = picked.prompt.map((block) => block.text).join('')
+        return Promise.resolve({
+          childId: `child-${kind}`,
+          result: Promise.resolve({ output: [{ type: 'text', text: `${kind}:${picked.parent.id}:${text.length}` }], stopReason: 'completed' }),
+          dispose: async () => undefined,
+        })
+      },
+    })
+    for (const kind of ['flat', 'nested']) {
+      const runner = createPrSubagentRunner({ subagents: () => fakeOf(kind), agents: () => ({ get: () => parent }) })
+      try {
+        const run = await runner.start({ sessionId: 's1', prompt: 'hello', label: 'test' })
+        await new Promise((done) => setTimeout(done, 20))
+        const settled = runner.get(run.runId)
+        assert.equal(settled?.status, 'done', `${kind} 形状必须能拉起子智能体（桌面版拍平 / CLI 版嵌套）`)
+        assert.equal(settled?.text, `${kind}:agent-parent-1:5`, `${kind} 形状必须把 parent 与 prompt 都传对`)
+      } finally {
+        runner.dispose()
+      }
+    }
+  }
   // 0.2.2 宿主：会话空闲时 agents.get() 是 undefined；必须能通过宿主
   // sessionController.resolveAgent() 把所选会话恢复成活 Agent，否则
   // 「投递到别的工作区会话」永远 session-not-live。
