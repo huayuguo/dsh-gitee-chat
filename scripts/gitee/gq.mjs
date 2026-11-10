@@ -1394,6 +1394,28 @@ export async function listRepoIssues(enterpriseId, repoId, auth, opts = {}) {
  * @param {{ token: string }} auth
  * @param {{ patches?: boolean, maxPatchChars?: number }} [opts] - patches=true 才带 diff 正文
  */
+/**
+ * 取 compare 结果里的 diff 文本。
+ *
+ * 企业版 `/{eid}/projects/{id}/compare/{base}...{head}` 的 `diffs[].patch` 不是字符串，
+ * 而是对象：`{ diff: string, new_path, old_path, a_mode, b_mode, new_file, renamed_file,
+ * deleted_file, too_large, type }`。直接 `String(patch)` 只会得到 `"[object Object]"`，
+ * 于是 AI 起草拿不到任何真实改动（0.5.4 线上复现过）。这里统一取 `patch.diff`，
+ * 并对 `too_large` 返回空串（内容被 Gitee 截断时不拿半截误导模型）。
+ *
+ * @param {unknown} patch
+ * @returns {string}
+ */
+function patchTextOf(patch) {
+  if (typeof patch === 'string') return patch
+  if (patch !== null && typeof patch === 'object') {
+    const obj = /** @type {{ diff?: unknown, too_large?: unknown }} */ (patch)
+    if (obj.too_large === true) return ''
+    return typeof obj.diff === 'string' ? obj.diff : ''
+  }
+  return ''
+}
+
 export async function compareRefs(enterpriseId, repoId, base, head, auth, opts = {}) {
   const path = `/${enterpriseId}/projects/${repoId}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
   const res = await apiGet(path, {}, auth)
@@ -1409,7 +1431,7 @@ export async function compareRefs(enterpriseId, repoId, base, head, auth, opts =
     status: String(d.status ?? ''),
     additions: Number(d.additions ?? 0),
     deletions: Number(d.deletions ?? 0),
-    patch: opts.patches === true ? String(d.patch ?? '').slice(0, maxPatch) : '',
+    patch: opts.patches === true ? patchTextOf(d.patch).slice(0, maxPatch) : '',
   }))
   return {
     ok: true,

@@ -2043,6 +2043,22 @@ process.stdin.on('data', (chunk) => {
     'prService.draftPull 必须先试本地仓库比对（快路径）')
   assert.ok(prServiceSrc.includes('不要调用任何工具'), 'AI 起草 prompt 必须禁止子智能体调工具')
 
+  // 2026-11-10 实测事故：企业版 compare 的 `diffs[].patch` 是**对象**
+  // （`{diff, new_path, old_path, too_large, …}`），不是字符串；直接 String() 得到
+  // "[object Object]"，于是 AI 起草的 prompt 里没有任何真实 diff（模型只能写「待补充」）。
+  assert.ok(gqSrc.includes('function patchTextOf('),
+    'gq.mjs 必须用 patchTextOf 解出 compare 的 diff 文本（企业版 patch 是对象）')
+  assert.ok(gqSrc.includes("typeof obj.diff === 'string'"),
+    'patchTextOf 必须取 patch.diff，而不是把对象转成字符串')
+  assert.ok(!gqSrc.includes("String(d.patch ?? '')"),
+    'compareRefs 不得再 String(d.patch)（会得到 [object Object]）')
+  // 子智能体常把「我先想想…」写进最终回复（实测 9.5K 回复前 6.8K 是过程），
+  // 所以 prompt 要钉死输出起点，客户端解析要从后往前找候选 JSON 起点。
+  assert.ok(prServiceSrc.includes('第一行第一个字符必须是'),
+    'AI 起草 prompt 必须要求最终回复第一行就是 JSON（否则过程说明会混进结论）')
+  assert.ok(createDialogSrc.includes('starts[k]'),
+    'parseDraft 必须能跳过前置过程说明（候选起点从后往前试解析）')
+
   // 「子智能体」胶囊勾选框（2026-10-27）：默认勾选；取消后投到主会话；
   // 勾选状态与工作区/会话一起按仓库记住。
   assert.ok(localSettingsSrc.includes('deliverSubagent'), 'localSettings.DraftTarget 必须带 deliverSubagent')

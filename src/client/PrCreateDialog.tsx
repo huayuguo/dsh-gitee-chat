@@ -601,17 +601,24 @@ export function PrCreateDialog(props: {
  * 先剥围栏，再取第一个 `{` 到最后一个 `}` 之间试解析；失败返回 `null`（调用方提示重试）。
  */
 export function parseDraft(text: string): { title: string; body: string } | null {
-  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
-  const start = cleaned.indexOf('{')
+  // 子智能体经常在 JSON 前面先写一段「我先看看…」的思考（实测 9.5K 回复里前 6.8K 全是过程），
+  // 所以不能简单地取「第一个 { 到最后一个 }」——那段区间里混着解释文字，JSON.parse 必失败。
+  // 做法：把每个 `{` 都当成候选起点，**从后往前**试解析，第一个能解析出 title 的就是答案。
+  const cleaned = text.replace(/```(?:json)?/gi, '').trim()
   const end = cleaned.lastIndexOf('}')
-  if (start < 0 || end <= start) return null
-  try {
-    const raw = JSON.parse(cleaned.slice(start, end + 1)) as { title?: unknown; body?: unknown }
-    const title = typeof raw.title === 'string' ? raw.title.trim() : ''
-    const body = typeof raw.body === 'string' ? raw.body.trim() : ''
-    if (title === '') return null
-    return { title, body }
-  } catch {
-    return null
+  if (end < 0) return null
+  const starts: number[] = []
+  for (let i = cleaned.indexOf('{'); i >= 0 && i < end; i = cleaned.indexOf('{', i + 1)) starts.push(i)
+  for (let k = starts.length - 1; k >= 0; k--) {
+    try {
+      const raw = JSON.parse(cleaned.slice(starts[k], end + 1)) as { title?: unknown; body?: unknown }
+      const title = typeof raw.title === 'string' ? raw.title.trim() : ''
+      const body = typeof raw.body === 'string' ? raw.body.trim() : ''
+      if (title === '') continue
+      return { title, body }
+    } catch {
+      /* 这个起点不是合法 JSON 对象，换更靠前的起点 */
+    }
   }
+  return null
 }

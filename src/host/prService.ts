@@ -638,7 +638,9 @@ function renderDraftPrompt(input: {
   L.push('## 写作要求（来自本仓 PR 模板的填写说明）')
   L.push(input.guide.trimEnd())
   L.push('')
-  L.push('## 输出格式（**只输出这一段 JSON**，不要解释、不要代码围栏、不要多余文字）')
+  L.push('## 输出格式（严格按此输出，别的什么都不要写）')
+  L.push('- 最终回复的**第一行第一个字符必须是 `{`**：前面不要写「我先看看…」「数据已拿到」这类过程说明。')
+  L.push('- 不要代码围栏（不要 ```json），JSON 之后也不要补任何解释或总结。')
   L.push('{"title":"<类型>: <一句话，不超过 50 字>","body":"<Markdown 正文，按上面模板的小标题组织>"}')
   return L.join('\n') + '\n'
 }
