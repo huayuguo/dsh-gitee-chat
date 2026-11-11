@@ -773,11 +773,31 @@ async function main() {
     'host 半必须走 inject([…tools…]) 注册 gateway（依赖就绪才启动，且随插件卸载而 dispose）')
   assert.equal(hostCtx.rec.promptContexts.length, 0,
     'host 半不得注册人格上下文——曾导致 PTC 等无关 preset 被注入 Gitee 人格')
-  assert.equal(hostCtx.rec.guards.length, 0,
-    'host 半不得注册门禁——门禁属于 agent 平面')
+  // 唯一的门禁例外（2026-11-11）：AI 审核子智能体必须**真的**只读。
+  //   子智能体继承所选主会话的完整工具集，而宿主的 activation 没有工具白名单口子
+  //   （`composition.toolFilter` 只由 preset 注入，spec 里带也不被采用），所以只能在
+  //   插件根上加一层按**会话**生效的门禁：只拦 `prSubagent` 登记过的 childId。
+  // 它必须对任何未登记的会话返回 undefined —— 否则就退化成"门禁串到所有 preset"，
+  // 那正是原来「门禁属于 agent 平面」这条纪律要防的事。
+  assert.equal(hostCtx.rec.guards.length, 1,
+    `host 半只许注册「审核子智能体只读」一个按会话生效的门禁，实际 ${hostCtx.rec.guards.length} 个`)
+  const reviewGuard = hostCtx.rec.guards[0]
+  for (const [toolName, args] of [
+    ['write', { file_path: 'x' }],
+    ['pwsh', { command: 'echo x' }],
+    ['mcp__gitee_ent__merge_enterprise_pull', {}],
+    ['mcp__gitee_ent__comment_enterprise_pull', {}],
+    ['gitee_ent', { op: 'call', name: 'merge_enterprise_pull' }],
+  ]) {
+    assert.equal(reviewGuard({ name: toolName, args, agent: { id: 'not-a-review-session' } }), undefined,
+      `审核只读门禁对未登记会话必须放行（${toolName} 被误拦说明门禁串到别的 preset 了）`)
+    assert.equal(reviewGuard({ name: toolName, args }), undefined,
+      `审核只读门禁在没有 agent 作用域时也必须放行（${toolName}）`)
+  }
   assert.equal(hostCtx.rec.restricts.length, 0,
     'host 半不得 restrict——tools.restrict() 要求 agent 作用域，全局调用会遮住所有 agent')
-  console.log(`  ✓ 🔴 平面纪律：host 半只注册公开 gateway「${PUBLIC_GATEWAY_TOOL_NAME}」一个工具，无工具/人格/门禁越界`)
+  console.log(`  ✓ 🔴 平面纪律：host 半只注册公开 gateway「${PUBLIC_GATEWAY_TOOL_NAME}」一个工具；`
+    + '唯一门禁是「审核子智能体只读」，且只对登记过的会话生效')
 
   // ══ 4. agent 半装配（preset 平面）═══════════════════════════════════════
   const agentCtx = fakeCtx()
@@ -2123,6 +2143,57 @@ process.stdin.on('data', (chunk) => {
   // 「投递到别的工作区会话」永远 session-not-live。
   assert.ok(prSubagentSrc.includes('resolveAgent'), 'prSubagent 必须支持会话空闲时恢复活 Agent（resolveAgent）')
   assert.ok(prSubagentSrc.includes('session-not-found'), 'prSubagent 必须区分「会话不存在」与「会话没在跑」')
+
+  // AI 审核子智能体只读（2026-11-11）：登记的是子会话，判据是纯函数，都在 reviewSessions.ts。
+  // 子智能体继承主会话的全量工具，宿主又没有 activation 级白名单，所以这里必须真的拒绝，
+  // 不能只在 prompt 里劝 —— 实测两个子智能体曾自己调 comment_enterprise_pull 贴真实 PR。
+  assert.ok(prSubagentSrc.includes('markReviewSession(run.childId)'),
+    'prSubagent 拉起子智能体后必须登记 childId，否则只读门禁对它是空转')
+  assert.ok(indexSrc.includes('reviewOnlyDenial(exec.name, callArgs)'),
+    'index.ts 的全局门禁必须把调用交给 reviewOnlyDenial 判定')
+  // 宿主 dsh-tools 的 createExecution 只 snapshot `exec.arguments`；写门禁读 `exec.args`
+  // 会拿到 undefined，把写工具当只读放行 —— 2026-11-11 现场就是这么漏的。
+  assert.ok(indexSrc.includes('const callArgs = exec.arguments ?? exec.args'),
+    '门禁必须从 exec.arguments 取入参（exec.args 只是兜底），否则判据永远拿到 undefined')
+  {
+    const { build } = await import('esbuild')
+    const guardBundle = join(tmpdir(), `dsh-gitee-chat-reviewguard-${process.pid}.mjs`)
+    await build({
+      entryPoints: [join(root, 'src', 'host', 'reviewSessions.ts')],
+      bundle: true,
+      platform: 'node',
+      format: 'esm',
+      outfile: guardBundle,
+      logLevel: 'silent',
+    })
+    const { reviewOnlyDenial, markReviewSession, isReviewSession } =
+      await import(`${pathToFileURL(guardBundle).href}?t=${Date.now()}`)
+    const truthTable = [
+      ['read', { file_path: 'x' }, true],
+      ['grep', {}, true],
+      ['gitee_ent', { op: 'list' }, true],
+      ['gitee_ent', { op: 'call', name: 'get_enterprise_pull_detail' }, true],
+      ['gitee_ent', { op: 'call', name: 'comment_enterprise_pull' }, false],
+      ['gitee_ent', { op: 'call', name: 'merge_enterprise_pull' }, false],
+      ['mcp__gitee_ent__list_enterprise_repositories', {}, true],
+      ['mcp__gitee_ent__comment_enterprise_pull', {}, false],
+      ['mcp__gitee_ent__merge_enterprise_pull', {}, false],
+      ['write', { file_path: 'x' }, false],
+      ['pwsh', { command: 'echo x' }, false],
+    ]
+    for (const [toolName, args, allowed] of truthTable) {
+      const denied = reviewOnlyDenial(toolName, args) !== undefined
+      assert.equal(denied, !allowed,
+        `审核只读判据：${toolName} 应${allowed ? '放行' : '拒绝'}，实际${denied ? '拒绝' : '放行'}`)
+    }
+    markReviewSession('review-child-1')
+    assert.equal(isReviewSession('review-child-1'), true, '登记后的审核子会话必须命中')
+    assert.equal(isReviewSession('some-other-session'), false, '普通会话不得被当成审核子会话')
+    for (let i = 0; i < 250; i++) markReviewSession(`bulk-review-${i}`)
+    assert.equal(isReviewSession('bulk-review-249'), true, '最新登记的审核子会话必须仍在表里')
+    assert.equal(isReviewSession('review-child-1'), false, '超过 200 条后应淘汰最早的登记（不能无限长）')
+  }
+
   assert.ok(indexSrc.includes('resolveSessionAgent') && indexSrc.includes("ctx.get('sessionController')"),
     'index.ts 必须把宿主 sessionController.resolveAgent 接到子智能体投递上')
   assert.ok(routesSrc.includes("delivery: 'parent'"),
@@ -2132,6 +2203,15 @@ process.stdin.on('data', (chunk) => {
   const prAiPaneSrc = await readFile(join(root, 'src', 'client', 'PrAiPane.tsx'), 'utf8')
   assert.ok(prAiPaneSrc.includes('PillCheck') && prAiPaneSrc.includes('useSubagent'),
     'AI 审核弹窗必须有「子智能体」胶囊勾选框')
+  const prTabSrc = await readFile(join(root, 'src', 'client', 'PrTab.tsx'), 'utf8')
+  assert.ok(prTabSrc.includes("useState<PrStateFilter>('all')"),
+    '合并请求页签必须默认「全部状态」——写死 opened 时已合并/已关闭的 PR 在界面上永远找不到（0.5.6 修复）')
+  assert.equal(prTabSrc.includes("useState<PrStateFilter>('opened')"), false,
+    '合并请求页签不得再默认 opened（回归守卫）')
+  const prSvcSrc = await readFile(join(root, 'src', 'host', 'prService.ts'), 'utf8')
+  assert.equal(prSvcSrc.includes('把结论发到这个 PR'), false,
+    '审核 prompt 不得再让子智能体去 comment_enterprise_pull：子智能体是只读的，结论由人决定是否贴到 PR')
+  assert.ok(prSvcSrc.includes('不要调用任何写工具'), '审核 prompt 必须明确禁止写工具（与只读门禁配套）')
   const prApiSrc = await readFile(join(root, 'src', 'client', 'prApi.ts'), 'utf8')
   assert.ok(prApiSrc.includes('deliverSubagent') && prApiSrc.includes("deliver === undefined"),
     'prApi 必须记住 deliverSubagent，并把 deliver 透传给宿主')

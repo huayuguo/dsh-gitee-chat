@@ -11,7 +11,13 @@
  * 此时走宿主 `sessionController.resolveAgent(sessionId)`（"Resolve or resume one ordinary
  * Session for another Host API domain"）把它**恢复**成活着的 Agent 再用 —— 这样「投递到别的
  * 工作区的会话」不用先在那个会话里发一条消息唤醒（0.2.2 宿主上实测旧的 session-not-live 太硬）。
+ *
+ * 拉起成功后会把 `childId` 登记到 `host/reviewSessions.ts`：子智能体继承的是主会话的
+ * **完整工具集**，而宿主没有给 activation 传工具白名单的口子 —— 所以"只读"由插件侧的
+ * 全局 guard 硬拦，见那个模块里 `reviewOnlyDenial()` 的说明。
  */
+
+import { markReviewSession } from './reviewSessions.ts'
 
 /** 子智能体服务的最小形状（宿主内部类型没有导出，这里按用到的成员声明）。 */
 interface SubagentsLike {
@@ -205,6 +211,8 @@ export function createPrSubagentRunner(deps: {
     }
     runs.set(run.runId, { run, controller })
     prune(now)
+    // 先登记再等结果：子智能体一被拉起就可能开始调工具，登记晚了第一次写调用就漏拦。
+    markReviewSession(run.childId)
 
     void activation.result
       .then((result) => {

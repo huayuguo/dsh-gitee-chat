@@ -68,7 +68,10 @@ export function PrTab(props: {
   deepLink?: DrawerTarget | null
 }) {
   const [scope, setScope] = useState<PrScope>('assign')
-  const [state, setState] = useState<PrStateFilter>('opened')
+  // 默认「全部状态」（0.5.6 起）：写死 opened 时，已合并 / 已关闭的 PR 在界面上永远
+  // 找不到 —— 用户 2026-11-11 就因此在面板里搜不到自己刚合并的 !1。
+  // 「待我审核 / 待我测试」这类 KPI 仍然按 opened 口径算（见 prApi 的 pending*）。
+  const [state, setState] = useState<PrStateFilter>('all')
   const [query, setQuery] = useState('')
   const [keyword, setKeyword] = useState('')
   const [page, setPage] = useState(1)

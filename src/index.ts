@@ -42,6 +42,7 @@ import { createPrSubagentRunner } from './host/prSubagent.ts'
 import { createPrTemplates } from './host/prTemplates.ts'
 import { createMcpClient } from './host/mcpClient.ts'
 import { giteeEntGatewayTool } from './host/gateway.ts'
+import { guardProbes, isReviewSession, recordGuardProbe, reviewOnlyDenial, reviewSessionSnapshot, sessionIdOf } from './host/reviewSessions.ts'
 import { DEFAULT_MCP_TOOL_PREFIX, PUBLIC_GATEWAY_TOOL_NAME } from './mcpNaming.ts'
 import type { GiteeChatFace } from './host/face.ts'
 
@@ -602,11 +603,48 @@ export function apply(ctx: any, config?: Config): void {
         enterpriseSelector: () => ({ id: enterprise.now().id, describe: enterprise.describe() }),
       })
       const unregister = child.tools.register(tool)
+      // AI 审核子智能体只读硬约束：子智能体继承主会话的完整工具集，而宿主没有给
+      // activation 传工具白名单的口子（`composition.toolFilter` 只由 preset 注入）。
+      // 「只读」只写在 prompt 里就是劝 —— 2026-11-11 两个审核子智能体自己调了
+      // `comment_enterprise_pull` 往真实 PR 贴结论；`prSubagent.ts` 拉起后登记 childId，
+      // 这里对它们只放行只读工具。
+      const disposeGuard = child.tools.guard((exec: {
+        name: string
+        /** 宿主真正传过来的字段是 `arguments`（dsh-tools 的 createExecution 只 snapshot 它），
+         * `args` 是早期猜错的名字 —— 保留兜底，否则门禁拿到 undefined 会把写工具当只读放行。 */
+        arguments?: unknown
+        args?: unknown
+        agent?: { id?: unknown; session?: { id?: unknown; header?: { id?: unknown } } }
+        sessionId?: unknown
+      }) => {
+        const resolvedSession = sessionIdOf(exec)
+        const registered = isReviewSession(resolvedSession)
+        const callArgs = exec.arguments ?? exec.args
+        const denialText = registered ? reviewOnlyDenial(exec.name, callArgs) : undefined
+        if (registered || exec.name === PUBLIC_GATEWAY_TOOL_NAME) {
+          const record = typeof callArgs === 'object' && callArgs !== null
+            ? callArgs as Record<string, unknown>
+            : {}
+          recordGuardProbe({
+            at: Date.now(),
+            tool: exec.name,
+            inner: typeof record.name === 'string' ? record.name : undefined,
+            op: typeof record.op === 'string' ? record.op : undefined,
+            agentKeys: Object.keys(exec.agent ?? {}).slice(0, 8),
+            argsFrom: exec.arguments !== undefined ? 'arguments' : exec.args !== undefined ? 'args' : 'none',
+            resolved: resolvedSession,
+            registered,
+            verdict: denialText === undefined ? 'allow' : 'deny',
+          })
+        }
+        return denialText
+      })
       ctx.logger?.info?.(
         `[${name}] 公开 gateway 已注册：${PUBLIC_GATEWAY_TOOL_NAME}（两级 list → schema → call；`
         + `${resolved.allowWrites ? '可写' : '只读，写工具硬拦'}）`,
       )
       return () => {
+        disposeGuard?.()
         unregister?.()
         client.dispose()
       }
@@ -1231,6 +1269,7 @@ export function apply(ctx: any, config?: Config): void {
     listSessions,
     debugPresets,
     debugServices,
+    debugReviewSessions: () => ({ ...reviewSessionSnapshot(), probes: guardProbes() }),
     isGiteeSession: async (sessionId: string) => {
       const preset = presetOf(sessionId)
       if (preset === null) return undefined

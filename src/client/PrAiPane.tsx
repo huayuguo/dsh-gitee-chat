@@ -196,7 +196,8 @@ export function PrAiPane(props: {
           template,
           scope,
           ...(scope === 'files' ? { files } : {}),
-          autoApprove,
+          // 子智能体只读：自动通过只对「投到主会话」有意义
+          autoApprove: useSubagent ? false : autoApprove,
         },
         undefined,
         useSubagent ? undefined : 'session',
@@ -383,14 +384,16 @@ export function PrAiPane(props: {
             <div className={css.gqPrAiLabel}>模型与结论</div>
             <div className={css.gqPrRowSub}>模型跟随当前会话，不在本页另选。</div>
             <div className={css.gqPrSwitchRow}>
-              <span>允许 AI 在结论为「通过」时自动审核通过</span>
+              <span>{useSubagent ? '允许 AI 自动审核通过（子智能体只读，不适用）' : '允许 AI 在结论为「通过」时自动审核通过'}</span>
               <label className={css.gqPrSwitch}>
-                <input type="checkbox" checked={autoApprove} onChange={(event) => setAutoApprove(event.target.checked)} />
+                <input type="checkbox" checked={useSubagent ? false : autoApprove} disabled={useSubagent} onChange={(event) => setAutoApprove(event.target.checked)} />
                 <span className={css.gqPrSwitchTrack} />
               </label>
             </div>
             <BQ tone={autoApprove ? 'warn' : undefined}>
-              {autoApprove
+              {useSubagent
+                ? '子智能体只读：只出结论，不代审、不发评论。要自动通过请把「投递方式」切到「投到主会话」。'
+                : autoApprove
                 ? '已打开自动通过：AI 结论为「通过」时会**直接**调用审核通过，不再经过二次确认。请确认你信任这个模板的判定。'
                 : '默认关闭：AI 只产出结论与评论，通过/驳回仍要你自己点（所有写动作都要过确认弹窗）。'}
             </BQ>

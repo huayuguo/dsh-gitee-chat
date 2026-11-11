@@ -16,6 +16,27 @@
   现在两种形状同时给（两个构建都不校验未知键），谁认哪个都能跑。
 - **错误提示**：形状不匹配时不再让人去猜「是不是会话关了」，直接说明宿主与插件的接口形状不一致。
 
+### 安全与权限
+
+- **AI 审核子智能体真的只读**：子智能体继承所选主会话的完整工具集，此前「只读」只写在 prompt 里，
+  实测两个审核子智能体自己调了 `comment_enterprise_pull`，往真实 PR 贴了结论。现在插件在
+  `prSubagent` 拉起后登记 childId，全局门禁对它只放行只读工具（读文件 / 搜代码 / `list_*` `get_*`
+  这类 MCP 读接口），`comment_*`、`merge_*`、`review_*`、`test_*`、写文件、跑命令一律硬拒绝。
+- **token 文件按 0o600 落盘**：`~/.dsh/.gitee-chat/token` 是整家企业的凭证，同机其他用户不该能读；
+  Windows 上 `mode` 被忽略，Linux/mac 生效（与同仓 `localSettings` / `snapshotStore` 同口径）。
+- **切企业 / 换 token 后立刻清读缓存**：读缓存的键没有企业维度，原来切企业后最多 30 秒内面板还会
+  回上一家的 PR 与工作项。现在 `/enterprise` 与 `/token` 成功后直接 `invalidateReadCaches`。
+- **门禁取参字段修正**：宿主 dsh-tools 的 `createExecution` 只把入参 snapshot 到 `exec.arguments`，
+  之前按 `exec.args` 取，拿到的是 `undefined` —— 于是所有写工具都被当成"只读"放行。现在
+  `exec.arguments ?? exec.args`，`/debug/review-sessions` 的探针会额外回显 `argsFrom`。
+- **AI 审核 prompt 不再要求发评论**：审核模板原来第 3 条写「用 `comment_enterprise_pull`
+  把结论发到这个 PR」，与「子智能体只读」直接冲突。现在结论只作为最终回复返回，由人在面板里决定
+  是否贴到 PR；「自动通过」也只对「投到主会话」生效（子智能体路径上开关置灰）。
+- **`/debug/review-sessions` 增加门禁探针**：回显最近 20 次 guard 判定的输入（工具名、取到的会话
+  id、是否登记、判定结果），排查「登记了但没拦住」时不用再猜。
+- **合并请求页签默认「全部状态」**：原来默认 `opened`，已合并 / 已关闭的 PR 在界面上永远找不到
+  （用户当天就搜不到自己刚合并的那个 PR）。待我审核 / 待我测试仍按 `opened` 口径统计。
+
 ## [0.5.5] - 2026-11-10
 
 **宿主 0.2.2 兼容 + AI 起草链路修复版**。0.5.4 之后宿主升到 0.2.2，`agents.get(sessionId)` 只返回

@@ -129,6 +129,8 @@ export interface RouteDeps {
   readonly debugPresets?: () => unknown | Promise<unknown>
   /** 临时诊断：探测宿主服务是否可用（子智能体投递要用 subagents/agents）。 */
   readonly debugServices?: () => unknown | Promise<unknown>
+  /** 临时诊断：当前登记了多少个"审核子智能体"会话（只读门禁靠这张表生效）。 */
+  readonly debugReviewSessions?: () => unknown | Promise<unknown>
   readonly listSessions?: () => Array<{
     id: string
     title: string
@@ -816,6 +818,12 @@ export function createRouteHandler(deps: RouteDeps) {
         return
       }
 
+      if (route === '/debug/review-sessions' && method === 'GET') {
+        // 诊断：审核子智能体登记表（证明"只读门禁"的输入在运行期真的在长）。
+        writeJson(res, 200, { ok: true, data: (await deps.debugReviewSessions?.()) ?? null })
+        return
+      }
+
       if (route === '/pr/list' && method === 'GET') {
         // sessionId 可选：只用于日志/审计，取数走直连通道。
         const sessionId = url.searchParams.get('sessionId') ?? ''
@@ -1080,7 +1088,10 @@ export function createRouteHandler(deps: RouteDeps) {
           template: kind,
           scope,
           ...(Array.isArray(body.files) ? { files: body.files.filter((f): f is string => typeof f === 'string') } : {}),
-          autoApprove: body.autoApprove === true,
+          // 子智能体是只读的（reviewSessions 的门禁硬拦写工具），所以「自动通过」在这条路径上
+          // 没有可执行主体：prompt 里绝不能再让它去调 review_enterprise_pull，否则它只会撞门禁。
+          // 要自动通过请走「投到主会话」（/pr/ai-review），由主会话决定。
+          autoApprove: false,
         })
         const label = `PR !${body.iid} ${kind === 'review' ? 'AI 审核' : 'AI 测试'}`
         try {
@@ -1167,6 +1178,9 @@ export function createRouteHandler(deps: RouteDeps) {
         // 写 $DSH_HOME/.gitee-chat/config.json + 失效宿主缓存 + 重解析人格
         // （顺序与原因见 host/enterprise.ts；漏掉后两步会「列表换了、卡片没换」）。
         const result = await switchEnterprise({ runner: deps.runner, role: deps.role }, id)
+        // 换企业后必须清读缓存：缓存键里没有企业维度，不清的话最多 30 秒内
+        // 面板还会回上一家的 PR / 工作项 / 看板（切企业是最该立刻生效的动作）。
+        invalidateReadCaches(deps)
         writeJson(res, 200, { ok: true, ...result })
         return
       }
@@ -1195,7 +1209,11 @@ export function createRouteHandler(deps: RouteDeps) {
         }
         const file = tokenFilePath()
         mkdirSync(dirname(file), { recursive: true })
-        writeFileSync(file, token + '\n', 'utf8')
+        // 0o600：token 是整家企业的凭证，同机别的用户不该能读。
+        // 同仓的 localSettings / snapshotStore 也是这个口径（Windows 上 mode 被忽略，Linux/mac 生效）。
+        writeFileSync(file, token + '\n', { encoding: 'utf8', mode: 0o600 })
+        // 换 token = 换身份（企业/权限都可能变），读缓存同样不能留。
+        invalidateReadCaches(deps)
         writeJson(res, 200, { ok: true, source: 'file', path: file })
         return
       }
